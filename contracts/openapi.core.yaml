@@ -1,0 +1,1172 @@
+openapi: 3.1.0
+info:
+  title: Conversation Core API
+  version: 0.1.0
+  description: |
+    Контракт ядра разговоров. Тенант (Аски, site-widget) ходит сюда
+    server-to-server с ключом sk_live_*/sk_test_*. Браузер конечного
+    пользователя — только с participant-token (Client API).
+servers:
+  - url: http://localhost:8100/api
+    description: локальный дев-стенд ядра (порт смещён от Аски)
+security:
+  - tenantKey: []
+tags:
+  - name: Tenancy
+    description: Ключ тенанта — проверка ключа перед первым вызовом (кто я для ядра, какой режим, какие скоупы).
+  - name: Sessions
+    description: Жизненный цикл сессии — создание, состояние, завершение, токены участников, транскрипт.
+  - name: Knowledge
+    description: Базы знаний тенанта — создание, инжест документов, статусы обработки, семантический поиск.
+  - name: Usage
+    description: Потребление и деньги — агрегаты usage, баланс credits и операции леджера.
+  - name: Webhooks
+    description: >-
+      Исходящие события ядра в адрес тенанта — конверт, типы событий и полезная
+      нагрузка. Доставка: POST на эндпоинт тенанта, успех — ЛЮБОЙ 2xx (тело
+      ответа не читается), всё остальное считается неудачей и повторяется.
+      Ретраи: до 8 попыток с паузами 1с, 3с, 9с, 27с и далее по 60с; после
+      восьмой доставка помечается проваленной и больше не повторяется.
+      Редиректы НЕ выполняются — 3xx это неудача, адрес эндпоинта задаётся
+      конечным. Повторы штатны (ретрай ядра, повторная финализация сессии),
+      поэтому получатель обязан дедуплицировать события по event_id конверта;
+      порядок доставки не гарантируется. Отвечать следует быстро: ядро ждёт
+      ответа не дольше 10 секунд, долгую обработку принято ставить в свою
+      очередь и отвечать 200 сразу.
+components:
+  securitySchemes:
+    tenantKey:
+      type: http
+      scheme: bearer
+      description: API-ключ тенанта, sk_live_* / sk_test_*
+    participantToken:
+      type: http
+      scheme: bearer
+      description: >-
+        Короткоживущий токен конечного пользователя; операции Client API
+        появятся в следующих версиях спеки.
+    webhookSignature:
+      type: apiKey
+      in: header
+      name: X-Core-Signature
+      description: >-
+        HMAC-SHA256 на секрете эндпоинта тенанта. Схема описывает только
+        исходящие вызовы ядра и не применяется к Server API.
+        Формат значения: `t=<unix-время>,v1=<hex>`, где `v1` — версия схемы
+        подписи (со временем рядом могут появиться `v2=…`, поэтому разбирать
+        заголовок нужно по ключам, а не по позиции).
+        Подписывается СКЛЕЙКА `<t>.<тело запроса>` — метка времени, точка и
+        сырое тело. Тело берётся БАЙТ В БАЙТ, до всякого разбора json:
+        пересериализация меняет подпись.
+        Проверка на стороне получателя: пересчитать HMAC от той же склейки,
+        сравнить постоянным по времени сравнением и отбросить запрос, если `t`
+        отличается от текущего времени больше чем на 5 минут (защита от повтора
+        перехваченного запроса; окно учитывает расхождение часов). У каждой
+        попытки доставки подпись своя — ретраи ядра в окно укладываются.
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: >-
+        Ключ повторяемости, уникальный в пределах тенанта. Исходов ровно три:
+        (1) ключа ещё не было — операция выполняется как обычно; (2) ключ есть и
+        тело запроса совпадает — тот же 201 с ТОЙ ЖЕ сессией (участнику
+        выпускается свежий токен, агент второй раз не вызывается); (3) ключ есть,
+        но тело другое — 409 idempotency_key_reuse. Пока первый запрос с этим
+        ключом ещё выполняется, повтор получает 409 idempotency_in_progress, а
+        если его сессия уже завершена — 410. Ключ живёт вместе со своей сессией
+        и на новую не переиспользуется.
+      schema: { type: string, maxLength: 64 }
+    SessionId:
+      name: sessionId
+      in: path
+      required: true
+      description: Идентификатор сессии ядра
+      schema: { type: string }
+    KnowledgeBaseId:
+      name: kbId
+      in: path
+      required: true
+      description: 'Идентификатор базы знаний, формат kb_*'
+      schema: { type: string, examples: [kb_7f3a2c] }
+    DocumentId:
+      name: docId
+      in: path
+      required: true
+      description: Идентификатор документа внутри базы знаний
+      schema: { type: string, examples: [doc_91b4e0] }
+    PeriodFrom:
+      name: from
+      in: query
+      required: false
+      description: 'Начало периода включительно, UTC; не передан — ядро берёт начало текущего месяца'
+      schema: { type: string, format: date }
+    PeriodTo:
+      name: to
+      in: query
+      required: false
+      description: 'Конец периода включительно, UTC; не передан — текущий день'
+      schema: { type: string, format: date }
+  responses:
+    NotFound:
+      description: Не найдено
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Unauthorized:
+      description: 'Ключ не предъявлен, не распознан или отозван (различить нельзя намеренно)'
+      headers:
+        WWW-Authenticate:
+          description: Схема аутентификации, которую ждёт ядро
+          schema: { type: string, examples: [Bearer] }
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Forbidden:
+      description: >-
+        Ключ действителен, но не допущен к разделу: у него нет нужного скоупа
+        (KeyScope). Отличается от 401 намеренно — перевыпускать ключ не нужно,
+        нужно выдать ему скоуп. Код ошибки — insufficient_scope.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    ServiceUnavailable:
+      description: >-
+        Ядро временно не может выполнить операцию: медиа-сервер недоступен или
+        не сконфигурирован (код provider_unavailable), либо не найден тариф
+        канала (pricing_unavailable). Запрос повторяем — побочных эффектов у
+        отказа нет.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string, examples: [insufficient_credits] }
+            message: { type: string }
+    KeyMode:
+      type: string
+      enum: [live, test]
+      description: 'Режим ключа; он же сегмент в самой строке ключа (sk_live_* / sk_test_*).'
+    KeyScope:
+      type: string
+      enum: [sessions, knowledge, usage]
+      description: Раздел API, к которому допущен ключ.
+    PingResponse:
+      type: object
+      required: [tenant_id, mode, scopes]
+      properties:
+        tenant_id: { type: string, description: 'Идентификатор тенанта, формат ten_*', examples: [ten_7f3a2c9b1d4e5f60] }
+        mode: { $ref: '#/components/schemas/KeyMode' }
+        scopes:
+          type: array
+          description: Скоупы предъявленного ключа.
+          items: { $ref: '#/components/schemas/KeyScope' }
+    Channel:
+      type: string
+      enum: [chat, voice, video]
+      description: >-
+        Канал сессии. `chat` — медиа-less: participant_token несёт
+        LiveKit-грант БЕЗ права публикации медиа (data-only,
+        canPublishData=true), сама реплика едет НЕ REST'ом, а LiveKit
+        data-channel — тем же протоколом pv1, что у voice/video
+        (contracts/realtime/pv1/): вход `user_text`, выход `transcript` c
+        `speaker=agent` (воркер эмитит и greeting, и ответы аватара этим
+        фреймом целиком, не дельтами). Отдельного текстового
+        транспорта/канала у ядра нет.
+    SessionStatus:
+      type: string
+      enum: [created, active, paused, finalized, expired]
+      description: Состояние сессии в ядре.
+    MessageRole:
+      type: string
+      enum: [agent, user]
+      description: Автор реплики транскрипта.
+    SessionCreate:
+      type: object
+      required: [channel, agent]
+      properties:
+        channel: { $ref: '#/components/schemas/Channel' }
+        agent:
+          type: object
+          required: [instructions]
+          properties:
+            instructions:
+              type: string
+              maxLength: 32000
+              description: >-
+                Полный системный промпт тенанта (без KB-секции — её добавит
+                ядро). Потолок не косметический: промпт уезжает в метаданные
+                комнаты медиа-сервера, а те реплицируются всем участникам и
+                ограничены по размеру. Большой контекст — в базу знаний, а не
+                в инструкции.
+            voice_id: { type: string }
+            avatar_id: { type: string }
+            greeting: { type: string }
+        identity:
+          type: string
+          description: >-
+            identity первого участника; не передан — ядро сгенерирует и вернёт
+            (`respondent-<id>-<hex>`). ⚠️ Своя identity сегодня обязана
+            начинаться с `respondent-` или `preview-`: агент узнаёт клиента
+            сессии по этому префиксу, и с произвольным значением он не
+            поздоровается и не увидит уход участника (ограничение снимется
+            вместе с переходом агента на признак «не агент и не аватар»).
+        continue_from:
+          type: string
+          pattern: '^sess_[0-9a-f]{16}$'
+          examples: [sess_8f19a2e6c4d17b03]
+          description: >-
+            Продолжение разговора: сессия ЛЮБОГО канала (chat/voice/video, в
+            любой комбинации с прошлым) может начаться с историей прошлой —
+            ~24 последних реплики прошлой сессии (после дедупа подряд идущих
+            повторов) засеваются в контекст LLM отдельной system-рамкой
+            («это фрагмент предыдущей части разговора, не зачитывай его
+            дословно»), и greeting новой сессии из-за этого НЕ повторяется.
+            Формат — публичный id сессии (`sess_` + 16 hex, как `session_id`
+            в ответе); пустая строка невалидна КАК ФОРМАТ
+            (`validation_failed`) и не трактуется как отсутствие поля, в
+            отличие от большинства опциональных строк контракта. Ссылка
+            обязана указывать на ЗАВЕРШЁННУЮ сессию ЭТОГО ЖЕ тенанта С
+            КОМНАТОЙ: `finalized` и `expired` продолжаемы одинаково, включая
+            сессию, которую после смерти воркера закрыл сторож зависших (у
+            неё честные лента и оплаченное время) — чужая или несуществующая
+            сессия отвечает 404 тем же телом, что и `GET /v1/sessions/{id}`
+            (не оракул чужих `sess_*`), а сессия, которая ещё идёт
+            (`created`/`active`), либо завершившаяся БЕЗ комнаты (звонок не
+            поднялся, истории физически нет), отвечает 422 кодом
+            `session_not_continuable` (для первого случая дождитесь
+            `POST /end` и повторите, для второго повтор с тем же id
+            бессмыслен). Кап и биллинг новой сессии — ПОЛНЫЕ по ЕЁ каналу:
+            остаток времени или кредитов прошлой сессии никуда не
+            переносится, каждая сессия цепочки платит сама за себя; обратный
+            эффект — история УДОРОЖАЕТ каждый ход новой сессии на
+            chat-канале, потому что ~24 инжектированные реплики едут в
+            промпте наравне с текущим ходом и тарифицируются как
+            `chat_token`. ⚠️ ГОНКА ОСЕДАНИЯ ЛЕНТЫ: создать продолжение СРАЗУ
+            после `POST /end` безопасно (лента прошлой сессии флашится раз в
+            5с, воркер продолжения ретраит пустой fetch истории до ~6с
+            общего дедлайна — обычно этого достаточно), но при МГНОВЕННОМ
+            `continue_from` самый последний обмен реплик может не успеть:
+            в chat-сессии, которую закрыл САМ ВОРКЕР (сторож тишины,
+            отключение клиента), финальный флаш ленты уходит детерминированно
+            ДО списания — надёжнее; при `POST /end` от тенанта такой
+            гарантии НЕТ ни на одном канале: ядро закрывает сессию и считает
+            деньги синхронно, не дожидаясь воркера (припозднившееся
+            потребление ядро потом догоняет отдельной поправкой, но ЛЕНТА к
+            моменту ответа может быть ещё неполной). На voice/video финальный
+            флаш вдобавок конкурирует с обработкой отключения участника.
+            ⚠️ ЦЕПОЧКА НЕ ТРАНЗИТИВНА: засевается лента ТОЛЬКО
+            непосредственного предшественника — история более ранних звеньев
+            НЕ переносится (A → B → C: в C уезжает разговор B, но не A).
+            Нужен более длинный контекст — держите его в базе знаний или в
+            `agent.instructions`, а не в длине цепочки.
+            ⚠️ VOICE/VIDEO: клиент, войдя в продолженную сессию,
+            ОБЯЗАН прислать `resume_welcome` (тот же data-фрейм, что при
+            обычном reconnect — contracts/realtime/pv1/client-to-worker.schema.json)
+            — иначе аватар молчит до первой реплики респондента, потому что
+            первичный greeting гасится (это продолжение, а не новый
+            разговор). КОГДА СЛАТЬ: ПОСЛЕ появления агента в комнате (трек
+            аватара либо первый фрейм воркера), и ПОВТОРЯТЬ, пока нет
+            реакции. Фрейм, отправленный до входа агента, теряется безвозвратно
+            — LiveKit data-фреймы не буферизует; а попавший в окно
+            инициализации (до ~6с, пока воркер тянет ленту прошлой сессии)
+            может быть молча проглочен. Тот же приём, что с `client_ready`.
+            Для chat этого требования НЕТ: greeting в продолжении
+            не повторяется by design без каких-либо действий клиента, а
+            `resume_welcome` в chat-сессии — no-op.
+        knowledge:
+          type: object
+          properties:
+            base_ids: { type: array, items: { type: string } }
+            injection: { type: string, enum: [auto, 'off'], default: auto }
+        script:
+          type: object
+          properties:
+            questions: { type: array, items: { type: string } }
+            completion_policy:
+              type: object
+              additionalProperties: true
+              description: >-
+                Насколько жёстко держаться плана вопросов. Ядро читает отсюда
+                только `mode`; остальные ключи сохраняются в снимке сессии, но
+                на поведение пока не влияют.
+              properties:
+                mode:
+                  type: string
+                  enum: [free, guided, strict]
+                  default: guided
+                  description: >-
+                    `free` — свободный разговор: гейт завершения по плану
+                    вопросов выключен. `guided` (умолчание) — пока в плане
+                    остались незакрытые вопросы, агент не завершает разговор
+                    сам. `strict` — то же намерение, выраженное сильнее; в
+                    текущей версии ведёт себя как `guided`. Блока нет, значение
+                    незнакомое или не строка — считается `guided`.
+        cards:
+          type: array
+          items:
+            type: object
+            required: [kind, moment]
+            properties:
+              kind: { type: string, examples: [contact_form, feedback, bonus] }
+              moment: { type: string }
+              config: { type: object, additionalProperties: true }
+        limits:
+          type: object
+          properties:
+            max_duration_s: { type: integer, minimum: 60 }
+            max_credits: { type: integer, minimum: 1 }
+        recording:
+          type: object
+          properties: { audio: { type: boolean, default: false }, video: { type: boolean, default: false } }
+        client_reference: { type: string, maxLength: 255, description: 'Сквозной id тенанта, возвращается в сессионных webhooks — session.*, transcript.ready, message.created, recording.ready' }
+        metadata: { type: object, additionalProperties: true }
+    ParticipantToken:
+      type: object
+      required: [token, expires_at, identity]
+      properties:
+        token: { type: string, description: 'LiveKit-grant для ЛЮБОГО канала, включая chat — chat получает тот же токен, но с data-only правами (canPublish=false, canSubscribe=true, canPublishData=true), см. Channel' }
+        identity: { type: string, description: 'identity, на которую выпущен именно этот токен' }
+        livekit_url: { type: string }
+        expires_at: { type: string, format: date-time }
+    ParticipantTokenRequest:
+      type: object
+      required: [identity]
+      properties:
+        identity: { type: string, description: 'identity участника для этого входа; при reconnect обычно НОВАЯ — переиспользование identity выкидывает из комнаты ещё живого прежнего участника LiveKit' }
+    SessionCreated:
+      type: object
+      required: [session_id, participant_token]
+      properties:
+        session_id: { type: string }
+        room: { type: string }
+        participant_token: { $ref: '#/components/schemas/ParticipantToken' }
+        continued_from:
+          type: string
+          examples: [sess_8f19a2e6c4d17b03]
+          description: >-
+            Публичный id сессии, разговор которой продолжает созданная (эхо
+            присланного `continue_from`). ПОЛЕ ОПУСКАЕТСЯ у обычной сессии —
+            то же правило, что у `Session.continued_from`. Отдаётся ИМЕННО
+            здесь, а не только в карточке, потому что решение клиента зависит
+            от него сразу: на voice/video продолженная сессия начинается молча,
+            и слать ли `resume_welcome`, фронт должен знать из того же ответа,
+            которым получил токен, — без второго запроса к
+            `GET /v1/sessions/{id}`. Между Server API и живым клиентом обычно
+            стоит бэкенд тенанта, и «он и так знает, что прислал» верно только
+            для него, а не для того, кто входит в комнату.
+    Session:
+      type: object
+      required: [session_id, channel, status]
+      properties:
+        session_id: { type: string }
+        channel: { $ref: '#/components/schemas/Channel' }
+        status: { $ref: '#/components/schemas/SessionStatus' }
+        client_reference: { type: string }
+        continued_from:
+          type: string
+          examples: [sess_8f19a2e6c4d17b03]
+          description: >-
+            Публичный id сессии, разговор которой это продолжение (то же
+            значение, что было отправлено в `continue_from` при создании).
+            ПОЛЕ ОПУСКАЕТСЯ у обычной сессии, а не приезжает как `null` — то
+            же правило, что у `client_reference`/`quality`; тенант отличает
+            продолжение от самостоятельной сессии наличием ключа, а не его
+            значением. Связь отдают ТРИ ответа одинаково: 201 создания
+            (`SessionCreated` — чтобы клиент знал про продолжение сразу, до
+            входа в комнату), эта карточка и `SessionFinalizedData`.
+            ⚠️ ОСТАЁТСЯ ОДНА АСИММЕТРИЯ, И ОНА ОСОЗНАННАЯ: конверт
+            `session.started` цепочку НЕ несёт — его состав заморожен и
+            отвечает на вопрос «сессия поехала», а не «откуда она взялась»;
+            для учёта по вебхукам связь приезжает в финальном конверте.
+        duration_s:
+          type: integer
+          description: >-
+            Оплачиваемая длительность в секундах. Отсчёт идёт с ВЫДАЧИ сессии
+            (ответ POST /v1/sessions: комната создана, агент вызван, токен
+            подписан), а не с входа участника в комнату — раньше собственного
+            входа ядро о нём не знает. Значение прижато к проданному
+            limits.max_duration_s; у закрытой сессии оно может быть уточнено
+            только ВНИЗ (активное время разговора знает воркер), и переплата в
+            этом случае возвращается операцией adjustment (поправка знаковая:
+            возврат — плюсом, см. CreditOperationKind).
+        credits_total:
+          type: integer
+          description: >-
+            СТОИМОСТЬ сессии по прайсу на момент её закрытия, а не «сколько
+            списали». Числа расходятся в двух случаях. Первый: баланса не
+            хватило, и списание прижалось к нему (drain-to-zero) — тогда
+            фактически снято меньше, и разница НЕ добирается позже, даже если
+            счёт пополнить. Второй: потребление доехало ПОСЛЕ расчёта (токены
+            chat-хода приезжают отдельным асинхронным каналом и могут опоздать к
+            синхронному POST /v1/sessions/{id}/end) — это расхождение временное,
+            догон приходит отдельной поправкой adjustment, и поле само
+            обновляется до полной стоимости. Точка правды по деньгам — GET
+            /v1/credits/operations, а именно СУММА операций со ссылкой на эту
+            сессию: session_debit плюс поправки adjustment (и возврат переплаты,
+            и догон идут ОТДЕЛЬНЫМИ строками с тем же reference, а не правкой
+            прежней). У живой сессии поле честно нулевое: потребление считается,
+            но счёт ещё не закрыт.
+        usage_summary: { type: object, additionalProperties: { type: number }, description: 'метр → количество в юнитах метра (не credits)' }
+        quality: { $ref: '#/components/schemas/SessionQuality' }
+    SessionQualityVerdict:
+      type: string
+      enum: [ok, degraded, bad, no_show, silent_user]
+      description: >-
+        Вердикт качества закрытой сессии по событиям пайплайна. bad — аватар
+        фактически не работал (не поднялся, молчал, TTS умер, оборвалась на
+        старте с ошибкой); degraded — разговор состоялся, но с деградацией
+        (фолбэки провайдеров, единичные ошибки STT, «проглоченные» ходы,
+        потери пакетов); no_show — респондент так и не пришёл; silent_user —
+        пришёл, но молчал, и сессию закрыл сторож тишины. Последние два — НЕ
+        ошибка продукта.
+    SessionQuality:
+      type: object
+      additionalProperties: true
+      description: >-
+        Качество закрытой сессии. Поле ОПУСКАЕТСЯ у живой сессии: вердикт
+        выводится на финализации и там же замораживается. У закрытой он есть
+        всегда — сессия, о событиях которой ядро ничего не узнало, это no_show
+        по правилам, а не пробел в данных. Состав может расширяться:
+        дополнительные ключи допустимы контрактом.
+      properties:
+        verdict: { $ref: '#/components/schemas/SessionQualityVerdict' }
+        reasons:
+          type: array
+          items: { type: string }
+          description: >-
+            Коды причин вердикта (stt_error_x3, unanswered_turns_x5,
+            high_packet_loss, silence, …) — для разбора инцидента, а не для
+            логики на стороне тенанта.
+        speech_to_speak_ms:
+          type: integer
+          description: >-
+            Серверная задержка «конец речи респондента → аватар заговорил»,
+            СРЕДНЕЕ по ходам сессии, миллисекунды. Клиентское плечо (доставка
+            звука до колонок респондента) сюда не входит. Ключ опускается,
+            когда ни один ход замера не дал.
+    TranscriptMessage:
+      type: object
+      required: [seq, role, text, created_at]
+      properties:
+        seq: { type: integer }
+        role: { $ref: '#/components/schemas/MessageRole' }
+        text: { type: string }
+        created_at: { type: string, format: date-time }
+    TranscriptPage:
+      type: object
+      required: [messages, has_more]
+      properties:
+        messages: { type: array, items: { $ref: '#/components/schemas/TranscriptMessage' } }
+        has_more:
+          type: boolean
+          description: >-
+            Есть ли ещё реплики за пределами страницы. Следующая страница
+            запрашивается с after_seq = seq последней полученной реплики.
+    RecordingStatus:
+      type: string
+      enum: [pending, processing, ready, failed]
+      description: Состояние записи сессии.
+    Recording:
+      type: object
+      required: [status]
+      properties:
+        status: { $ref: '#/components/schemas/RecordingStatus' }
+        url: { type: [string, 'null'], format: uri, description: 'Ссылка на файл записи; заполнена только при status = ready' }
+        duration_s: { type: integer }
+        bytes: { type: integer }
+    DocumentType:
+      type: string
+      enum: [text, file, url, website]
+      description: Тип источника документа в базе знаний.
+    DocumentCreateType:
+      type: string
+      enum: [text, url, website]
+      description: 'Тип документа при JSON-инжесте; файл заливается multipart-вариантом той же ручки и получает type = file.'
+    DocumentStatus:
+      type: string
+      enum: [pending, parsing, embedding, ready, error]
+      description: Стадия конвейера инжеста документа.
+    KnowledgeBaseCreate:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, maxLength: 255 }
+        metadata:
+          type: object
+          additionalProperties: true
+          description: >-
+            Принимается для forward-compat и участвует в отпечатке
+            идемпотентности, но ядром пока НЕ ХРАНИТСЯ (колонки нет) — не
+            рассчитывайте прочитать её обратно.
+    KnowledgeBase:
+      type: object
+      required: [kb_id]
+      properties:
+        kb_id: { type: string, examples: [kb_7f3a2c] }
+        name: { type: string }
+        created_at: { type: string, format: date-time }
+    DocumentCreate:
+      type: object
+      required: [type]
+      properties:
+        type: { $ref: '#/components/schemas/DocumentCreateType' }
+        content: { type: string, description: 'Текст документа; обязателен при type = text' }
+        url: { type: string, format: uri, description: 'Адрес источника; обязателен при type = url и type = website' }
+        title: { type: string, maxLength: 255 }
+        metadata:
+          type: object
+          additionalProperties: true
+          description: >-
+            Принимается для forward-compat и участвует в отпечатке
+            идемпотентности, но ядром пока НЕ ХРАНИТСЯ (колонки нет) — не
+            рассчитывайте прочитать её обратно.
+    DocumentUpload:
+      type: object
+      required: [file]
+      properties:
+        file: { type: string, format: binary, description: 'Файл документа — pdf, docx, txt, md' }
+        title: { type: string, maxLength: 255 }
+    DocumentCreated:
+      type: object
+      required: [document_id, status]
+      properties:
+        document_id: { type: string, examples: [doc_91b4e0] }
+        status: { $ref: '#/components/schemas/DocumentStatus' }
+    Document:
+      type: object
+      required: [document_id, status]
+      properties:
+        document_id: { type: string, examples: [doc_91b4e0] }
+        kb_id: { type: string, examples: [kb_7f3a2c] }
+        type: { $ref: '#/components/schemas/DocumentType' }
+        status: { $ref: '#/components/schemas/DocumentStatus' }
+        title: { type: string }
+        url: { type: string, format: uri }
+        chunks: { type: integer, description: Число проиндексированных чанков }
+        error: { type: string, description: 'Причина отказа; заполнена только при status = error' }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    SearchRequest:
+      type: object
+      required: [q]
+      properties:
+        q: { type: string, description: Поисковый запрос }
+        k: { type: integer, minimum: 1, maximum: 50, default: 5, description: Сколько чанков вернуть }
+    SearchChunk:
+      type: object
+      required: [document_id, text, score]
+      properties:
+        document_id: { type: string }
+        text: { type: string }
+        score: { type: number, description: 'Релевантность, больше — ближе' }
+    SearchResult:
+      type: object
+      required: [chunks]
+      properties:
+        chunks: { type: array, items: { $ref: '#/components/schemas/SearchChunk' } }
+    UsageItem:
+      type: object
+      required: [group_key, meter, quantity, credits]
+      properties:
+        group_key: { type: string, description: 'ключ группировки: дата ISO при day, id сессии при session, имя счётчика при meter' }
+        meter: { type: string, description: 'счётчик потребления; есть при ЛЮБОМ разрезе — складывать секунды разговора с токенами нельзя', examples: [voice_second] }
+        quantity: { type: number, description: 'количество в юнитах метра (не credits)' }
+        credits: { type: integer }
+    UsagePage:
+      type: object
+      required: [items]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/UsageItem' } }
+    CreditsBalance:
+      type: object
+      required: [balance, updated_at]
+      properties:
+        balance: { type: integer }
+        updated_at: { type: string, format: date-time }
+    CreditOperationKind:
+      type: string
+      # ЛЕНТА kind РАСТЁТ по фазам (здесь +knowledge_hold/knowledge_settle к
+      # knowledge_debit). Пополнение response-enum'а oasdiff считает ломающим
+      # (`response-property-enum-value-added`); политика гейта для ЭТОЙ проверки —
+      # `info` (contracts/oasdiff-severity.conf): клиент ленты операций обязан
+      # толерировать неизвестный kind, а СУЖЕНИЕ enum'а остаётся gated (warn).
+      # Список = App\Entity\CreditOperation::KINDS (держится тестом схемы).
+      enum: [purchase, session_debit, knowledge_debit, knowledge_hold, knowledge_settle, adjustment, expiry]
+      description: >-
+        Тип операции леджера credits. knowledge_hold — резерв под инжест базы
+        знаний на accept (списание оценки); knowledge_settle — коррекция резерва
+        до реальной стоимости на ready/error (возврат переоценки, доспиcание либо
+        release). knowledge_debit — историческая модель drain-to-zero, новыми
+        инжестами не пишется. adjustment — ЗНАКОВАЯ поправка к уже проведённому
+        расчёту сессии, и знак решает семантику: плюс — возврат переплаты
+        (длительность уточнена вниз), минус — догон потребления, доехавшего
+        после расчёта (токены chat-хода приезжают асинхронно). Поправок у одной
+        сессии может быть несколько; итог по сессии — СУММА всех её операций.
+    CreditOperation:
+      type: object
+      required: [id, kind, amount, balance_after, created_at]
+      properties:
+        id: { type: string, description: 'Непрозрачный идентификатор операции, формат op_*', examples: [op_9f1c2a7b4e5d6013] }
+        kind: { $ref: '#/components/schemas/CreditOperationKind' }
+        amount: { type: integer, description: 'Положительное — пополнение, отрицательное — списание' }
+        balance_after: { type: integer }
+        reference: { type: string, description: 'Ссылка на источник операции — id сессии, документа или платежа' }
+        created_at: { type: string, format: date-time }
+    CreditOperationsPage:
+      type: object
+      required: [items, has_more]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/CreditOperation' } }
+        has_more:
+          type: boolean
+          description: >-
+            Лента усечена: за период есть ещё операции. Ядро отдаёт не больше
+            200 записей на запрос, свежие первыми. Если их больше — остаток за
+            эти сутки недоступен: курсорной пагинации у ручки пока нет, а
+            from/to принимают ДАТЫ, то есть сужение периода помогает, только
+            если он шире суток.
+    SessionTerminalStatus:
+      type: string
+      enum: [finalized, expired]
+      description: >-
+        Терминальное состояние сессии в событии session.finalized — осознанное
+        подмножество SessionStatus. Значения created / active / paused в это
+        событие не приходят: оно шлётся один раз, после закрытия сессии.
+    WebhookEnvelope:
+      type: object
+      required: [api_version, event_id, type, created, data]
+      properties:
+        api_version: { type: string, examples: [v1] }
+        event_id: { type: string, description: Идемпотентность на стороне тенанта }
+        type: { type: string, examples: [session.finalized] }
+        created: { type: string, format: date-time }
+        data: { type: object, additionalProperties: true, description: 'Полезная нагрузка события; конкретная форма — в схеме <Event>Data' }
+    SessionStartedData:
+      type: object
+      required: [session_id, channel, started_at]
+      properties:
+        session_id: { type: string }
+        client_reference: { type: string }
+        channel: { $ref: '#/components/schemas/Channel' }
+        started_at: { type: string, format: date-time }
+    SessionStartedEvent:
+      allOf:
+        - $ref: '#/components/schemas/WebhookEnvelope'
+        - type: object
+          required: [type, data]
+          properties:
+            type: { type: string, const: 'session.started' }
+            data: { $ref: '#/components/schemas/SessionStartedData' }
+    SessionFinalizedData:
+      type: object
+      required: [session_id, status, duration_s, credits_total]
+      properties:
+        session_id: { type: string }
+        client_reference: { type: string }
+        continued_from:
+          type: string
+          examples: [sess_8f19a2e6c4d17b03]
+          description: >-
+            То же поле, что в карточке `GET /v1/sessions/{id}`
+            (`Session.continued_from`) — конверт строится из карточки и
+            наследует её правило: поле есть ТОЛЬКО у сессий-продолжений и
+            опускается, а не приезжает `null`, у остальных.
+            `session.started` эту связь не несёт (см.
+            `Session.continued_from` про асимметрию).
+        status: { $ref: '#/components/schemas/SessionTerminalStatus' }
+        duration_s: { type: integer }
+        credits_total:
+          type: integer
+          description: >-
+            СТОИМОСТЬ сессии по прайсу на момент её закрытия, а не «сколько
+            списали». Числа расходятся в двух случаях: баланса не хватило и
+            списание прижалось к нему (drain-to-zero, разница не добирается
+            позже) либо потребление доехало ПОСЛЕ расчёта (асинхронный канал
+            токенов chat) — тогда стоимость догоняется отдельной поправкой
+            adjustment. Точка правды по деньгам — GET /v1/credits/operations, а
+            именно СУММА операций со ссылкой на эту сессию: session_debit плюс
+            поправки adjustment (и возврат переплаты, и догон идут ОТДЕЛЬНЫМИ
+            строками с тем же reference, а не правкой прежней). ⚠️ ЗНАЧЕНИЕ В
+            ЭТОМ КОНВЕРТЕ ЗАМОРОЖЕНО на момент постановки события: поздний
+            досчёт (уточнение длительности воркером, проход подметальщика, догон
+            позднего потребления) его уже не поправит — второго
+            session.finalized у сессии не бывает. Авторитетный итог по закрытой
+            сессии — GET /v1/sessions/{session_id} и лента операций.
+        usage_summary: { type: object, additionalProperties: { type: number }, description: 'метр → количество в юнитах метра (не credits)' }
+        quality: { $ref: '#/components/schemas/SessionQuality' }
+    SessionFinalizedEvent:
+      allOf:
+        - $ref: '#/components/schemas/WebhookEnvelope'
+        - type: object
+          required: [type, data]
+          properties:
+            type: { type: string, const: 'session.finalized' }
+            data: { $ref: '#/components/schemas/SessionFinalizedData' }
+    TranscriptReadyData:
+      type: object
+      required: [session_id, message_count]
+      properties:
+        session_id: { type: string }
+        client_reference: { type: string }
+        message_count: { type: integer }
+    TranscriptReadyEvent:
+      allOf:
+        - $ref: '#/components/schemas/WebhookEnvelope'
+        - type: object
+          required: [type, data]
+          properties:
+            type: { type: string, const: 'transcript.ready' }
+            data: { $ref: '#/components/schemas/TranscriptReadyData' }
+    MessageCreatedData:
+      type: object
+      required: [session_id, message]
+      properties:
+        session_id: { type: string }
+        client_reference: { type: string }
+        message: { $ref: '#/components/schemas/TranscriptMessage' }
+    MessageCreatedEvent:
+      allOf:
+        - $ref: '#/components/schemas/WebhookEnvelope'
+        - type: object
+          required: [type, data]
+          properties:
+            type: { type: string, const: 'message.created' }
+            data: { $ref: '#/components/schemas/MessageCreatedData' }
+    RecordingReadyData:
+      type: object
+      required: [session_id, recording]
+      properties:
+        session_id: { type: string }
+        client_reference: { type: string }
+        recording: { $ref: '#/components/schemas/Recording' }
+    RecordingReadyEvent:
+      allOf:
+        - $ref: '#/components/schemas/WebhookEnvelope'
+        - type: object
+          required: [type, data]
+          properties:
+            type: { type: string, const: 'recording.ready' }
+            data: { $ref: '#/components/schemas/RecordingReadyData' }
+    KnowledgeDocumentReadyData:
+      type: object
+      required: [kb_id, document_id, status]
+      properties:
+        kb_id: { type: string }
+        document_id: { type: string }
+        status: { type: string, const: ready, description: Событие шлётся только на успешном финале инжеста }
+        chunks: { type: integer }
+    KnowledgeDocumentReadyEvent:
+      allOf:
+        - $ref: '#/components/schemas/WebhookEnvelope'
+        - type: object
+          required: [type, data]
+          properties:
+            type: { type: string, const: 'knowledge.document.ready' }
+            data: { $ref: '#/components/schemas/KnowledgeDocumentReadyData' }
+    KnowledgeDocumentFailedData:
+      type: object
+      required: [kb_id, document_id, status, error]
+      properties:
+        kb_id: { type: string }
+        document_id: { type: string }
+        status: { type: string, const: error, description: Событие шлётся только на провале инжеста }
+        error: { type: string }
+    KnowledgeDocumentFailedEvent:
+      allOf:
+        - $ref: '#/components/schemas/WebhookEnvelope'
+        - type: object
+          required: [type, data]
+          properties:
+            type: { type: string, const: 'knowledge.document.failed' }
+            data: { $ref: '#/components/schemas/KnowledgeDocumentFailedData' }
+    CreditsLowData:
+      type: object
+      required: [balance, threshold]
+      properties:
+        balance: { type: integer }
+        threshold: { type: integer }
+    CreditsLowEvent:
+      allOf:
+        - $ref: '#/components/schemas/WebhookEnvelope'
+        - type: object
+          required: [type, data]
+          properties:
+            type: { type: string, const: 'credits.low' }
+            data: { $ref: '#/components/schemas/CreditsLowData' }
+paths:
+  /v1/ping:
+    get:
+      operationId: ping
+      summary: Проверить ключ тенанта
+      description: >-
+        Проба без побочных эффектов: подтверждает, что ключ действителен, и
+        показывает, кем ядро считает предъявителя. Ответ не кешируется —
+        отозванный ключ отдаёт 401 сразу. Это НЕ проба живости сервиса:
+        для мониторинга есть публичный GET /health вне /api.
+      tags: [Tenancy]
+      responses:
+        '200': { description: Ключ действителен, content: { application/json: { schema: { $ref: '#/components/schemas/PingResponse' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/sessions:
+    post:
+      operationId: createSession
+      summary: Создать сессию (любой канал) + сразу выпустить participant-token
+      tags: [Sessions]
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/SessionCreate' } } }
+      responses:
+        '201': { description: Создано, content: { application/json: { schema: { $ref: '#/components/schemas/SessionCreated' } } } }
+        '402': { description: Недостаточно credits, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: >-
+            `continue_from` указывает на сессию, которой у этого тенанта нет
+            — чужую или выдуманную ядро не различает и отвечает тем же телом,
+            что `GET /v1/sessions/{id}` (не оракул чужих `sess_*`). Без
+            `continue_from` в теле эта ручка 404 не отдаёт вовсе.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '409':
+          description: >-
+            Конфликт по Idempotency-Key: тот же ключ пришёл с ДРУГИМ телом
+            запроса (idempotency_key_reuse) либо первый запрос с этим ключом
+            ещё выполняется (idempotency_in_progress — повторить через мгновение).
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '410':
+          description: >-
+            Idempotency-Key указывает на уже завершённую сессию (код
+            session_finished). Ключ живёт вместе со своей сессией и на новую не
+            переиспользуется: нужна новая сессия — нужен новый ключ.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '422':
+          description: >-
+            Два разных кода под одним статусом. `validation_failed` — тело не
+            проходит контракт: в том числе `limits.max_credits`, не
+            покрывающий минимальную сессию (пополнение баланса тут не
+            поможет), и `continue_from` кривой формы — включая пустую
+            строку, которая НЕ трактуется как отсутствие поля и обязана быть
+            публичным id сессии (`sess_*`) целиком. `session_not_continuable`
+            — `continue_from` указывает на СУЩЕСТВУЮЩУЮ сессию этого
+            тенанта, которую нельзя продолжить: она ещё идёт
+            (`created`/`active` — дождитесь `POST /end` и повторите) либо
+            завершилась БЕЗ комнаты (истории физически нет, повтор
+            бессмыслен). Любой терминальный статус С комнатой продолжаем — и
+            `finalized`, и `expired` (включая сессию, которую после смерти
+            воркера закрыл сторож зависших).
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /v1/sessions/{sessionId}:
+    get:
+      operationId: getSession
+      summary: Карточка сессии
+      tags: [Sessions]
+      parameters: [ { $ref: '#/components/parameters/SessionId' } ]
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Session' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/sessions/{sessionId}/end:
+    post:
+      operationId: endSession
+      summary: Завершить сессию
+      tags: [Sessions]
+      parameters: [ { $ref: '#/components/parameters/SessionId' } ]
+      responses:
+        '204': { description: Завершено }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/sessions/{sessionId}/participant-tokens:
+    post:
+      operationId: issueParticipantToken
+      summary: Повторный вход (reconnect) в ту же сессию
+      tags: [Sessions]
+      parameters: [ { $ref: '#/components/parameters/SessionId' } ]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/ParticipantTokenRequest' } } }
+      responses:
+        '201': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/ParticipantToken' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '410':
+          description: >-
+            Сессия завершена (код session_finished) — входить некуда. Тем же
+            кодом отвечает сессия, у которой не удалось поднять комнату.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '422': { description: Невалидное тело (identity обязателен), content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /v1/sessions/{sessionId}/transcript:
+    get:
+      operationId: getTranscript
+      summary: Транскрипт сессии
+      description: >-
+        Лента наполняется у ЛЮБОГО канала, включая `chat` (ИЗМЕНЕНИЕ
+        ПОВЕДЕНИЯ Э3.5: раньше медиа-less канал нигде не персистировал
+        реплики, и эта ручка отдавала бы пустую страницу на живом диалоге) —
+        обе роли приезжают тем же путём, что у voice/video. Служебные
+        реплики chat (greeting, нудж и прощание сторожа простоя) в ленту НЕ
+        попадают — только `user_text` и ответы аватара, порождённые самим
+        диалогом; это же ограничивает то, что засевается в контекст
+        `continue_from` следующей сессии.
+      tags: [Sessions]
+      parameters:
+        - { $ref: '#/components/parameters/SessionId' }
+        - name: after_seq
+          in: query
+          required: false
+          description: >-
+            Отдавать реплики строго ПОСЛЕ этого seq. Нумерация разрежена
+            (дырка остаётся от реплики, отбитой дедупом), поэтому курсором
+            служит seq последней полученной реплики, а не счётчик страниц.
+          schema: { type: integer, minimum: 0, default: 0 }
+        - name: limit
+          in: query
+          required: false
+          description: 'Сколько реплик отдать за раз'
+          schema: { type: integer, minimum: 1, maximum: 500, default: 500 }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/TranscriptPage' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { description: Невалидный limit или after_seq, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /v1/sessions/{sessionId}/recording:
+    get:
+      operationId: getRecording
+      summary: Запись сессии
+      tags: [Sessions]
+      parameters: [ { $ref: '#/components/parameters/SessionId' } ]
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Recording' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/knowledge-bases:
+    post:
+      operationId: createKnowledgeBase
+      summary: Создать базу знаний
+      tags: [Knowledge]
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/KnowledgeBaseCreate' } } }
+      responses:
+        '201': { description: Создано, content: { application/json: { schema: { $ref: '#/components/schemas/KnowledgeBase' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: >-
+            Тот же Idempotency-Key пришёл с ДРУГИМ телом запроса
+            (idempotency_key_reuse).
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '422': { description: Невалидные поля, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /v1/knowledge-bases/{kbId}:
+    delete:
+      operationId: deleteKnowledgeBase
+      summary: Удалить базу знаний вместе с документами
+      tags: [Knowledge]
+      parameters: [ { $ref: '#/components/parameters/KnowledgeBaseId' } ]
+      responses:
+        '204': { description: Удалено }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/knowledge-bases/{kbId}/documents:
+    post:
+      operationId: createDocument
+      summary: Добавить документ в базу знаний
+      description: >-
+        Инжест асинхронный: ядро возвращает document_id со статусом pending и
+        досылает knowledge.document.ready либо knowledge.document.failed.
+        Файл — multipart/form-data, текст и ссылки — JSON.
+      tags: [Knowledge]
+      parameters:
+        - { $ref: '#/components/parameters/KnowledgeBaseId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: '#/components/schemas/DocumentCreate' } }
+          multipart/form-data: { schema: { $ref: '#/components/schemas/DocumentUpload' } }
+      responses:
+        '201': { description: Принято в обработку, content: { application/json: { schema: { $ref: '#/components/schemas/DocumentCreated' } } } }
+        '402':
+          description: >-
+            Недостаточно credits на инжест (insufficient_credits). Баланс ≤ 0 либо
+            КОНСЕРВАТИВНАЯ оценка стоимости документа (по размеру/содержимому)
+            превышает баланс: тенант не стартует документ, чья максимальная
+            стоимость больше баланса. Оценка грубая (pre-flight), фактическое
+            списание идёт по числу токенов эмбеддинга на готовности документа.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: >-
+            Тот же Idempotency-Key пришёл с ДРУГИМ телом/файлом или для другой
+            базы (idempotency_key_reuse) ЛИБО достигнут кап числа/объёма
+            документов тенанта (knowledge_quota_exceeded). Ключ уникален в
+            пределах тенанта.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '422': { description: Невалидный документ, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /v1/knowledge-bases/{kbId}/documents/{docId}:
+    get:
+      operationId: getDocument
+      summary: Статус и карточка документа
+      tags: [Knowledge]
+      parameters:
+        - { $ref: '#/components/parameters/KnowledgeBaseId' }
+        - { $ref: '#/components/parameters/DocumentId' }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Document' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      operationId: deleteDocument
+      summary: Удалить документ из базы знаний
+      tags: [Knowledge]
+      parameters:
+        - { $ref: '#/components/parameters/KnowledgeBaseId' }
+        - { $ref: '#/components/parameters/DocumentId' }
+      responses:
+        '204': { description: Удалено }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/knowledge-bases/{kbId}/search:
+    post:
+      operationId: searchKnowledgeBase
+      summary: Семантический поиск по чанкам базы знаний
+      tags: [Knowledge]
+      parameters: [ { $ref: '#/components/parameters/KnowledgeBaseId' } ]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/SearchRequest' } } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/SearchResult' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { description: Невалидный запрос, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /v1/usage:
+    get:
+      operationId: getUsage
+      summary: Агрегаты потребления за период
+      tags: [Usage]
+      parameters:
+        - { $ref: '#/components/parameters/PeriodFrom' }
+        - { $ref: '#/components/parameters/PeriodTo' }
+        - name: group_by
+          in: query
+          required: false
+          description: 'Разрез агрегации; по умолчанию — day'
+          schema: { type: string, enum: [day, session, meter], default: day }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/UsagePage' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { description: Невалидный период или разрез, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /v1/credits/balance:
+    get:
+      operationId: getCreditsBalance
+      summary: Текущий баланс credits тенанта
+      tags: [Usage]
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/CreditsBalance' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/credits/operations:
+    get:
+      operationId: listCreditOperations
+      summary: Операции леджера credits за период
+      tags: [Usage]
+      parameters:
+        - { $ref: '#/components/parameters/PeriodFrom' }
+        - { $ref: '#/components/parameters/PeriodTo' }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/CreditOperationsPage' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { description: Невалидный период, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+webhooks:
+  sessionStarted:
+    post:
+      operationId: onSessionStarted
+      summary: session.started — сессия перешла в active
+      tags: [Webhooks]
+      security: [ { webhookSignature: [] } ]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/SessionStartedEvent' } } }
+      responses:
+        '200': { description: Принято тенантом }
+  sessionFinalized:
+    post:
+      operationId: onSessionFinalized
+      summary: session.finalized — сессия закрыта, деньги посчитаны
+      tags: [Webhooks]
+      security: [ { webhookSignature: [] } ]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/SessionFinalizedEvent' } } }
+      responses:
+        '200': { description: Принято тенантом }
+  transcriptReady:
+    post:
+      operationId: onTranscriptReady
+      summary: transcript.ready — транскрипт сессии собран целиком
+      tags: [Webhooks]
+      security: [ { webhookSignature: [] } ]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/TranscriptReadyEvent' } } }
+      responses:
+        '200': { description: Принято тенантом }
+  messageCreated:
+    post:
+      operationId: onMessageCreated
+      summary: message.created — новая реплика в сессии
+      tags: [Webhooks]
+      security: [ { webhookSignature: [] } ]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/MessageCreatedEvent' } } }
+      responses:
+        '200': { description: Принято тенантом }
+  recordingReady:
+    post:
+      operationId: onRecordingReady
+      summary: recording.ready — запись сессии смикширована и доступна
+      tags: [Webhooks]
+      security: [ { webhookSignature: [] } ]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/RecordingReadyEvent' } } }
+      responses:
+        '200': { description: Принято тенантом }
+  knowledgeDocumentReady:
+    post:
+      operationId: onKnowledgeDocumentReady
+      summary: knowledge.document.ready — документ проиндексирован
+      tags: [Webhooks]
+      security: [ { webhookSignature: [] } ]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/KnowledgeDocumentReadyEvent' } } }
+      responses:
+        '200': { description: Принято тенантом }
+  knowledgeDocumentFailed:
+    post:
+      operationId: onKnowledgeDocumentFailed
+      summary: knowledge.document.failed — инжест документа сорвался
+      tags: [Webhooks]
+      security: [ { webhookSignature: [] } ]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/KnowledgeDocumentFailedEvent' } } }
+      responses:
+        '200': { description: Принято тенантом }
+  creditsLow:
+    post:
+      operationId: onCreditsLow
+      summary: credits.low — баланс тенанта пробил порог
+      tags: [Webhooks]
+      security: [ { webhookSignature: [] } ]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/CreditsLowEvent' } } }
+      responses:
+        '200': { description: Принято тенантом }

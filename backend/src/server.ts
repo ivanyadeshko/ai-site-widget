@@ -1,10 +1,12 @@
 import { buildApp } from './app.ts';
 import { loadConfig } from './config.ts';
+import { CoreClient } from './core/client.ts';
 import { createPool } from './db/pool.ts';
 
 const config = loadConfig(process.env);
 const pool = createPool(config.databaseUrl);
-const app = await buildApp({ config, pool });
+const core = new CoreClient({ baseUrl: config.coreBaseUrl, tenantKey: config.coreTenantKey, timeoutMs: 45_000 });
+const app = await buildApp({ config, pool, core });
 
 await app.listen({ port: config.port, host: '0.0.0.0' });
 

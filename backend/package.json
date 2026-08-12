@@ -8,7 +8,9 @@
     "start": "node dist/server.js",
     "migrate": "node-pg-migrate -m migrations --envPath ../.env up",
     "test": "vitest run",
-    "db:test:up": "docker compose -f ../infra/compose.test.yaml up -d --wait"
+    "db:test:up": "docker compose -f ../infra/compose.test.yaml up -d --wait",
+    "contracts:sync": "node ../contracts/sync.mjs && npx openapi-typescript ../contracts/openapi.core.yaml -o ../contracts/core-api.d.ts",
+    "contracts:check": "node ../contracts/sync.mjs --check"
   },
   "dependencies": {
     "fastify": "^5.2.0",
@@ -20,6 +22,7 @@
   "devDependencies": {
     "@types/node": "^22.10.0",
     "@types/pg": "^8.11.10",
+    "openapi-typescript": "^7.4.0",
     "typescript": "~5.7.2",
     "vitest": "^3.0.0"
   }

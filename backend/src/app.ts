@@ -1,18 +1,15 @@
 import Fastify, { type FastifyBaseLogger, type FastifyInstance } from 'fastify';
 import type { Pool } from 'pg';
 import type { AppConfig } from './config.ts';
+import type { CoreClient } from './core/client.ts';
+import { coreWebhookRoutes } from './routes/coreWebhooks.ts';
 import { healthRoutes } from './routes/health.ts';
-
-// Плейсхолдер: T2 заносит настоящий клиент ядра (CoreClient) в свой модуль и
-// заменяет этот alias на импорт оттуда. Имя типа зафиксировано контрактом T1
-// уже сейчас, чтобы `AppDeps.core` не переименовывался в чужом таске.
-export type CoreClient = unknown;
 
 export type AppDeps = {
   config: AppConfig;
   pool: Pool;
   log: FastifyBaseLogger;
-  core?: CoreClient; // в T2 станет обязательным
+  core: CoreClient;
 };
 
 /** То, что передаёт вызывающий: логгер рождается вместе с инстансом Fastify. */
@@ -35,6 +32,7 @@ export async function buildApp(input: AppDepsInput): Promise<FastifyInstance> {
   const deps: AppDeps = { ...input, log: app.log };
   app.decorate('deps', deps);
   await app.register(healthRoutes);
+  await app.register(coreWebhookRoutes);
   return app;
 }
 
