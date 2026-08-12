@@ -12,6 +12,15 @@ export class FakeCore {
 
   enqueue(reply: FakeReply): this { this.queue.push(reply); return this; }
 
+  /**
+   * Сброс НЕДОРАЗОБРАННЫХ ответов между тестами: `core` в файле — один
+   * долгоживущий инстанс на весь suite (реальный HTTP-сервер, поднимать заново
+   * на каждый тест дорого), и `enqueue`, не съеденный своим тестом (например,
+   * под мутацией, которая нарочно делает МЕНЬШЕ запросов, чем ожидалось),
+   * иначе тихо просачивается в следующий тест и путает его результат.
+   */
+  resetQueue(): void { this.queue.length = 0; }
+
   get baseUrl(): string { return `http://127.0.0.1:${this.port}/api`; }
 
   async start(): Promise<void> {

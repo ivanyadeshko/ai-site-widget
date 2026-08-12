@@ -3,7 +3,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.ts';
 import { CoreClient } from '../src/core/client.ts';
-import { applyFinalizedUsage, insertDialog, attachCoreSession, findDialogById } from '../src/db/repositories/dialogs.ts';
+import { applyFinalizedUsage, insertDialog, attachCoreSession, findDialogById, setDialogStatus } from '../src/db/repositories/dialogs.ts';
 import { insertMessage, listThreadTail } from '../src/db/repositories/messages.ts';
 import { FakeCore } from './helpers/fakeCore.ts';
 import { seedWidget, testPool, truncateAll } from './helpers/db.ts';
@@ -87,6 +87,34 @@ describe('POST /w/v1/core-webhooks', () => {
     expect(fresh?.usage).toEqual({ chat_token: 1200 });
   });
 
+  it('повторная доставка ОДНОГО transcript.ready-конверта не долбит ядро дважды — дедуп на core_events', async () => {
+    // Вскрывающая проба: деньги (session.finalized) идемпотентны САМИ ПО СЕБЕ
+    // через settled_session_ids (см. тест «гонка со свипером» выше), поэтому
+    // мутация `if (!fresh) return` их не ловит — эта проба целится в другую
+    // ветку (transcript.ready), у которой такой собственной идемпотентности
+    // нет: без дедупа на core_events повтор конверта дёрнул бы ядро СНОВА.
+    const { id: widgetId } = await seedWidget(pool);
+    const dialog = await insertDialog(pool, { widgetId, visitorKey: '11111111-1111-4111-8111-111111111111' });
+    await attachCoreSession(pool, { dialogId: dialog.id, sessionId: 'sess_0123456789abcdef', channel: 'chat' });
+    core.enqueue({ status: 200, body: { messages: [
+      { seq: 1, role: 'user', text: 'Привет', created_at: '2026-08-13T10:00:00Z' },
+    ], has_more: false } });
+
+    const raw = envelope('evt_dup_tr', {
+      session_id: 'sess_0123456789abcdef', client_reference: dialog.client_reference, message_count: 1,
+    }, 'transcript.ready');
+
+    const first = await post(raw);
+    expect(first.statusCode).toBe(200);
+    expect(first.json()).toEqual({ ok: true });
+    const callsAfterFirst = core.calls.length;
+
+    const second = await post(raw); // ретрай ТОГО ЖЕ event_id — тело идентично первому
+    expect(second.statusCode).toBe(200);
+    expect(second.json()).toEqual({ ok: true, deduped: true });
+    expect(core.calls.length).toBe(callsAfterFirst); // ядро НЕ дёрнуто повторно
+  });
+
   it('финализация НЕ текущей сессии не роняет диалог в ended', async () => {
     const { id: widgetId } = await seedWidget(pool);
     const dialog = await insertDialog(pool, { widgetId, visitorKey: '11111111-1111-4111-8111-111111111111' });
@@ -100,6 +128,28 @@ describe('POST /w/v1/core-webhooks', () => {
     const fresh = await findDialogById(pool, dialog.id);
     expect(fresh?.status).toBe('active');
     expect(fresh?.credits_total).toBe(3);
+  });
+
+  it('финализация ТЕКУЩЕЙ сессии диалога в escalating НЕ откатывает статус обратно (гард под T4)', async () => {
+    // Вскрывающая проба: в тесте выше «не текущая сессия» уже проверку статуса
+    // не задевает — там мимо бьёт условие current_core_session_id, а не
+    // status==='active'. Здесь сессия ИМЕННО текущая, чтобы отдельно проверить
+    // именно гард по статусу: диалог, ушедший в эскалацию (T4), не обязан
+    // молча вернуться в 'ended' только потому, что его chat-сессия закрылась.
+    const { id: widgetId } = await seedWidget(pool);
+    const dialog = await insertDialog(pool, { widgetId, visitorKey: '11111111-1111-4111-8111-111111111111' });
+    await attachCoreSession(pool, { dialogId: dialog.id, sessionId: 'sess_0123456789abcdef', channel: 'chat' });
+    await setDialogStatus(pool, dialog.id, 'escalating');
+
+    const raw = envelope('evt_esc', {
+      session_id: 'sess_0123456789abcdef', client_reference: dialog.client_reference,
+      status: 'finalized', duration_s: 20, credits_total: 4,
+    });
+    expect((await post(raw)).statusCode).toBe(200);
+
+    const fresh = await findDialogById(pool, dialog.id);
+    expect(fresh?.status).toBe('escalating'); // НЕ 'ended'
+    expect(fresh?.credits_total).toBe(4);      // деньги при этом всё равно учтены
   });
 
   it('неизвестный тип события принимается 200 и просто ложится в core_events', async () => {

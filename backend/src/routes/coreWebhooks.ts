@@ -56,6 +56,18 @@ export const coreWebhookRoutes: FastifyPluginAsync = async (app) => {
       if (!dialog) {
         app.log.warn({ ref, sessionId: data.session_id }, 'session.finalized без известного диалога');
       } else {
+        // ОСОЗНАННО не сверяем data.session_id ∈ dialog.core_session_ids перед
+        // applyFinalizedUsage: диалог найден по client_reference — этого
+        // достаточно, чтобы доверять сессии как СВОЕЙ. Строгая сверка была бы
+        // соблазнительна (лишний барьер), но открывает гонку: вебхук может
+        // долететь РАНЬШЕ, чем наш собственный POST /v1/sessions успеет
+        // дописать sessionId в core_session_ids через attachCoreSession
+        // (сеть/БД — из независимых путей, порядок не гарантирован). При такой
+        // гонке строгая проверка отбросила бы ЗАКОННОЕ событие — и деньги за
+        // сессию были бы потеряны молча (applyFinalizedUsage больше не
+        // вызовется, дальше только сверка ленты, а не биллинг). Идемпотентность
+        // денег и так закрыта на уровне settled_session_ids ниже — этого
+        // достаточно, и без риска потерять честно принадлежащую сессию.
         const settled = await applyFinalizedUsage(app.deps.pool, {
           dialogId: dialog.id,
           sessionId: data.session_id,

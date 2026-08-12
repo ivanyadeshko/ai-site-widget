@@ -45,7 +45,18 @@ export async function reconcileTranscript(
 ): Promise<SyncResult> {
   let messages: TranscriptMessage[] = [];
   try {
-    messages = (await deps.core!.getTranscript(input.sessionId)).messages;
+    // Пагинация ОБЯЗАТЕЛЬНА: getTranscript отдаёт одну страницу (лимит
+    // CoreClient — 500), а лента может быть длиннее. Без цикла по has_more
+    // хвост длинного диалога молча обрезался бы — и не только здесь: эту же
+    // функцию зовут T3 (re-enter живой сессии) и будущая T4 (эскалация),
+    // так что дыра тянулась бы во все три сценария разом.
+    let afterSeq = 0;
+    for (;;) {
+      const page = await deps.core!.getTranscript(input.sessionId, afterSeq);
+      messages = messages.concat(page.messages);
+      if (!page.has_more || page.messages.length === 0) break;
+      afterSeq = page.messages[page.messages.length - 1]!.seq;
+    }
   } catch (err) {
     deps.log.warn({ err, sessionId: input.sessionId }, 'сверка: ленту получить не удалось');
     return { fetched: 0, stored: 0, skipped: 0 };
