@@ -13,12 +13,13 @@
 Эти ограничения — часть требований КАЖДОГО таска. Значения скопированы из спеки `docs/superpowers/specs/2026-08-12-widget-mvp-design.md`.
 
 - **Ядро — строго `origin/main`** (80b6a3b+). Локальные чекауты `ai-conversation-core` отстают. Любая сверка контракта: `git -C ../ai-conversation-core show origin/main:contracts/openapi.yaml` и `origin/main:contracts/realtime/pv1/*`. Дев-ядро: `http://185.125.102.133:8100`, API-база `http://185.125.102.133:8100/api`, health — `http://185.125.102.133:8100/health` (ВНЕ `/api`).
-- **Origin-check ОБЯЗАТЕЛЕН на каждой ручке `/w/v1/*`, кроме `GET /config`.** Пустой `allowed_origins` = отказ ВСЕМ (не «любой» — анти-паттерн монолита не наследуем).
+- **Origin-check ОБЯЗАТЕЛЕН на каждой ручке `/w/v1/*`, кроме `GET /config`.** Пустой `allowed_origins` = отказ ВСЕМ (не «любой» — анти-паттерн монолита не наследуем). Правило асимметрично по методу: **на любой не-GET ручке отсутствие `Origin` = ОТКАЗ** (браузер по Fetch-спеке шлёт `Origin` на каждый не-GET запрос, включая same-origin, — значит безголовый `curl` без заголовка отсекается, а iframe не страдает); на GET отсутствие `Origin` допустимо (браузер его на same-origin GET не шлёт).
+- **`trustProxy: false` в дев-раскладке.** Backend слушает `:8200` напрямую, без обратного прокси: доверие к `X-Forwarded-For` превратило бы IP-кап в декорацию (клиент подставит любой заголовок). Включать `trustProxy` только одновременно с реальным прокси перед сервисом.
 - **`identity` на re-enter генерит BFF в форме `respondent-<uuid>`.** Префикс `respondent-` обязателен (воркер узнаёт клиента по нему); переиспользовать прежнюю identity нельзя — LiveKit выкинет живого участника.
 - **Дедуп эха на клиенте обязателен:** воркер шлёт обратно и реплику посетителя (`transcript` со `speaker: "respondent"`). Свои сообщения рендерятся оптимистично, обратный `transcript` дедупится по нормализованному тексту в окне.
 - **FSM диалога:** `chat → escalating → voice | chat_fallback | ended | error`. Обрыв LiveKit-соединения в состоянии `escalating`/`ended` — ШТАТНЫЙ переход, не ошибка (`POST /end` сносит комнату БЕЗ фрейма `session_ended`).
 - **Бюджет-предохранитель:** отдельный тенант ядра «site-widget» с намеренно малым балансом (дев: ~5000 credits); `limits.max_duration_s = 600` у ОБОИХ каналов (не дефолт 1800); капы `MAX_DIALOGS_PER_VISITOR_PER_DAY=10`, `MAX_DIALOGS_PER_IP_PER_DAY=30`; `credits.low` → warn-лог.
-- **Secure context:** голос из iframe работает только на https/localhost. Дев-прогон голоса — `ssh -L 8200:localhost:8200` + `http://localhost:8200/demo.html`. Чат по data-channel живёт и на http.
+- **Secure context:** голос из iframe работает только на https/localhost. Дев-прогон голоса — `ssh -L 8200:localhost:8200` + `http://localhost:8200/demo.html`, и при этом `WIDGET_PUBLIC_ORIGIN` обязан быть `http://localhost:8200`: iframe грузится по `app_url` из конфига, и IP-origin (`http://185.125.102.133:8200`) сделал бы страницу iframe НЕ secure context — `getUserMedia` умрёт даже внутри ssh-туннеля. Чат по data-channel живёт и на http с любым origin.
 - **Вебхуки: rawBody.** HMAC-SHA256 считается по СКЛЕЙКЕ `<t>.<сырое тело>` до всякого `JSON.parse`; заголовок `X-Core-Signature: t=<unix>,v1=<hex>` разбирается ПО КЛЮЧАМ (не по позиции), окно ±300с, сравнение постоянное по времени. Ответ ≤10с, любой 2xx = успех, редиректы = провал.
 - **SQL живёт ТОЛЬКО в `backend/src/db/repositories/*`.** Роуты и сервисы дёргают функции репозиториев, а не `pool.query`.
 - **Рендер текста реплик — ТОЛЬКО интерполяция.** `v-html` запрещён: реплики — влияемый посетителем контент.
@@ -48,9 +49,9 @@ ai-site-widget/
 │   │   ├── core/{client,signature,types}.ts
 │   │   ├── http/{originGuard,errors}.ts
 │   │   ├── routes/{health,coreWebhooks,publicApi,appPage}.ts
-│   │   ├── dialogs/{openSession,startDialog,reenter,escalate,threadDigest}.ts
+│   │   ├── dialogs/{budget,openSession,startDialog,reenter,escalate,threadDigest}.ts
 │   │   └── jobs/sweeper.ts
-│   └── test/{helpers/db.ts,helpers/fakeCore.ts, …}
+│   └── test/{helpers/db.ts,helpers/fakeCore.ts,helpers/app.ts, …}
 ├── embed/
 │   ├── loader/src/loader.ts           vanilla TS, Shadow DOM, ≤8КБ gzip
 │   ├── loader/scripts/{make-shim.mjs,size-check.mjs}
@@ -59,6 +60,20 @@ ai-site-widget/
 ├── infra/{Dockerfile,compose.yaml,compose.test.yaml,.env.example}
 └── scripts/widget_smoke.py            6 сценариев §8 спеки
 ```
+
+## Карта тасков (9)
+
+| № | Таск | Артефакт |
+|---|---|---|
+| 1 | Скелет backend + модель данных | `/healthz` на живой БД, репозитории под тестами |
+| 2 | Core-клиент + приёмник вебхуков | подпись, дедуп, деньги садятся в диалог |
+| 3 | Публичный API диалогов | 8 ручек, Origin-check, капы, журнал, лид |
+| 4 | Эскалация чат→голос + свипер | `/escalate` с выжимкой нити, досинк зависших |
+| 5 | Backend-обвязка embed + лоадер | `/app/:token` с `frame-ancestors`, `w.<hash>.js` ≤8КБ |
+| 6 | iframe-приложение: чат | лента, композер, дедуп эха, журнал, `client_ready` |
+| 7 | iframe-приложение: голос и FSM | эскалация, микрофон, «Продолжить», лид-форма |
+| 8 | Compose + деплой дев + провижининг | живой стенд, тенант ядра, вебхуки, demo.html |
+| 9 | `widget_smoke.py` + гейт фазы | 6 сценариев §8 зелёные + ручной браузерный голос |
 
 ---
 ### Task 1: Скелет backend + модель данных
@@ -79,26 +94,28 @@ ai-site-widget/
   - `type AppConfig = { port: number; databaseUrl: string; coreBaseUrl: string; coreTenantKey: string; coreWebhookSecret: string; publicOrigin: string; cspConnectSrc: string; ipHashSalt: string; maxDialogsPerVisitorPerDay: number; maxDialogsPerIpPerDay: number; maxDurationS: number; logLevel: string }`
   - `createPool(databaseUrl: string): Pool` (из `pg`)
   - `type Queryable = Pool | PoolClient`
-  - `buildApp(deps: AppDeps): Promise<FastifyInstance>`; `type AppDeps = { config: AppConfig; pool: Pool }` (T2 расширит поле `core`).
+  - `type AppDeps = { config: AppConfig; pool: Pool; log: FastifyBaseLogger; core?: CoreClient }`; `type AppDepsInput = Omit<AppDeps, 'log'>`; `buildApp(input: AppDepsInput): Promise<FastifyInstance>`. Поле `log` заводится СРАЗУ, в T1 (сервисам оно нужно с первого дня, и дописывать его в чужом таске — плохой шов), но заполняется внутри `buildApp`: логгер рождается вместе с инстансом Fastify. `core` опционально здесь и становится обязательным в T2.
   - Типы строк: `WidgetRow`, `AgentConfig`, `DialogRow`, `DialogStatus`, `MessageRow`, `LeadRow`.
   - Репозитории (все — функции `(db: Queryable, …)`):
     `findWidgetByToken(db, token: string): Promise<WidgetRow | null>`;
     `insertDialog(db, input: { widgetId: string; visitorKey: string }): Promise<DialogRow>`;
     `findDialogById(db, id: string): Promise<DialogRow | null>`;
     `findDialogByClientReference(db, ref: string): Promise<DialogRow | null>`;
-    `bumpSessionSeq(db, dialogId: string): Promise<number>`;
     `attachCoreSession(db, input: { dialogId: string; sessionId: string; channel: 'chat' | 'voice' }): Promise<void>`;
     `setDialogStatus(db, dialogId: string, status: DialogStatus): Promise<void>`;
     `casDialogStatus(db, dialogId: string, from: DialogStatus, to: DialogStatus): Promise<boolean>`;
     `touchDialog(db, dialogId: string): Promise<void>`;
-    `applyFinalizedUsage(db, input: { dialogId: string; usage: Record<string, number>; creditsTotal: number }): Promise<void>`;
+    `applyFinalizedUsage(db, input: { dialogId: string; sessionId: string; usage: Record<string, number>; creditsTotal: number }): Promise<boolean>` (идемпотентно по `sessionId`; false = деньги этой сессии уже учтены);
     `countDialogsStartedByVisitor(db, visitorKey: string): Promise<number>`;
     `insertMessage(db, input: InsertMessageInput): Promise<boolean>` (false = дубль, отбит уникальным индексом);
-    `listMessages(db, dialogId: string, limit: number): Promise<MessageRow[]>`;
-    `listLastMessages(db, dialogId: string, limit: number): Promise<MessageRow[]>`;
+    `listThreadTail(db, dialogId: string, limit: number): Promise<MessageRow[]>` (ХВОСТ в хронологическом порядке — единственная функция чтения журнала);
+    `maxClientSeq(db, dialogId: string): Promise<number>`;
+    `hasSimilarMessage(db, input: { dialogId: string; role: 'user' | 'agent'; text: string; windowSeconds: number }): Promise<boolean>`;
     `insertLead(db, input: InsertLeadInput): Promise<string>`;
     `insertCoreEvent(db, input: { eventId: string; type: string; payload: unknown }): Promise<boolean>` (false = уже видели);
     `bumpIpDayCounter(db, ipHash: string): Promise<number>` (возвращает счётчик ПОСЛЕ инкремента);
+    `purgeOldIpCounters(db, keepDays: number): Promise<number>`;
+    `hashIp(ip: string, salt: string): string`;
     `listStaleActiveDialogs(db, olderThanMinutes: number, limit: number): Promise<DialogRow[]>`.
 
 - [ ] **Step 1: Каркас репозитория и workspaces**
@@ -151,7 +168,7 @@ ai-site-widget/
 }
 ```
 
-`backend/tsconfig.json`: `target/module: ES2023/NodeNext`, `moduleResolution: NodeNext`, `strict: true`, `noUncheckedIndexedAccess: true`, `outDir: dist`, `rootDir: src`, `verbatimModuleSyntax: true`.
+`backend/tsconfig.json`: `target/module: ES2023/NodeNext`, `moduleResolution: NodeNext`, `strict: true`, `noUncheckedIndexedAccess: true`, `outDir: dist`, `rootDir: src`, `verbatimModuleSyntax: true` и **обязательно `"rewriteRelativeImportExtensions": true`** (TS 5.7). Без этого флага пара «импорты с расширением `.ts` + эмит в `dist`» даёт ошибку TS5097 (`An import path can only end with a '.ts' extension when 'allowImportingTsExtensions' is set`), а `allowImportingTsExtensions` в свою очередь требует `noEmit` — то есть сборка бы не собралась вовсе. Флаг переписывает `./x.ts` → `./x.js` на выходе, поэтому в исходниках расширения `.ts` (как во всех снипетах плана) остаются корректными и в рантайме Node 22.
 
 `backend/vitest.config.ts`:
 
@@ -225,6 +242,12 @@ describe('loadConfig', () => {
     expect(cfg.maxDialogsPerIpPerDay).toBe(30);
     expect(cfg.maxDurationS).toBe(600);
   });
+
+  it('trustProxy по умолчанию ВЫКЛЮЧЕН: иначе IP-кап обходится одним заголовком', () => {
+    expect(loadConfig(FULL).trustProxy).toBe(false);
+    expect(loadConfig({ ...FULL, TRUST_PROXY: 'true' }).trustProxy).toBe(false); // включает только '1'
+    expect(loadConfig({ ...FULL, TRUST_PROXY: '1' }).trustProxy).toBe(true);
+  });
 });
 ```
 
@@ -245,6 +268,8 @@ export type AppConfig = {
   maxDialogsPerVisitorPerDay: number;
   maxDialogsPerIpPerDay: number;
   maxDurationS: number;
+  /** Только за реальным обратным прокси: иначе X-Forwarded-For ломает IP-кап. */
+  trustProxy: boolean;
   logLevel: string;
 };
 
@@ -287,6 +312,8 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
     maxDialogsPerVisitorPerDay: int(env.MAX_DIALOGS_PER_VISITOR_PER_DAY, 10),
     maxDialogsPerIpPerDay: int(env.MAX_DIALOGS_PER_IP_PER_DAY, 30),
     maxDurationS: int(env.CORE_MAX_DURATION_S, 600),
+    // Небезопасное значение требует ЯВНОГО согласия: дефолт закрыт.
+    trustProxy: env.TRUST_PROXY === '1',
     logLevel: env.LOG_LEVEL ?? 'info',
   };
 }
@@ -322,10 +349,13 @@ exports.up = (pgm) => {
       status                  TEXT NOT NULL DEFAULT 'active'
                               CHECK (status IN ('active','escalating','ended','error')),
       core_session_ids        JSONB NOT NULL DEFAULT '[]'::jsonb,
+      -- Сессии, деньги по которым УЖЕ учтены. Вебхук и свипер приходят к одному
+      -- и тому же выводу разными путями и могут сойтись на одной сессии —
+      -- без этого списка credits_total удвоился бы.
+      settled_session_ids     JSONB NOT NULL DEFAULT '[]'::jsonb,
       current_core_session_id TEXT,
       current_channel         TEXT CHECK (current_channel IN ('chat','voice')),
       client_reference        TEXT NOT NULL UNIQUE,
-      session_seq             INTEGER NOT NULL DEFAULT 0,
       usage                   JSONB NOT NULL DEFAULT '{}'::jsonb,
       credits_total           INTEGER NOT NULL DEFAULT 0,
       started_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -445,8 +475,8 @@ export async function seedWidget(
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { seedWidget, testPool, truncateAll } from './helpers/db.ts';
 import { findWidgetByToken } from '../src/db/repositories/widgets.ts';
-import { attachCoreSession, bumpSessionSeq, casDialogStatus, countDialogsStartedByVisitor, findDialogByClientReference, insertDialog } from '../src/db/repositories/dialogs.ts';
-import { insertMessage, listLastMessages } from '../src/db/repositories/messages.ts';
+import { attachCoreSession, casDialogStatus, countDialogsStartedByVisitor, findDialogByClientReference, insertDialog } from '../src/db/repositories/dialogs.ts';
+import { hasSimilarMessage, insertMessage, listThreadTail, maxClientSeq } from '../src/db/repositories/messages.ts';
 import { insertCoreEvent } from '../src/db/repositories/coreEvents.ts';
 import { bumpIpDayCounter } from '../src/db/repositories/quotas.ts';
 
@@ -465,13 +495,15 @@ describe('репозитории', () => {
     expect(await findWidgetByToken(pool, 'нет-такого')).toBeNull();
   });
 
-  it('client_reference диалога — widget:dialog:{id}, session_seq растёт монотонно', async () => {
+  it('client_reference диалога — widget:dialog:{id}, свежий диалог без привязанных сессий', async () => {
     const { id: widgetId } = await seedWidget(pool);
     const dialog = await insertDialog(pool, { widgetId, visitorKey: VISITOR });
     expect(dialog.client_reference).toBe(`widget:dialog:${dialog.id}`);
     expect(await findDialogByClientReference(pool, dialog.client_reference)).not.toBeNull();
-    expect(await bumpSessionSeq(pool, dialog.id)).toBe(1);
-    expect(await bumpSessionSeq(pool, dialog.id)).toBe(2);
+    // Ключ повторяемости считается от ДЛИНЫ core_session_ids, отдельного
+    // счётчика нет: два источника правды разъехались бы на первом же ретрае.
+    expect(dialog.core_session_ids).toEqual([]);
+    expect(dialog.settled_session_ids).toEqual([]);
   });
 
   it('attachCoreSession копит историю сессий и переключает текущую', async () => {
@@ -498,17 +530,37 @@ describe('репозитории', () => {
     const row = { dialogId: dialog.id, role: 'user' as const, text: 'Меня зовут Пётр', source: 'client' as const, coreSessionId: null, seq: 1 };
     expect(await insertMessage(pool, row)).toBe(true);
     expect(await insertMessage(pool, row)).toBe(false);
-    expect((await listLastMessages(pool, dialog.id, 10)).length).toBe(1);
+    expect((await listThreadTail(pool, dialog.id, 10)).length).toBe(1);
   });
 
-  it('listLastMessages отдаёт ХВОСТ в хронологическом порядке', async () => {
+  it('listThreadTail отдаёт ХВОСТ в хронологическом порядке', async () => {
     const { id: widgetId } = await seedWidget(pool);
     const dialog = await insertDialog(pool, { widgetId, visitorKey: VISITOR });
     for (let seq = 1; seq <= 5; seq += 1) {
       await insertMessage(pool, { dialogId: dialog.id, role: 'user', text: `реплика ${seq}`, source: 'client', coreSessionId: null, seq });
     }
-    const tail = await listLastMessages(pool, dialog.id, 2);
+    const tail = await listThreadTail(pool, dialog.id, 2);
     expect(tail.map((m) => m.text)).toEqual(['реплика 4', 'реплика 5']);
+  });
+
+  it('maxClientSeq продолжает нумерацию клиента и не считает реплики ядра', async () => {
+    const { id: widgetId } = await seedWidget(pool);
+    const dialog = await insertDialog(pool, { widgetId, visitorKey: VISITOR });
+    expect(await maxClientSeq(pool, dialog.id)).toBe(0);
+    await insertMessage(pool, { dialogId: dialog.id, role: 'user', text: 'раз', source: 'client', coreSessionId: null, seq: 7 });
+    await insertMessage(pool, { dialogId: dialog.id, role: 'agent', text: 'два', source: 'core', coreSessionId: 'sess_x', seq: 99 });
+    expect(await maxClientSeq(pool, dialog.id)).toBe(7);
+  });
+
+  it('hasSimilarMessage ловит ту же реплику, приехавшую вторым путём', async () => {
+    const { id: widgetId } = await seedWidget(pool);
+    const dialog = await insertDialog(pool, { widgetId, visitorKey: VISITOR });
+    await insertMessage(pool, { dialogId: dialog.id, role: 'user', text: 'Меня зовут Пётр', source: 'client', coreSessionId: null, seq: 1 });
+    // Регистр и лишние пробелы не должны мешать: ядро отдаёт свой вариант текста.
+    expect(await hasSimilarMessage(pool, { dialogId: dialog.id, role: 'user', text: '  меня  зовут пётр ', windowSeconds: 600 })).toBe(true);
+    expect(await hasSimilarMessage(pool, { dialogId: dialog.id, role: 'agent', text: 'Меня зовут Пётр', windowSeconds: 600 })).toBe(false);
+    expect(await hasSimilarMessage(pool, { dialogId: dialog.id, role: 'user', text: 'другое', windowSeconds: 600 })).toBe(false);
+    expect(await hasSimilarMessage(pool, { dialogId: dialog.id, role: 'user', text: 'Меня зовут Пётр', windowSeconds: 0 })).toBe(false);
   });
 
   it('core_events дедупятся по event_id', async () => {
@@ -586,10 +638,10 @@ export type DialogRow = {
   visitor_key: string;
   status: DialogStatus;
   core_session_ids: string[];
+  settled_session_ids: string[];
   current_core_session_id: string | null;
   current_channel: 'chat' | 'voice' | null;
   client_reference: string;
-  session_seq: number;
   usage: Record<string, number>;
   credits_total: number;
   started_at: Date;
@@ -597,24 +649,22 @@ export type DialogRow = {
   last_activity_at: Date;
 };
 
-const COLS = `id, widget_id, visitor_key, status, core_session_ids, current_core_session_id,
-              current_channel, client_reference, session_seq, usage, credits_total,
-              started_at, ended_at, last_activity_at`;
+const COLS = `id, widget_id, visitor_key, status, core_session_ids, settled_session_ids,
+              current_core_session_id, current_channel, client_reference,
+              usage, credits_total, started_at, ended_at, last_activity_at`;
 
 export async function insertDialog(db: Queryable, input: { widgetId: string; visitorKey: string }): Promise<DialogRow> {
-  // client_reference детерминирован от id — одним INSERT'ом, без второго UPDATE.
+  // ОДНИМ statement'ом: client_reference — NOT NULL UNIQUE, и промежуточная
+  // вставка пустой строки с последующим UPDATE ловила бы 23505 на втором же
+  // параллельном старте диалога (пустая строка уникальна ровно в одном экземпляре).
   const { rows } = await db.query<DialogRow>(
     `INSERT INTO dialogs (id, widget_id, visitor_key, client_reference)
-     VALUES (gen_random_uuid(), $1, $2, '')
+     SELECT g.id, $1, $2, 'widget:dialog:' || g.id
+       FROM (SELECT gen_random_uuid() AS id) g
      RETURNING ${COLS}`,
     [input.widgetId, input.visitorKey],
   );
-  const created = rows[0]!;
-  const { rows: updated } = await db.query<DialogRow>(
-    `UPDATE dialogs SET client_reference = $2 WHERE id = $1 RETURNING ${COLS}`,
-    [created.id, `widget:dialog:${created.id}`],
-  );
-  return updated[0]!;
+  return rows[0]!;
 }
 
 export async function findDialogById(db: Queryable, id: string): Promise<DialogRow | null> {
@@ -625,14 +675,6 @@ export async function findDialogById(db: Queryable, id: string): Promise<DialogR
 export async function findDialogByClientReference(db: Queryable, ref: string): Promise<DialogRow | null> {
   const { rows } = await db.query<DialogRow>(`SELECT ${COLS} FROM dialogs WHERE client_reference = $1`, [ref]);
   return rows[0] ?? null;
-}
-
-export async function bumpSessionSeq(db: Queryable, dialogId: string): Promise<number> {
-  const { rows } = await db.query<{ session_seq: number }>(
-    `UPDATE dialogs SET session_seq = session_seq + 1 WHERE id = $1 RETURNING session_seq`,
-    [dialogId],
-  );
-  return rows[0]!.session_seq;
 }
 
 export async function attachCoreSession(
@@ -667,14 +709,20 @@ export async function touchDialog(db: Queryable, dialogId: string): Promise<void
   await db.query(`UPDATE dialogs SET last_activity_at = now() WHERE id = $1`, [dialogId]);
 }
 
+/**
+ * Учесть деньги ОДНОЙ закрытой сессии. Идемпотентно по session_id: вебхук
+ * `session.finalized` и свипер приходят к одному выводу разными путями, и без
+ * защиты credits_total удвоился бы. Возвращает false, если сессию уже учли.
+ */
 export async function applyFinalizedUsage(
   db: Queryable,
-  input: { dialogId: string; usage: Record<string, number>; creditsTotal: number },
-): Promise<void> {
+  input: { dialogId: string; sessionId: string; usage: Record<string, number>; creditsTotal: number },
+): Promise<boolean> {
   // Складываем по сессиям нити: у диалога их несколько (chat → voice → chat…).
-  await db.query(
+  const { rowCount } = await db.query(
     `UPDATE dialogs
-        SET usage = (
+        SET settled_session_ids = settled_session_ids || to_jsonb($4::text),
+            usage = (
               SELECT coalesce(jsonb_object_agg(key, value), '{}'::jsonb)
                 FROM (
                   SELECT key, sum(value::numeric) AS value
@@ -687,9 +735,11 @@ export async function applyFinalizedUsage(
                 ) summed
             ),
             credits_total = credits_total + $3
-      WHERE id = $1`,
-    [input.dialogId, JSON.stringify(input.usage), input.creditsTotal],
+      WHERE id = $1
+        AND NOT (settled_session_ids @> to_jsonb($4::text))`,
+    [input.dialogId, JSON.stringify(input.usage), input.creditsTotal, input.sessionId],
   );
+  return (rowCount ?? 0) > 0;
 }
 
 export async function countDialogsStartedByVisitor(db: Queryable, visitorKey: string): Promise<number> {
@@ -748,16 +798,13 @@ export async function insertMessage(db: Queryable, input: InsertMessageInput): P
   return (rowCount ?? 0) > 0;
 }
 
-export async function listMessages(db: Queryable, dialogId: string, limit: number): Promise<MessageRow[]> {
-  const { rows } = await db.query<MessageRow>(
-    `SELECT id::text, dialog_id, role, text, source, core_session_id, seq, created_at
-       FROM dialog_messages WHERE dialog_id = $1 ORDER BY id ASC LIMIT $2`,
-    [dialogId, limit],
-  );
-  return rows;
-}
-
-export async function listLastMessages(db: Queryable, dialogId: string, limit: number): Promise<MessageRow[]> {
+/**
+ * ХВОСТ нити в хронологическом порядке — единственный способ читать журнал.
+ * Голова здесь никому не нужна: у долгого диалога `ORDER BY id ASC LIMIT 200`
+ * отдал бы первые двести реплик и спрятал всё недавнее — посетитель открыл бы
+ * виджет и увидел начало разговора недельной давности.
+ */
+export async function listThreadTail(db: Queryable, dialogId: string, limit: number): Promise<MessageRow[]> {
   const { rows } = await db.query<MessageRow>(
     `SELECT * FROM (
        SELECT id::text, dialog_id, role, text, source, core_session_id, seq, created_at
@@ -766,6 +813,38 @@ export async function listLastMessages(db: Queryable, dialogId: string, limit: n
     [dialogId, limit],
   );
   return rows;
+}
+
+/** Максимальный seq клиентского журнала — с него продолжится нумерация после reload. */
+export async function maxClientSeq(db: Queryable, dialogId: string): Promise<number> {
+  const { rows } = await db.query<{ seq: number | null }>(
+    `SELECT max(seq) AS seq FROM dialog_messages WHERE dialog_id = $1 AND source = 'client'`,
+    [dialogId],
+  );
+  return rows[0]?.seq ?? 0;
+}
+
+/**
+ * Есть ли уже в журнале такой текст этой роли в окне ±N секунд. Нужен на синке
+ * транскрипта ядра: уникальный индекс ловит лишь повтор той же (source,seq)
+ * пары, а одна и та же реплика приезжает ДВАЖДЫ разными путями — от клиента
+ * (source=client, свой seq) и из ленты ядра (source=core, seq ядра).
+ */
+export async function hasSimilarMessage(
+  db: Queryable,
+  input: { dialogId: string; role: 'user' | 'agent'; text: string; windowSeconds: number },
+): Promise<boolean> {
+  const { rows } = await db.query<{ hit: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM dialog_messages
+        WHERE dialog_id = $1 AND role = $2
+          AND lower(btrim(regexp_replace(text, '\\s+', ' ', 'g')))
+              = lower(btrim(regexp_replace($3::text, '\\s+', ' ', 'g')))
+          AND created_at > now() - ($4 || ' seconds')::interval
+     ) AS hit`,
+    [input.dialogId, input.role, input.text, String(input.windowSeconds)],
+  );
+  return rows[0]!.hit;
 }
 ```
 
@@ -833,6 +912,19 @@ export async function bumpIpDayCounter(db: Queryable, ipHash: string): Promise<n
   );
   return rows[0]!.started;
 }
+
+/**
+ * Чистка счётчиков старше N суток. Таблица растёт по одной строке на IP в день
+ * и никем не подметается — за год это мусор, который никто не удалит руками.
+ * Зовётся свипером (T4) тем же тиком, что и досинк диалогов.
+ */
+export async function purgeOldIpCounters(db: Queryable, keepDays: number): Promise<number> {
+  const { rowCount } = await db.query(
+    `DELETE FROM ip_day_counters WHERE day < current_date - ($1 || ' days')::interval`,
+    [String(keepDays)],
+  );
+  return rowCount ?? 0;
+}
 ```
 
 Run: `npx vitest run test/repositories.test.ts` → PASS.
@@ -894,20 +986,31 @@ import type { Pool } from 'pg';
 import type { AppConfig } from './config.ts';
 import { healthRoutes } from './routes/health.ts';
 
-export type AppDeps = { config: AppConfig; pool: Pool };
+export type AppDeps = {
+  config: AppConfig;
+  pool: Pool;
+  log: FastifyBaseLogger;
+  core?: CoreClient; // в T2 станет обязательным
+};
 
-export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
+/** То, что передаёт вызывающий: логгер рождается вместе с инстансом Fastify. */
+export type AppDepsInput = Omit<AppDeps, 'log'>;
+
+export async function buildApp(input: AppDepsInput): Promise<FastifyInstance> {
   const app = Fastify({
     logger: {
-      level: deps.config.logLevel,
+      level: input.config.logLevel,
       // Структурный JSON: стенд собирает логи grep'ом по полям, не по тексту.
       redact: { paths: ['req.headers.authorization', 'req.headers["x-core-signature"]'], remove: true },
     },
-    trustProxy: true, // за nginx: req.ip = X-Forwarded-For
+    // trustProxy НЕ включаем на дев-раскладке: сервис слушает :8200 напрямую,
+    // и доверие к X-Forwarded-For позволило бы обойти IP-кап одним заголовком.
+    trustProxy: input.config.trustProxy,
     bodyLimit: 64 * 1024,
     disableRequestLogging: false,
   });
 
+  const deps: AppDeps = { ...input, log: app.log };
   app.decorate('deps', deps);
   await app.register(healthRoutes);
   return app;
@@ -984,9 +1087,9 @@ git commit -m "feat(backend): скелет Fastify + Postgres-схема вид�
 **Files:**
 - Create: `contracts/sync.mjs`, `contracts/openapi.core.yaml` (вендорённая копия), `contracts/core-api.d.ts` (генерится)
 - Create: `backend/src/core/types.ts`, `backend/src/core/client.ts`, `backend/src/core/signature.ts`
-- Create: `backend/src/routes/coreWebhooks.ts`
-- Modify: `backend/src/app.ts` (тип `AppDeps` + регистрация роутов), `backend/package.json` (скрипты `contracts:sync`, devDep `openapi-typescript`)
-- Test: `backend/test/helpers/fakeCore.ts`, `backend/test/coreClient.test.ts`, `backend/test/signature.test.ts`, `backend/test/coreWebhooks.test.ts`
+- Create: `backend/src/routes/coreWebhooks.ts`, `backend/src/dialogs/transcriptSync.ts`
+- Modify: `backend/src/app.ts` (`core` в `AppDeps` становится обязательным + регистрация роутов), `backend/package.json` (скрипты `contracts:sync`, devDep `openapi-typescript`)
+- Test: `backend/test/helpers/fakeCore.ts`, `backend/test/coreClient.test.ts`, `backend/test/signature.test.ts`, `backend/test/coreWebhooks.test.ts`, `backend/test/transcriptSync.test.ts`
 
 **Interfaces:**
 - Consumes (T1): `AppDeps`, `buildApp`, `Queryable`, `insertCoreEvent`, `findDialogByClientReference`, `applyFinalizedUsage`, `setDialogStatus`, `DialogRow`.
@@ -1001,7 +1104,10 @@ git commit -m "feat(backend): скелет Fastify + Postgres-схема вид�
     `getSession(sessionId: string): Promise<CoreSession>`.
   - `verifyCoreSignature(raw: Buffer, header: string | undefined, secret: string, nowMs: number, windowS?: number): { ok: true } | { ok: false; reason: string }`
   - `coreWebhookRoutes: FastifyPluginAsync` — вешает `POST /w/v1/core-webhooks`.
-  - `AppDeps` расширен полем `core: CoreClient`.
+  - `AppDeps.core` становится обязательным (`core: CoreClient`).
+  - `const TRANSCRIPT_DEDUP_WINDOW_S = 900`; `type SyncResult = { fetched: number; stored: number; skipped: number }`;
+    `persistTranscript(deps, input: { dialog: DialogRow; sessionId: string; messages: TranscriptMessage[] }): Promise<SyncResult>`;
+    `reconcileTranscript(deps, input: { dialog: DialogRow; sessionId: string; expected?: number }): Promise<SyncResult>`.
 
 - [ ] **Step 1: Вендорим контракт ядра и генерим типы**
 
@@ -1182,10 +1288,21 @@ Run: `npx vitest run test/signature.test.ts` → PASS.
 
 - [ ] **Step 5: Мутпроба подписи (протокол + деньги)**
 
-Три мутации, каждая обязана уронить свой тест; после каждой — вернуть код:
-1. Заменить `timingSafeEqual(...)` на `got.equals(expected)` → тесты PASS (это не регресс поведения, а регресс безопасности) → значит нужен ЯВНЫЙ тест-страж: добавить в `signature.test.ts` проверку, что реализация использует постоянное по времени сравнение — `expect(readFileSync('src/core/signature.ts','utf8')).toContain('timingSafeEqual')`. Прогнать: с мутацией FAIL, без — PASS.
-2. Расширить `windowS` по умолчанию до `10 ** 9` → тест «отвергает повтор старше окна» FAIL. Вернуть.
-3. Убрать `Buffer.from(`${timestamp}.`)` из склейки (подписывать голое тело) → тест «принимает валидную подпись» FAIL. Вернуть.
+Мутации, каждая обязана уронить свой тест; после каждой — вернуть код:
+1. Расширить `windowS` по умолчанию до `10 ** 9` → тест «отвергает повтор старше окна» FAIL. Вернуть.
+2. Убрать `Buffer.from(`${timestamp}.`)` из склейки (подписывать голое тело) → тест «принимает валидную подпись» FAIL. Вернуть.
+3. Заменить сравнение хэшей на `got.equals(expected)` → все тесты остаются зелёными: постоянство времени поведением не проверяется в принципе. Вместо теста-стража на текст файла (`toContain('timingSafeEqual')` — проверка реализации, а не поведения: переживёт переименование импорта и сломается от безобидного рефакторинга) закрыть это ПОВЕДЕНЧЕСКИ — добавить тест на длину:
+
+```ts
+it('подпись неверной ДЛИНЫ отвергается до сравнения, а не кидает исключение', () => {
+  const t = Math.floor(NOW / 1000);
+  // timingSafeEqual кидает RangeError на буферах разной длины — реализация
+  // обязана проверить длину САМА и вернуть вердикт, а не упасть.
+  expect(verifyCoreSignature(RAW, `t=${t},v1=ab`, SECRET, NOW)).toEqual({ ok: false, reason: 'hmac_mismatch' });
+});
+```
+
+Мутация: убрать `got.length !== expected.length ||` → тест падает с `RangeError`, а не с ассертом. Вернуть. Постоянство времени остаётся под ревью, а не под тестом — и это честно записано здесь, а не спрятано за зелёной галочкой.
 
 Прогнать всё: PASS.
 
@@ -1448,12 +1565,15 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.ts';
 import { CoreClient } from '../src/core/client.ts';
-import { insertDialog, attachCoreSession, findDialogById } from '../src/db/repositories/dialogs.ts';
+import { applyFinalizedUsage, insertDialog, attachCoreSession, findDialogById } from '../src/db/repositories/dialogs.ts';
+import { insertMessage, listThreadTail } from '../src/db/repositories/messages.ts';
+import { FakeCore } from './helpers/fakeCore.ts';
 import { seedWidget, testPool, truncateAll } from './helpers/db.ts';
 
 const SECRET = 'секрет-длиной-больше-шестнадцати';
 const pool = testPool();
 let app: FastifyInstance;
+let core: FakeCore; // нужен сценарию transcript.ready: сверка тянет ленту сама
 
 const post = (raw: string, headerOverride?: string) => {
   const t = Math.floor(Date.now() / 1000);
@@ -1467,19 +1587,21 @@ const post = (raw: string, headerOverride?: string) => {
 };
 
 beforeAll(async () => {
+  core = new FakeCore();
+  await core.start();
   app = await buildApp({
     config: {
-      port: 8200, databaseUrl: process.env.DATABASE_URL!, coreBaseUrl: 'http://core.invalid/api',
+      port: 8200, databaseUrl: process.env.DATABASE_URL!, coreBaseUrl: core.baseUrl,
       coreTenantKey: 'sk_test_x', coreWebhookSecret: SECRET, publicOrigin: 'http://localhost:8200',
       cspConnectSrc: "'self'", ipHashSalt: 'соль', maxDialogsPerVisitorPerDay: 10,
-      maxDialogsPerIpPerDay: 30, maxDurationS: 600, logLevel: 'silent',
+      maxDialogsPerIpPerDay: 30, maxDurationS: 600, trustProxy: false, logLevel: 'silent',
     },
     pool,
-    core: new CoreClient({ baseUrl: 'http://core.invalid/api', tenantKey: 'sk_test_x' }),
+    core: new CoreClient({ baseUrl: core.baseUrl, tenantKey: 'sk_test_x', timeoutMs: 2000 }),
   });
 });
 beforeEach(() => truncateAll(pool));
-afterAll(async () => { await app.close(); await pool.end(); });
+afterAll(async () => { await app.close(); await core.stop(); await pool.end(); });
 
 const envelope = (eventId: string, data: unknown, type = 'session.finalized'): string =>
   JSON.stringify({ api_version: 'v1', event_id: eventId, type, created: '2026-08-13T10:00:00Z', data });
@@ -1555,6 +1677,66 @@ describe('POST /w/v1/core-webhooks', () => {
     const { rows } = await pool.query('SELECT count(*)::int AS n FROM core_events');
     expect(rows[0].n).toBe(0);
   });
+
+  it('деньги той же сессии из ДРУГОГО события не удваиваются (гонка со свипером)', async () => {
+    const { id: widgetId } = await seedWidget(pool);
+    const dialog = await insertDialog(pool, { widgetId, visitorKey: '11111111-1111-4111-8111-111111111111' });
+    await attachCoreSession(pool, { dialogId: dialog.id, sessionId: 'sess_0123456789abcdef', channel: 'chat' });
+    // Свипер успел раньше и уже учёл эту сессию.
+    await applyFinalizedUsage(pool, {
+      dialogId: dialog.id, sessionId: 'sess_0123456789abcdef',
+      usage: { chat_token: 1200 }, creditsTotal: 7,
+    });
+    const raw = envelope('evt_race', {
+      session_id: 'sess_0123456789abcdef', client_reference: dialog.client_reference,
+      status: 'finalized', duration_s: 42, credits_total: 7, usage_summary: { chat_token: 1200 },
+    });
+    expect((await post(raw)).statusCode).toBe(200);
+    const fresh = await findDialogById(pool, dialog.id);
+    expect(fresh?.credits_total).toBe(7);            // НЕ 14
+    expect(fresh?.usage).toEqual({ chat_token: 1200 }); // НЕ 2400
+  });
+
+  it('деньги РАЗНЫХ сессий одной нити суммируются', async () => {
+    const { id: widgetId } = await seedWidget(pool);
+    const dialog = await insertDialog(pool, { widgetId, visitorKey: '11111111-1111-4111-8111-111111111111' });
+    await attachCoreSession(pool, { dialogId: dialog.id, sessionId: 'sess_1111111111111111', channel: 'chat' });
+    await attachCoreSession(pool, { dialogId: dialog.id, sessionId: 'sess_2222222222222222', channel: 'voice' });
+    for (const [id, sid, credits] of [['evt_a', 'sess_1111111111111111', 7], ['evt_b', 'sess_2222222222222222', 5]] as const) {
+      const raw = envelope(id, {
+        session_id: sid, client_reference: dialog.client_reference,
+        status: 'finalized', duration_s: 10, credits_total: credits, usage_summary: { chat_token: 100 },
+      });
+      expect((await post(raw)).statusCode).toBe(200);
+    }
+    const fresh = await findDialogById(pool, dialog.id);
+    expect(fresh?.credits_total).toBe(12);
+    expect(fresh?.usage).toEqual({ chat_token: 200 });
+  });
+
+  it('transcript.ready доливает в журнал ТОЛЬКО то, чего клиент не записал', async () => {
+    const { id: widgetId } = await seedWidget(pool);
+    const dialog = await insertDialog(pool, { widgetId, visitorKey: '11111111-1111-4111-8111-111111111111' });
+    await attachCoreSession(pool, { dialogId: dialog.id, sessionId: 'sess_0123456789abcdef', channel: 'chat' });
+    // Клиент успел записать первую реплику своим путём.
+    await insertMessage(pool, {
+      dialogId: dialog.id, role: 'user', text: 'Меня зовут Пётр',
+      source: 'client', coreSessionId: null, seq: 1,
+    });
+    core.enqueue({ status: 200, body: { messages: [
+      { seq: 1, role: 'user', text: 'Меня зовут Пётр', created_at: '2026-08-13T10:00:00Z' },
+      { seq: 2, role: 'agent', text: 'Здравствуйте, Пётр!', created_at: '2026-08-13T10:00:05Z' },
+    ], has_more: false } });
+
+    const raw = envelope('evt_tr', {
+      session_id: 'sess_0123456789abcdef', client_reference: dialog.client_reference, message_count: 2,
+    }, 'transcript.ready');
+    expect((await post(raw)).statusCode).toBe(200);
+
+    const rows = await listThreadTail(pool, dialog.id, 50);
+    expect(rows.map((m) => m.text)).toEqual(['Меня зовут Пётр', 'Здравствуйте, Пётр!']);
+    expect(rows.filter((m) => m.source === 'core')).toHaveLength(1); // задвоения НЕТ
+  });
 });
 ```
 
@@ -1617,16 +1799,31 @@ export const coreWebhookRoutes: FastifyPluginAsync = async (app) => {
       if (!dialog) {
         app.log.warn({ ref, sessionId: data.session_id }, 'session.finalized без известного диалога');
       } else {
-        await applyFinalizedUsage(app.deps.pool, {
+        const settled = await applyFinalizedUsage(app.deps.pool, {
           dialogId: dialog.id,
+          sessionId: data.session_id,
           usage: (data.usage_summary ?? {}) as Record<string, number>,
           creditsTotal: data.credits_total ?? 0,
         });
+        if (!settled) {
+          app.log.info({ sessionId: data.session_id }, 'деньги сессии уже учтены (свипер успел раньше)');
+        }
         // В ended роняем ТОЛЬКО текущую сессию активного диалога: закрытие
         // чата ради эскалации приходит сюда же, но диалог тогда 'escalating'.
         if (dialog.status === 'active' && dialog.current_core_session_id === data.session_id) {
           await setDialogStatus(app.deps.pool, dialog.id, 'ended');
         }
+      }
+    } else if (envelope.type === 'transcript.ready') {
+      // СВЕРКА ленты (спека §3): журнал ведёт iframe, ядро — своя правда.
+      // На финализации подтягиваем ленту ядра как source='core'; расхождение
+      // логируем — это единственный сигнал, что витрина и лента разъехались.
+      const data = envelope.data as { session_id: string; client_reference?: string; message_count: number };
+      const dialog = data.client_reference
+        ? await findDialogByClientReference(app.deps.pool, data.client_reference)
+        : null;
+      if (dialog) {
+        await reconcileTranscript(app.deps, { dialog, sessionId: data.session_id, expected: data.message_count });
       }
     } else if (envelope.type === 'credits.low') {
       app.log.warn({ data: envelope.data }, 'БЮДЖЕТ-ПРЕДОХРАНИТЕЛЬ: у тенанта виджета кончаются кредиты');
@@ -1637,15 +1834,86 @@ export const coreWebhookRoutes: FastifyPluginAsync = async (app) => {
 };
 ```
 
-Обновить `backend/src/app.ts`: `export type AppDeps = { config: AppConfig; pool: Pool; core: CoreClient }` и `await app.register(coreWebhookRoutes);`. Обновить `server.ts`: создать `new CoreClient({ baseUrl: config.coreBaseUrl, tenantKey: config.coreTenantKey, timeoutMs: 45_000 })` и передать в `buildApp`. Поправить `test/health.test.ts` — добавить `core` в deps.
+`backend/src/dialogs/transcriptSync.ts` — общая сверка ленты, её же зовут T3 (хвост живой сессии на re-enter) и T4 (опрос перед эскалацией):
+
+```ts
+import type { AppDeps } from '../app.ts';
+import type { TranscriptMessage } from '../core/types.ts';
+import type { DialogRow } from '../db/repositories/dialogs.ts';
+import { hasSimilarMessage, insertMessage } from '../db/repositories/messages.ts';
+
+/** Окно, в котором реплика из ленты ядра считается той же, что уже в журнале. */
+export const TRANSCRIPT_DEDUP_WINDOW_S = 900;
+
+export type SyncResult = { fetched: number; stored: number; skipped: number };
+
+/**
+ * Положить ленту ядра в журнал БЕЗ дублей. Уникальный индекс тут бессилен: одна
+ * и та же реплика приезжает двумя путями с разными ключами — от клиента
+ * (source='client', его seq) и из ленты (source='core', seq ядра), — поэтому
+ * дедупим по тексту+роли в окне. Витрина склеивается, а source остаётся, чтобы
+ * на разборе инцидента было видно, кто что принёс.
+ */
+export async function persistTranscript(
+  deps: AppDeps,
+  input: { dialog: DialogRow; sessionId: string; messages: TranscriptMessage[] },
+): Promise<SyncResult> {
+  let stored = 0;
+  let skipped = 0;
+  for (const message of input.messages) {
+    const role = message.role === 'agent' ? 'agent' : 'user';
+    if (await hasSimilarMessage(deps.pool, {
+      dialogId: input.dialog.id, role, text: message.text, windowSeconds: TRANSCRIPT_DEDUP_WINDOW_S,
+    })) {
+      skipped += 1;
+      continue;
+    }
+    if (await insertMessage(deps.pool, {
+      dialogId: input.dialog.id, role, text: message.text,
+      source: 'core', coreSessionId: input.sessionId, seq: message.seq,
+    })) stored += 1;
+    else skipped += 1;
+  }
+  return { fetched: input.messages.length, stored, skipped };
+}
+
+/** Сверка на финализации: тянем ленту сами и докладываем расхождение. */
+export async function reconcileTranscript(
+  deps: AppDeps,
+  input: { dialog: DialogRow; sessionId: string; expected?: number },
+): Promise<SyncResult> {
+  let messages: TranscriptMessage[] = [];
+  try {
+    messages = (await deps.core!.getTranscript(input.sessionId)).messages;
+  } catch (err) {
+    deps.log.warn({ err, sessionId: input.sessionId }, 'сверка: ленту получить не удалось');
+    return { fetched: 0, stored: 0, skipped: 0 };
+  }
+  const result = await persistTranscript(deps, { dialog: input.dialog, sessionId: input.sessionId, messages });
+  if (input.expected !== undefined && input.expected !== messages.length) {
+    deps.log.warn(
+      { sessionId: input.sessionId, expected: input.expected, got: messages.length },
+      'сверка: message_count вебхука разошёлся с лентой',
+    );
+  }
+  if (result.stored > 0) {
+    deps.log.info({ sessionId: input.sessionId, ...result }, 'сверка: журнал дополнен репликами из ленты ядра');
+  }
+  return result;
+}
+```
+
+Обновить `backend/src/app.ts`: сделать `core` в `AppDeps` обязательным (`core: CoreClient`) и `await app.register(coreWebhookRoutes);`. Обновить `server.ts`: создать `new CoreClient({ baseUrl: config.coreBaseUrl, tenantKey: config.coreTenantKey, timeoutMs: 45_000 })` и передать в `buildApp`. Поправить `test/health.test.ts` — добавить `core` в deps.
 
 Run: `npx vitest run` → PASS.
 
 - [ ] **Step 11: Мутпроба дедупа и денег**
 
 1. Убрать `if (!fresh) return …` (обрабатывать дубли) → тест «ретрай того же event_id не удваивает деньги» FAIL. Вернуть.
-2. Заменить `credits_total = credits_total + $3` на `credits_total = $3` в `applyFinalizedUsage` → тест «финализация НЕ текущей сессии» останется зелёным, а вот суммирование по нити не проверено — ДОБАВИТЬ тест: два разных `event_id` по двум сессиям одного диалога дают `credits_total = сумма`. С мутацией FAIL, без — PASS.
-3. Снять условие `dialog.status === 'active'` → тест «финализация НЕ текущей сессии не роняет диалог в ended» FAIL (диалог уйдёт в ended). Вернуть.
+2. Заменить `credits_total = credits_total + $3` на `credits_total = $3` в `applyFinalizedUsage` → тест «деньги РАЗНЫХ сессий одной нити суммируются» FAIL. Вернуть.
+3. Убрать условие `AND NOT (settled_session_ids @> to_jsonb($4::text))` → тест «деньги той же сессии из ДРУГОГО события не удваиваются» FAIL (14 вместо 7). Вернуть.
+4. Снять условие `dialog.status === 'active'` → тест «финализация НЕ текущей сессии не роняет диалог в ended» FAIL (диалог уйдёт в ended). Вернуть.
+5. В `persistTranscript` убрать проверку `hasSimilarMessage` → тест «transcript.ready доливает ТОЛЬКО то, чего клиент не записал» FAIL (реплика задвоится). Вернуть.
 
 - [ ] **Step 12: Commit**
 
@@ -1659,29 +1927,32 @@ git commit -m "feat(core): HTTP-клиент ядра + приёмник веб�
 
 **Files:**
 - Create: `backend/src/http/errors.ts`, `backend/src/http/originGuard.ts`
-- Create: `backend/src/dialogs/openSession.ts`, `backend/src/dialogs/startDialog.ts`, `backend/src/dialogs/reenter.ts`
+- Create: `backend/src/dialogs/budget.ts`, `backend/src/dialogs/openSession.ts`, `backend/src/dialogs/startDialog.ts`, `backend/src/dialogs/reenter.ts`
 - Create: `backend/src/routes/publicApi.ts`
+- Create: `backend/test/helpers/app.ts` — общая сборка тестового инстанса (`buildTestApp(overrides?)` → `{ app, core, pool, deps }`), её переиспользуют T4, T5 и T6
 - Modify: `backend/src/app.ts` (регистрация `@fastify/rate-limit` + publicApi)
 - Test: `backend/test/originGuard.test.ts`, `backend/test/publicApi.test.ts`, `backend/test/caps.test.ts`
 
 **Interfaces:**
 - Consumes (T1, T2): все репозитории, `AppDeps`, `CoreClient`, `CoreHttpError`, `SessionCreate`, `ParticipantToken`, `WidgetRow`, `DialogRow`.
 - Produces:
-  - `class ApiError extends Error { readonly status: number; readonly code: string }` + `sendApiError(reply, err)`.
-  - `originVerdict(widget: WidgetRow, origin: string | undefined, publicOrigin: string): 'allow' | 'deny'`
+  - `class ApiError extends Error { readonly status: number; readonly code: string }` + `sendApiError(reply, err)` + `mapCoreError(err: CoreHttpError): ApiError` (пропускает 402/404/409/410/503 как есть, остальное → 422).
+  - `ensureSessionBudget(deps, input: { visitorKey: string; ipHash: string }): Promise<void>` — суточные капы, зовётся ПЕРЕД каждым `openCoreSession`.
+  - `originVerdict(widget: WidgetRow, ctx: { origin: string | undefined; publicOrigin: string; method: string }): 'allow' | 'deny'`; `normalizeOrigin(raw: string): string`
   - `openCoreSession(deps, input: OpenSessionInput): Promise<OpenSessionResult>` где
     `type OpenSessionInput = { widget: WidgetRow; dialog: DialogRow; channel: 'chat' | 'voice'; instructions: string; continueFrom?: string }`,
     `type OpenSessionResult = { core_session_id: string; participant_token: ParticipantToken; continued_from?: string }`.
+    Ключ повторяемости — `dlg:{dialogId}:{core_session_ids.length + 1}`, стабильный для ретраев одной логической операции.
   - `startDialog(deps, input: StartDialogInput): Promise<StartDialogResult>` где
     `type StartDialogInput = { widget: WidgetRow; visitorKey: string; ipHash: string; dialogId?: string }`,
-    `type StartDialogResult = { dialog_id: string; channel: 'chat'; participant_token: ParticipantToken; continued_from?: string; messages: PublicMessage[] }`.
+    `type StartDialogResult = { dialog_id: string; channel: 'chat'; participant_token: ParticipantToken; continued_from?: string; messages: PublicMessage[]; next_seq: number }`.
   - `reenterDialog(deps, input: { widget: WidgetRow; dialog: DialogRow }): Promise<ReenterResult>` где
-    `type ReenterResult = { dialog_id: string; channel: 'chat' | 'voice'; participant_token: ParticipantToken; messages: PublicMessage[] }`.
+    `type ReenterResult = { dialog_id: string; channel: 'chat' | 'voice'; participant_token: ParticipantToken; messages: PublicMessage[]; next_seq: number }`.
   - `type PublicMessage = { role: 'user' | 'agent'; text: string; seq: number; source: 'client' | 'core'; created_at: string }`.
   - Роуты: `GET /w/v1/:token/config`, `POST /w/v1/:token/dialogs`, `POST /w/v1/:token/dialogs/:id/reenter`, `POST|GET /w/v1/:token/dialogs/:id/messages`, `POST /w/v1/:token/dialogs/:id/end`, `POST /w/v1/:token/dialogs/:id/lead`.
 
 **Решения, доопределяющие спеку (обязательны к реализации именно так):**
-1. **Origin у iframe — НАШ, а не сайта клиента.** Iframe живёт на `WIDGET_PUBLIC_ORIGIN`, поэтому буквальная проверка «Origin ∈ allowed_origins» убила бы штатный путь. Правило: `Origin` отсутствует → пропускаем (браузер не шлёт его на same-origin GET; cross-origin fetch шлёт всегда); `Origin` есть → обязан быть в `allowed_origins ∪ {WIDGET_PUBLIC_ORIGIN}`. Пустой `allowed_origins` → **отказ всем, включая запросы без Origin** (виджет не настроен ни на один сайт — спека §3). Настоящая защита от встраивания на чужой сайт — заголовок `frame-ancestors` на странице `/app/:token` (T5), браузер её обеспечивает.
+1. **Origin у iframe — НАШ, а не сайта клиента.** Iframe живёт на `WIDGET_PUBLIC_ORIGIN`, поэтому буквальная проверка «Origin ∈ allowed_origins» убила бы штатный путь. Правило асимметрично по методу: на не-GET отсутствие `Origin` → **ОТКАЗ** (Fetch-спека обязывает браузер слать заголовок на каждый не-GET, значит его отсутствие — не браузер), на GET отсутствие допустимо (same-origin GET его не несёт); если `Origin` есть — обязан быть в `allowed_origins ∪ {WIDGET_PUBLIC_ORIGIN}`. Пустой `allowed_origins` → отказ всем на любом методе (виджет не настроен ни на один сайт — спека §3). Настоящая защита от встраивания на чужой сайт — заголовок `frame-ancestors` на странице `/app/:token` (Task 5), её обеспечивает браузер.
 2. **`POST /dialogs` с `dialog_id` = продолжение нити** (баннер «Продолжить» после `silence` и фолбэк провалившейся эскалации из §5): создаёт НОВУЮ chat-сессию ядра с `continue_from` = последней сессии диалога.
 3. **Капы считают КАЖДОЕ создание сессии ядра** (старт, продолжение, эскалация), а не только первый старт диалога: деньги жжёт сессия, а не строка в БД. Это осознанное ужесточение §6.
 
@@ -1697,38 +1968,49 @@ import type { WidgetRow } from '../src/db/repositories/widgets.ts';
 const widget = (origins: string[]): WidgetRow =>
   ({ allowed_origins: origins } as WidgetRow);
 const OURS = 'https://widget.aski.pro';
+const check = (
+  origins: string[],
+  origin: string | undefined,
+  method: string,
+): 'allow' | 'deny' => originVerdict(widget(origins), { origin, publicOrigin: OURS, method });
 
 describe('originVerdict', () => {
   it('свой сайт разрешён', () => {
-    expect(originVerdict(widget(['https://shop.example']), 'https://shop.example', OURS)).toBe('allow');
+    expect(check(['https://shop.example'], 'https://shop.example', 'POST')).toBe('allow');
   });
 
   it('наш собственный origin разрешён — это путь iframe', () => {
-    expect(originVerdict(widget(['https://shop.example']), OURS, OURS)).toBe('allow');
+    expect(check(['https://shop.example'], OURS, 'POST')).toBe('allow');
   });
 
   it('чужой origin — отказ', () => {
-    expect(originVerdict(widget(['https://shop.example']), 'https://evil.example', OURS)).toBe('deny');
+    expect(check(['https://shop.example'], 'https://evil.example', 'POST')).toBe('deny');
   });
 
-  it('отсутствие Origin при непустом списке — пропуск (same-origin GET браузера)', () => {
-    expect(originVerdict(widget(['https://shop.example']), undefined, OURS)).toBe('allow');
+  it('НЕ-GET без Origin — ОТКАЗ: браузер шлёт Origin на любой не-GET, значит это curl', () => {
+    expect(check(['https://shop.example'], undefined, 'POST')).toBe('deny');
+    expect(check(['https://shop.example'], undefined, 'DELETE')).toBe('deny');
   });
 
-  it('ПУСТОЙ allowed_origins — отказ всем, включая запрос без Origin', () => {
-    expect(originVerdict(widget([]), 'https://shop.example', OURS)).toBe('deny');
-    expect(originVerdict(widget([]), undefined, OURS)).toBe('deny');
-    expect(originVerdict(widget([]), OURS, OURS)).toBe('deny');
+  it('GET без Origin — пропуск: браузер не шлёт его на same-origin GET', () => {
+    expect(check(['https://shop.example'], undefined, 'GET')).toBe('allow');
+    expect(check(['https://shop.example'], undefined, 'HEAD')).toBe('allow');
+  });
+
+  it('ПУСТОЙ allowed_origins — отказ всем и на любом методе', () => {
+    expect(check([], 'https://shop.example', 'POST')).toBe('deny');
+    expect(check([], undefined, 'GET')).toBe('deny');
+    expect(check([], OURS, 'POST')).toBe('deny');
   });
 
   it('сравнение точное: поддомен и порт не подходят', () => {
-    expect(originVerdict(widget(['https://shop.example']), 'https://evil.shop.example', OURS)).toBe('deny');
-    expect(originVerdict(widget(['https://shop.example']), 'https://shop.example:8443', OURS)).toBe('deny');
-    expect(originVerdict(widget(['https://shop.example']), 'http://shop.example', OURS)).toBe('deny');
+    expect(check(['https://shop.example'], 'https://evil.shop.example', 'POST')).toBe('deny');
+    expect(check(['https://shop.example'], 'https://shop.example:8443', 'POST')).toBe('deny');
+    expect(check(['https://shop.example'], 'http://shop.example', 'POST')).toBe('deny');
   });
 
   it('хвостовой слэш и регистр схемы/хоста нормализуются', () => {
-    expect(originVerdict(widget(['https://Shop.Example/']), 'https://shop.example', OURS)).toBe('allow');
+    expect(check(['https://Shop.Example/'], 'https://shop.example', 'POST')).toBe('allow');
   });
 });
 ```
@@ -1741,6 +2023,7 @@ Run: `npx vitest run test/originGuard.test.ts` → FAIL.
 
 ```ts
 import type { FastifyReply } from 'fastify';
+import type { CoreHttpError } from '../core/client.ts';
 
 export class ApiError extends Error {
   constructor(readonly status: number, readonly code: string, message: string) {
@@ -1751,6 +2034,17 @@ export class ApiError extends Error {
 
 export const sendApiError = (reply: FastifyReply, err: ApiError): FastifyReply =>
   reply.code(err.status).send({ error: { code: err.code, message: err.message } });
+
+/**
+ * Ошибка ядра → ошибка наружу. Коды НЕ схлопываем в 422: 409
+ * (`idempotency_in_progress` — повторить через мгновение), 404 (чужой
+ * `continue_from`) и 410 (сессия закрыта) требуют от клиента РАЗНЫХ действий,
+ * и одинаковый статус лишил бы его возможности их различить.
+ */
+export const mapCoreError = (err: CoreHttpError): ApiError => {
+  const passthrough = new Set([402, 404, 409, 410, 503]);
+  return new ApiError(passthrough.has(err.status) ? err.status : 422, err.code, err.message);
+};
 ```
 
 `backend/src/http/originGuard.ts`:
@@ -1768,19 +2062,27 @@ export function normalizeOrigin(raw: string): string {
   }
 }
 
+const SAFE_METHODS = new Set(['GET', 'HEAD']);
+
 export function originVerdict(
   widget: Pick<WidgetRow, 'allowed_origins'>,
-  origin: string | undefined,
-  publicOrigin: string,
+  ctx: { origin: string | undefined; publicOrigin: string; method: string },
 ): 'allow' | 'deny' {
   // Пустой список = виджет не настроен ни на один сайт → закрыт весь публичный
   // путь. Это ЯВНОЕ отличие от монолита, где пустой список значил «любой».
   if (widget.allowed_origins.length === 0) return 'deny';
-  // Браузер не шлёт Origin на same-origin GET; cross-origin fetch шлёт всегда.
-  if (origin === undefined) return 'allow';
-  const wanted = normalizeOrigin(origin);
+
+  if (ctx.origin === undefined) {
+    // Fetch-спека обязывает браузер слать Origin на КАЖДЫЙ не-GET запрос, в том
+    // числе same-origin. Значит отсутствие заголовка на POST — это не браузер, а
+    // curl: отказываем. На GET заголовка честно может не быть (same-origin), и
+    // там пропускаем — иначе iframe не прочитает собственную историю.
+    return SAFE_METHODS.has(ctx.method.toUpperCase()) ? 'allow' : 'deny';
+  }
+
+  const wanted = normalizeOrigin(ctx.origin);
   const allowed = widget.allowed_origins.map(normalizeOrigin);
-  return wanted === normalizeOrigin(publicOrigin) || allowed.includes(wanted) ? 'allow' : 'deny';
+  return wanted === normalizeOrigin(ctx.publicOrigin) || allowed.includes(wanted) ? 'allow' : 'deny';
 }
 ```
 
@@ -1797,7 +2099,7 @@ import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.ts';
 import { CoreClient } from '../src/core/client.ts';
 import { findDialogById, insertDialog } from '../src/db/repositories/dialogs.ts';
-import { listMessages } from '../src/db/repositories/messages.ts';
+import { listThreadTail } from '../src/db/repositories/messages.ts';
 import { FakeCore } from './helpers/fakeCore.ts';
 import { seedWidget, testPool, truncateAll } from './helpers/db.ts';
 
@@ -1975,7 +2277,7 @@ describe('POST /w/v1/:token/dialogs/:id/reenter', () => {
     expect(sent.identity).toMatch(/^respondent-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
     // Хвост живой сессии подмешан к журналу и сохранён как source='core'.
     expect(res.json().messages.map((m: { text: string }) => m.text)).toEqual(['Здравствуйте!', 'хвост живой сессии']);
-    const stored = await listMessages(pool, dialog.id, 50);
+    const stored = await listThreadTail(pool, dialog.id, 50);
     expect(stored.filter((m) => m.source === 'core').map((m) => m.text)).toEqual(['хвост живой сессии']);
   });
 
@@ -2014,7 +2316,7 @@ describe('журнал, завершение и лид', () => {
     const id = await startDialog(token);
     await app.inject({ method: 'POST', url: `/w/v1/${token}/dialogs/${id}/messages`, headers: { origin: ORIGIN },
       payload: { visitor_key: VISITOR, role: 'user', text: 'я'.repeat(2500), seq: 1 } });
-    const stored = await listMessages(pool, id, 10);
+    const stored = await listThreadTail(pool, id, 10);
     expect(stored[0]!.text).toHaveLength(2000);
   });
 
@@ -2069,16 +2371,20 @@ import { describe, expect, it } from 'vitest';
 // … та же beforeEach-обвязка, но конфиг с маленькими капами:
 //    maxDialogsPerVisitorPerDay: 2, maxDialogsPerIpPerDay: 3
 
+// IP берётся из РЕАЛЬНОГО адреса соединения (trustProxy=false), поэтому в
+// тестах его задаёт remoteAddress инжекта, а не заголовок.
+const post = (token: string, body: object, remoteAddress = '203.0.113.7') =>
+  app.inject({ method: 'POST', url: `/w/v1/${token}/dialogs`, headers: { origin: ORIGIN }, remoteAddress, payload: body });
+
 describe('капы бюджет-предохранителя', () => {
   it('третий диалог того же visitor за сутки → 429 visitor_daily_cap, ядро не дёргается', async () => {
     const { token } = await seedWidget(pool, { allowedOrigins: [ORIGIN] });
     core.enqueue({ status: 201, body: CREATED('sess_1111111111111111') });
     core.enqueue({ status: 201, body: CREATED('sess_2222222222222222') });
     for (let i = 0; i < 2; i += 1) {
-      const ok = await app.inject({ method: 'POST', url: `/w/v1/${token}/dialogs`, headers: { origin: ORIGIN, 'x-forwarded-for': '203.0.113.7' }, payload: { visitor_key: VISITOR } });
-      expect(ok.statusCode).toBe(201);
+      expect((await post(token, { visitor_key: VISITOR })).statusCode).toBe(201);
     }
-    const denied = await app.inject({ method: 'POST', url: `/w/v1/${token}/dialogs`, headers: { origin: ORIGIN, 'x-forwarded-for': '203.0.113.7' }, payload: { visitor_key: VISITOR } });
+    const denied = await post(token, { visitor_key: VISITOR });
     expect(denied.statusCode).toBe(429);
     expect(denied.json().error.code).toBe('visitor_daily_cap');
     expect(core.calls).toHaveLength(2);
@@ -2088,34 +2394,103 @@ describe('капы бюджет-предохранителя', () => {
     const { token } = await seedWidget(pool, { allowedOrigins: [ORIGIN] });
     for (let i = 0; i < 3; i += 1) core.enqueue({ status: 201, body: CREATED(`sess_${String(i).repeat(16)}`) });
     for (let i = 0; i < 3; i += 1) {
-      const res = await app.inject({ method: 'POST', url: `/w/v1/${token}/dialogs`, headers: { origin: ORIGIN, 'x-forwarded-for': '203.0.113.8' }, payload: { visitor_key: randomUUID() } });
-      expect(res.statusCode).toBe(201);
+      expect((await post(token, { visitor_key: randomUUID() }, '203.0.113.8')).statusCode).toBe(201);
     }
-    const denied = await app.inject({ method: 'POST', url: `/w/v1/${token}/dialogs`, headers: { origin: ORIGIN, 'x-forwarded-for': '203.0.113.8' }, payload: { visitor_key: randomUUID() } });
+    const denied = await post(token, { visitor_key: randomUUID() }, '203.0.113.8');
     expect(denied.statusCode).toBe(429);
     expect(denied.json().error.code).toBe('ip_daily_cap');
+  });
+
+  it('X-Forwarded-For НЕ подменяет IP: иначе кап обходится одним заголовком', async () => {
+    const { token } = await seedWidget(pool, { allowedOrigins: [ORIGIN] });
+    for (let i = 0; i < 3; i += 1) core.enqueue({ status: 201, body: CREATED(`sess_${String(i).repeat(16)}`) });
+    for (let i = 0; i < 3; i += 1) {
+      expect((await post(token, { visitor_key: randomUUID() }, '203.0.113.10')).statusCode).toBe(201);
+    }
+    // Атакующий крутит заголовок, надеясь получить свежую квоту.
+    const spoofed = await app.inject({
+      method: 'POST', url: `/w/v1/${token}/dialogs`,
+      headers: { origin: ORIGIN, 'x-forwarded-for': '198.51.100.1' },
+      remoteAddress: '203.0.113.10',
+      payload: { visitor_key: randomUUID() },
+    });
+    expect(spoofed.statusCode).toBe(429);
+    expect(spoofed.json().error.code).toBe('ip_daily_cap');
+    // И в счётчиках ровно ОДИН ключ — подменённый адрес своей строки не завёл.
+    const { rows } = await pool.query('SELECT count(*)::int AS n FROM ip_day_counters');
+    expect(rows[0].n).toBe(1);
   });
 
   it('IP в БД не попадает — только хэш', async () => {
     const { token } = await seedWidget(pool, { allowedOrigins: [ORIGIN] });
     core.enqueue({ status: 201, body: CREATED('sess_3333333333333333') });
-    await app.inject({ method: 'POST', url: `/w/v1/${token}/dialogs`, headers: { origin: ORIGIN, 'x-forwarded-for': '203.0.113.9' }, payload: { visitor_key: VISITOR } });
+    await post(token, { visitor_key: VISITOR }, '203.0.113.9');
     const { rows } = await pool.query('SELECT ip_hash FROM ip_day_counters');
     expect(rows[0].ip_hash).toMatch(/^[0-9a-f]{64}$/);
     expect(rows[0].ip_hash).not.toContain('203.0.113.9');
+  });
+
+  it('кап считает и ЭСКАЛАЦИЮ: она создаёт платную сессию так же, как старт', async () => {
+    const { token, id: widgetId } = await seedWidget(pool, { allowedOrigins: [ORIGIN] });
+    // Диалог уже есть, квота visitor выбрана двумя прошлыми диалогами.
+    const dialog = await insertDialog(pool, { widgetId, visitorKey: VISITOR });
+    await insertDialog(pool, { widgetId, visitorKey: VISITOR });
+    await pool.query(
+      `UPDATE dialogs SET current_core_session_id='sess_aaaaaaaaaaaaaaaa', current_channel='chat' WHERE id=$1`,
+      [dialog.id],
+    );
+    const denied = await app.inject({
+      method: 'POST', url: `/w/v1/${token}/dialogs/${dialog.id}/escalate`,
+      headers: { origin: ORIGIN }, remoteAddress: '203.0.113.11',
+      payload: { visitor_key: VISITOR, messages_count: 0 },
+    });
+    expect(denied.statusCode).toBe(429);
+    expect(denied.json().error.code).toBe('visitor_daily_cap');
+    expect(core.calls).toHaveLength(0); // ядро не тронуто: ни /end, ни создания
   });
 });
 ```
 
 Run: `npx vitest run test/caps.test.ts` → FAIL.
 
-- [ ] **Step 5: Реализация `openSession.ts`**
+- [ ] **Step 5: Реализация `budget.ts` — единая проверка капов**
+
+`backend/src/dialogs/budget.ts`. Капы обязаны стоять перед КАЖДЫМ созданием сессии ядра, а не только перед стартом диалога: эскалация и продолжение нити жгут деньги ровно так же (решение №3 выше). Отдельная функция — чтобы «забыть позвать» можно было только явно:
+
+```ts
+import type { AppDeps } from '../app.ts';
+import { countDialogsStartedByVisitor } from '../db/repositories/dialogs.ts';
+import { bumpIpDayCounter } from '../db/repositories/quotas.ts';
+import { ApiError } from '../http/errors.ts';
+
+/**
+ * Суточные капы бюджет-предохранителя (спека §6.3). Зовётся ПЕРЕД каждым
+ * openCoreSession: старт диалога, продолжение нити, эскалация в голос.
+ * Счётчик IP инкрементится здесь же — попытка создания уже стоит квоты, иначе
+ * провалившиеся создания дали бы бесплатный обход.
+ */
+export async function ensureSessionBudget(
+  deps: AppDeps,
+  input: { visitorKey: string; ipHash: string },
+): Promise<void> {
+  const byVisitor = await countDialogsStartedByVisitor(deps.pool, input.visitorKey);
+  if (byVisitor >= deps.config.maxDialogsPerVisitorPerDay) {
+    throw new ApiError(429, 'visitor_daily_cap', 'Слишком много обращений за сутки. Попробуйте завтра.');
+  }
+  const byIp = await bumpIpDayCounter(deps.pool, input.ipHash);
+  if (byIp > deps.config.maxDialogsPerIpPerDay) {
+    throw new ApiError(429, 'ip_daily_cap', 'Слишком много обращений за сутки. Попробуйте завтра.');
+  }
+}
+```
+
+- [ ] **Step 6: Реализация `openSession.ts`**
 
 `backend/src/dialogs/openSession.ts`:
 
 ```ts
 import type { AppDeps } from '../app.ts';
-import { attachCoreSession, bumpSessionSeq, type DialogRow } from '../db/repositories/dialogs.ts';
+import { attachCoreSession, type DialogRow } from '../db/repositories/dialogs.ts';
 import type { WidgetRow } from '../db/repositories/widgets.ts';
 import type { ParticipantToken, SessionCreate } from '../core/types.ts';
 
@@ -2134,12 +2509,22 @@ export type OpenSessionResult = {
 };
 
 /**
- * Единственная точка создания сессии ядра. Ключ повторяемости детерминирован и
- * монотонен (`dlg:<id>:<seq>`): повтор того же запроса не плодит вторую
- * сессию, а новая попытка никогда не переиспользует ключ закрытой (410).
+ * Единственная точка создания сессии ядра.
+ *
+ * Ключ повторяемости — на ЛОГИЧЕСКУЮ операцию, а не на попытку:
+ * `dlg:<id>:<число уже привязанных сессий + 1>`. Пока сессия не привязана,
+ * повтор (ретрай сети, двойной клик, дубль POST) вычисляет ТОТ ЖЕ ключ и
+ * получает от ядра ту же сессию, а не вторую платную. Счётчик, который
+ * инкрементился бы перед каждой попыткой, ровно это и ломал: каждый ретрай
+ * покупал новую сессию.
+ *
+ * Он же закрывает гонку двух параллельных запросов по одному диалогу: второй
+ * приходит с тем же ключом и получает 409 `idempotency_in_progress` — роль
+ * общего замка играет idempotency-хранилище ядра, локальный CAS не нужен.
  */
 export async function openCoreSession(deps: AppDeps, input: OpenSessionInput): Promise<OpenSessionResult> {
-  const seq = await bumpSessionSeq(deps.pool, input.dialog.id);
+  const attempt = input.dialog.core_session_ids.length + 1;
+  const idempotencyKey = `dlg:${input.dialog.id}:${attempt}`;
   const body: SessionCreate = {
     channel: input.channel,
     agent: {
@@ -2156,7 +2541,20 @@ export async function openCoreSession(deps: AppDeps, input: OpenSessionInput): P
     metadata: { widget_id: input.widget.id, dialog_id: input.dialog.id },
   };
 
-  const created = await deps.core.createSession(body, `dlg:${input.dialog.id}:${seq}`);
+  let created;
+  try {
+    created = await deps.core.createSession(body, idempotencyKey);
+  } catch (err) {
+    // 410 = ключ принадлежит уже ЗАВЕРШЁННОЙ сессии: такое возможно, если
+    // прошлая попытка успела создать сессию, но упала до привязки. Один раз
+    // пробуем со свежим ключом — иначе диалог залипнет навсегда.
+    if (err instanceof CoreHttpError && err.status === 410) {
+      deps.log.warn({ dialogId: input.dialog.id, idempotencyKey }, 'ключ повторяемости указывает на закрытую сессию — берём свежий');
+      created = await deps.core.createSession(body, `${idempotencyKey}:r${Date.now()}`);
+    } else {
+      throw err;
+    }
+  }
   await attachCoreSession(deps.pool, {
     dialogId: input.dialog.id,
     sessionId: created.session_id,
@@ -2170,7 +2568,7 @@ export async function openCoreSession(deps: AppDeps, input: OpenSessionInput): P
 }
 ```
 
-- [ ] **Step 6: Реализация `startDialog.ts` и `reenter.ts`**
+- [ ] **Step 7: Реализация `startDialog.ts` и `reenter.ts`**
 
 `backend/src/dialogs/startDialog.ts`:
 
@@ -2180,7 +2578,7 @@ import { CoreHttpError } from '../core/client.ts';
 import {
   countDialogsStartedByVisitor, findDialogById, insertDialog, setDialogStatus, type DialogRow,
 } from '../db/repositories/dialogs.ts';
-import { listMessages, type MessageRow } from '../db/repositories/messages.ts';
+import { listThreadTail, type MessageRow } from '../db/repositories/messages.ts';
 import { bumpIpDayCounter } from '../db/repositories/quotas.ts';
 import type { WidgetRow } from '../db/repositories/widgets.ts';
 import { ApiError } from '../http/errors.ts';
@@ -2196,21 +2594,14 @@ export const toPublicMessage = (row: MessageRow): PublicMessage => ({
 export type StartDialogInput = { widget: WidgetRow; visitorKey: string; ipHash: string; dialogId?: string };
 export type StartDialogResult = {
   dialog_id: string; channel: 'chat'; participant_token: ParticipantToken;
-  continued_from?: string; messages: PublicMessage[];
+  continued_from?: string; messages: PublicMessage[]; next_seq: number;
 };
 
 export const MESSAGES_PAGE = 200;
 
 export async function startDialog(deps: AppDeps, input: StartDialogInput): Promise<StartDialogResult> {
   // Капы ДО денег: сессия ядра — единственное, что жжёт кредиты.
-  const byVisitor = await countDialogsStartedByVisitor(deps.pool, input.visitorKey);
-  if (byVisitor >= deps.config.maxDialogsPerVisitorPerDay) {
-    throw new ApiError(429, 'visitor_daily_cap', 'Слишком много диалогов за сутки. Попробуйте завтра.');
-  }
-  const byIp = await bumpIpDayCounter(deps.pool, input.ipHash);
-  if (byIp > deps.config.maxDialogsPerIpPerDay) {
-    throw new ApiError(429, 'ip_daily_cap', 'Слишком много диалогов за сутки. Попробуйте завтра.');
-  }
+  await ensureSessionBudget(deps, { visitorKey: input.visitorKey, ipHash: input.ipHash });
 
   let dialog: DialogRow;
   let continueFrom: string | undefined;
@@ -2242,18 +2633,21 @@ export async function startDialog(deps: AppDeps, input: StartDialogInput): Promi
       ...(continueFrom ? { continueFrom } : {}),
     });
     await setDialogStatus(deps.pool, dialog.id, 'active');
-    const rows = await listMessages(deps.pool, dialog.id, MESSAGES_PAGE);
+    const rows = await listThreadTail(deps.pool, dialog.id, MESSAGES_PAGE);
     return {
       dialog_id: dialog.id, channel: 'chat', participant_token: opened.participant_token,
       ...(opened.continued_from ? { continued_from: opened.continued_from } : {}),
       messages: rows.map(toPublicMessage),
+      // Клиент продолжает нумерацию журнала отсюда: после reload у него свой
+      // счётчик обнулился бы, и новые реплики затирались бы дедупом по (seq).
+      next_seq: (await maxClientSeq(deps.pool, dialog.id)) + 1,
     };
   } catch (err) {
     if (err instanceof CoreHttpError) {
-      // 402 — денег нет: диалог мёртв. Остальное (503/422) оставляем живым,
-      // клиент вправе повторить.
+      // 402 — денег нет: диалог мёртв. Остальное оставляем живым, клиент вправе
+      // повторить. Коды ядра наружу НЕ схлопываем (mapCoreError).
       await setDialogStatus(deps.pool, dialog.id, err.status === 402 ? 'error' : 'active');
-      throw new ApiError(err.status === 402 ? 402 : err.status === 503 ? 503 : 422, err.code, err.message);
+      throw mapCoreError(err);
     }
     throw err;
   }
@@ -2267,15 +2661,16 @@ import { randomUUID } from 'node:crypto';
 import type { AppDeps } from '../app.ts';
 import { CoreHttpError } from '../core/client.ts';
 import type { DialogRow } from '../db/repositories/dialogs.ts';
-import { insertMessage, listMessages } from '../db/repositories/messages.ts';
+import { listThreadTail, maxClientSeq } from '../db/repositories/messages.ts';
 import type { WidgetRow } from '../db/repositories/widgets.ts';
 import { ApiError } from '../http/errors.ts';
 import type { ParticipantToken } from '../core/types.ts';
+import { reconcileTranscript } from './transcriptSync.ts';
 import { MESSAGES_PAGE, toPublicMessage, type PublicMessage } from './startDialog.ts';
 
 export type ReenterResult = {
   dialog_id: string; channel: 'chat' | 'voice';
-  participant_token: ParticipantToken; messages: PublicMessage[];
+  participant_token: ParticipantToken; messages: PublicMessage[]; next_seq: number;
 };
 
 /** identity ре-входа: ВСЕГДА новая и ВСЕГДА с префиксом respondent-. */
@@ -2293,41 +2688,29 @@ export async function reenterDialog(
     // Прежнюю identity переиспользовать НЕЛЬЗЯ: LiveKit выкинет живого участника.
     token = await deps.core.issueParticipantToken(sessionId, newRespondentIdentity());
   } catch (err) {
-    if (err instanceof CoreHttpError) throw new ApiError(err.status === 410 ? 410 : err.status, err.code, err.message);
+    if (err instanceof CoreHttpError) throw mapCoreError(err);
     throw err;
   }
 
   // Хвост ЖИВОЙ сессии: лента ядра наполняется и на chat, лаг флаша ≤5с.
-  try {
-    const page = await deps.core.getTranscript(sessionId);
-    for (const message of page.messages) {
-      await insertMessage(deps.pool, {
-        dialogId: input.dialog.id,
-        role: message.role === 'agent' ? 'agent' : 'user',
-        text: message.text,
-        source: 'core',
-        coreSessionId: sessionId,
-        seq: message.seq,
-      });
-    }
-  } catch (err) {
-    // Транскрипт — довесок к журналу, а не условие входа: журнал уже у нас.
-    deps.log.warn({ err, sessionId }, 'хвост транскрипта не доехал — отдаём только журнал');
-  }
+  // Та же общая сверка, что на transcript.ready — с дедупом по тексту, иначе
+  // каждое повторное открытие вкладки удваивало бы историю.
+  await reconcileTranscript(deps, { dialog: input.dialog, sessionId });
 
-  const rows = await listMessages(deps.pool, input.dialog.id, MESSAGES_PAGE);
+  const rows = await listThreadTail(deps.pool, input.dialog.id, MESSAGES_PAGE);
   return {
     dialog_id: input.dialog.id,
     channel: input.dialog.current_channel ?? 'chat',
     participant_token: token,
     messages: rows.map(toPublicMessage),
+    next_seq: (await maxClientSeq(deps.pool, input.dialog.id)) + 1,
   };
 }
 ```
 
 `deps.log` появляется в этом шаге: расширить `AppDeps` в `app.ts` до `{ config: AppConfig; pool: Pool; core: CoreClient; log: FastifyBaseLogger }`, присвоить `deps.log = app.log` сразу после создания инстанса Fastify (логгер до этого момента не существует) и добавить поле `log` во все тестовые сборки deps (`test/helpers/app.ts`, `test/health.test.ts`, `test/coreWebhooks.test.ts`) — там подойдёт `app.log` уже собранного инстанса либо заглушка `{ info(){}, warn(){}, error(){} } as unknown as FastifyBaseLogger`.
 
-- [ ] **Step 7: Реализация роутов `publicApi.ts`**
+- [ ] **Step 8: Реализация роутов `publicApi.ts`**
 
 `backend/src/routes/publicApi.ts` — ключевые фрагменты (полностью: 6 ручек по одному шаблону):
 
@@ -2335,7 +2718,7 @@ export async function reenterDialog(
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { findDialogById, setDialogStatus, touchDialog, type DialogRow } from '../db/repositories/dialogs.ts';
 import { insertLead } from '../db/repositories/leads.ts';
-import { insertMessage, listMessages } from '../db/repositories/messages.ts';
+import { insertMessage, listThreadTail, maxClientSeq } from '../db/repositories/messages.ts';
 import { hashIp } from '../db/repositories/quotas.ts';
 import { findWidgetByToken, type WidgetRow } from '../db/repositories/widgets.ts';
 import { ApiError, sendApiError } from '../http/errors.ts';
@@ -2349,10 +2732,15 @@ const TEXT_MAX = 2000; // воркер режет ровно тут — реже
 const requireWidget = async (req: FastifyRequest, token: string, checkOrigin: boolean): Promise<WidgetRow> => {
   const widget = await findWidgetByToken(req.server.deps.pool, token);
   if (!widget) throw new ApiError(404, 'widget_not_found', 'Виджет не найден.');
-  if (checkOrigin && originVerdict(widget, req.headers.origin, req.server.deps.config.publicOrigin) === 'deny') {
-    throw new ApiError(403, 'origin_not_allowed', 'Этот сайт не разрешён для виджета.');
+  if (checkOrigin) {
+    const verdict = originVerdict(widget, {
+      origin: req.headers.origin,
+      publicOrigin: req.server.deps.config.publicOrigin,
+      method: req.method,
+    });
+    if (verdict === 'deny') throw new ApiError(403, 'origin_not_allowed', 'Этот сайт не разрешён для виджета.');
+    if (!widget.enabled) throw new ApiError(403, 'widget_disabled', 'Виджет выключен.');
   }
-  if (checkOrigin && !widget.enabled) throw new ApiError(403, 'widget_disabled', 'Виджет выключен.');
   return widget;
 };
 
@@ -2376,13 +2764,18 @@ export const publicApiRoutes: FastifyPluginAsync = async (app) => {
     return reply.code(500).send({ error: { code: 'internal', message: 'Внутренняя ошибка.' } });
   });
 
-  app.get<{ Params: { token: string } }>('/w/v1/:token/config', async (req, reply) => {
+  app.get<{ Params: { token: string } }>(
+    '/w/v1/:token/config',
+    // Ручка без Origin-check — единственная открытая настежь, поэтому свой
+    // лимит: иначе она станет бесплатным способом щупать чужие токены.
+    { config: { rateLimit: { max: 120, timeWindow: '1 minute' } } },
+    async (req, reply) => {
     const widget = await requireWidget(req, req.params.token, false);
     const origin = req.headers.origin;
     // CORS-эхо ТОЛЬКО для разрешённых сайтов: сам ответ не секрет, но и раздавать
     // его каждому встречному незачем. Vary обязателен — кэш иначе перепутает.
     reply.header('Vary', 'Origin');
-    if (origin && originVerdict(widget, origin, app.deps.config.publicOrigin) === 'allow') {
+    if (origin && originVerdict(widget, { origin, publicOrigin: app.deps.config.publicOrigin, method: 'GET' }) === 'allow') {
       reply.header('Access-Control-Allow-Origin', origin);
     }
     reply.header('Cache-Control', 'public, max-age=60');
@@ -2453,10 +2846,11 @@ export const publicApiRoutes: FastifyPluginAsync = async (app) => {
       const widget = await requireWidget(req, req.params.token, true);
       const visitorKey = requireVisitorKey(req.query.visitor_key);
       const dialog = await requireOwnedDialog(req, widget, req.params.id, visitorKey);
-      const rows = await listMessages(app.deps.pool, dialog.id, MESSAGES_PAGE);
+      const rows = await listThreadTail(app.deps.pool, dialog.id, MESSAGES_PAGE);
       return reply.send({
         dialog_id: dialog.id, status: dialog.status, channel: dialog.current_channel,
         messages: rows.map(toPublicMessage),
+        next_seq: (await maxClientSeq(app.deps.pool, dialog.id)) + 1,
       });
     },
   );
@@ -2513,16 +2907,44 @@ await app.register(publicApiRoutes);
 
 Run: `npx vitest run` → PASS.
 
-- [ ] **Step 8: Мутпробы (деньги и протокол)**
+- [ ] **Step 9: Мутпробы (деньги и протокол)**
 
 Каждая мутация — вернуть код после проверки:
 1. В `originVerdict` вернуть `'allow'` при пустом `allowed_origins` → тест «ПУСТОЙ allowed_origins» FAIL.
-2. В `startDialog` перенести проверки капов ПОСЛЕ `openCoreSession` → тесты капов FAIL (`core.calls` длиннее ожидаемого).
-3. В `openCoreSession` заменить `limits: { max_duration_s: deps.config.maxDurationS }` на отсутствие поля → тест «создаёт диалог и chat-сессию ядра» FAIL.
-4. В `newRespondentIdentity` убрать префикс `respondent-` → тест reenter FAIL.
-5. В `startDialog` (ветка продолжения) убрать `await deps.core.endSession(last)` → тест продолжения нити FAIL (первый вызов ядра окажется не `/end`).
+2. В `originVerdict` пропускать отсутствие `Origin` на любом методе → тест «НЕ-GET без Origin — ОТКАЗ» FAIL.
+3. В `app.ts` поставить `trustProxy: true` → тест «X-Forwarded-For НЕ подменяет IP» FAIL (кап обойдён, в счётчиках две строки).
+4. В `startDialog` перенести `ensureSessionBudget` ПОСЛЕ `openCoreSession` → тесты капов FAIL (`core.calls` длиннее ожидаемого).
+5. В `openCoreSession` заменить `limits: { max_duration_s: deps.config.maxDurationS }` на отсутствие поля → тест «создаёт диалог и chat-сессию ядра» FAIL.
+6. В `newRespondentIdentity` убрать префикс `respondent-` → тест reenter FAIL.
+7. В `startDialog` (ветка продолжения) убрать `await deps.core.endSession(last)` → тест продолжения нити FAIL (первый вызов ядра окажется не `/end`).
+8. В `openCoreSession` вернуть счётчик попыток вместо `core_session_ids.length + 1` (например `Date.now()`) → тест «ретрай не покупает вторую сессию» FAIL. Этот тест ДОБАВИТЬ сюда же:
 
-- [ ] **Step 9: Commit**
+```ts
+it('ретрай POST /dialogs с тем же состоянием шлёт ТОТ ЖЕ Idempotency-Key', async () => {
+  const { token, id: widgetId } = await seedWidget(pool, { allowedOrigins: [ORIGIN] });
+  const dialog = await insertDialog(pool, { widgetId, visitorKey: VISITOR });
+  await pool.query(
+    `UPDATE dialogs SET core_session_ids='["sess_aaaaaaaaaaaaaaaa"]'::jsonb,
+            current_core_session_id='sess_aaaaaaaaaaaaaaaa', status='ended' WHERE id=$1`, [dialog.id]);
+  // Первая попытка: ядро приняло /end, но создание оборвалось сетью.
+  core.enqueue({ status: 204, body: null });
+  core.enqueue({ status: 503, body: { error: { code: 'service_unavailable', message: 'ой' } } });
+  await app.inject({ method: 'POST', url: `/w/v1/${token}/dialogs`, headers: { origin: ORIGIN },
+    payload: { visitor_key: VISITOR, dialog_id: dialog.id } });
+  // Вторая попытка — сессия так и не привязана, ключ ОБЯЗАН совпасть.
+  core.enqueue({ status: 204, body: null });
+  core.enqueue({ status: 201, body: { ...CREATED('sess_bbbbbbbbbbbbbbbb'), continued_from: 'sess_aaaaaaaaaaaaaaaa' } });
+  await app.inject({ method: 'POST', url: `/w/v1/${token}/dialogs`, headers: { origin: ORIGIN },
+    payload: { visitor_key: VISITOR, dialog_id: dialog.id } });
+
+  const creates = core.calls.filter((c) => c.url === '/api/v1/sessions');
+  expect(creates).toHaveLength(2);
+  expect(creates[0]!.headers['idempotency-key']).toBe(creates[1]!.headers['idempotency-key']);
+  expect(creates[0]!.headers['idempotency-key']).toBe(`dlg:${dialog.id}:2`);
+});
+```
+
+- [ ] **Step 5: Commit**
 
 ```bash
 git add backend/src/http backend/src/dialogs backend/src/routes/publicApi.ts backend/src/app.ts backend/test
@@ -2538,13 +2960,14 @@ git commit -m "feat(api): публичные ручки диалогов — Ori
 - Test: `backend/test/threadDigest.test.ts`, `backend/test/escalate.test.ts`, `backend/test/sweeper.test.ts`
 
 **Interfaces:**
-- Consumes (T1-T3): `openCoreSession`, `casDialogStatus`, `setDialogStatus`, `attachCoreSession`, `insertMessage`, `listLastMessages`, `listStaleActiveDialogs`, `applyFinalizedUsage`, `CoreClient.getTranscript/endSession/getSession`, `CoreHttpError`, `ApiError`, `toPublicMessage`.
+- Consumes (T1-T3): `openCoreSession`, `ensureSessionBudget`, `persistTranscript`, `casDialogStatus`, `setDialogStatus`, `attachCoreSession`, `listThreadTail`, `listStaleActiveDialogs`, `applyFinalizedUsage`, `purgeOldIpCounters`, `hashIp`, `CoreClient.getTranscript/endSession/getSession`, `CoreHttpError`, `ApiError`, `mapCoreError`, `toPublicMessage`, `buildTestApp`.
 - Produces:
   - `const INSTRUCTIONS_MAX = 32000`, `const DIGEST_MAX_MESSAGES = 30`, `const TRANSCRIPT_POLL_DEADLINE_MS = 4000`, `const TRANSCRIPT_POLL_INTERVAL_MS = 500`
   - `type ThreadLine = { role: 'user' | 'agent'; text: string }`
   - `buildContinuationInstructions(base: string, thread: ThreadLine[], pendingUserText?: string): string`
   - `escalateDialog(deps, input: EscalateInput): Promise<EscalateResult>` где
-    `type EscalateInput = { widget: WidgetRow; dialog: DialogRow; messagesCount: number }`,
+    `type EscalateInput = { widget: WidgetRow; dialog: DialogRow; messagesCount: number; visitorKey: string; ipHash: string }`
+    (`visitorKey`/`ipHash` — не для авторизации, а для `ensureSessionBudget`: голосовая сессия платная),
     `type EscalateResult = { dialog_id: string; channel: 'voice'; core_session_id: string; participant_token: ParticipantToken; continued_from: string; transcript_complete: boolean }`
   - `startSweeper(deps, opts?: { intervalMs?: number; staleMinutes?: number; batch?: number }): { stop: () => void }`
   - `sweepOnce(deps, opts: { staleMinutes: number; batch: number }): Promise<number>` (число досинхроненных диалогов)
@@ -2666,7 +3089,7 @@ Run: `npx vitest run test/threadDigest.test.ts` → PASS.
 ```ts
 import { describe, expect, it } from 'vitest';
 import { findDialogById, insertDialog } from '../src/db/repositories/dialogs.ts';
-import { listMessages } from '../src/db/repositories/messages.ts';
+import { listThreadTail } from '../src/db/repositories/messages.ts';
 // … beforeEach из helpers/app.ts: app, core (FakeCore), pool, ORIGIN, VISITOR
 
 const TOKEN = { token: 'jwt-voice', identity: 'respondent-core', livekit_url: 'wss://lk.example', expires_at: '2026-08-13T11:00:00Z' };
@@ -2719,7 +3142,7 @@ describe('POST /w/v1/:token/dialogs/:id/escalate', () => {
     expect(fresh?.current_channel).toBe('voice');
     expect(fresh?.core_session_ids).toEqual(['sess_aaaaaaaaaaaaaaaa', 'sess_bbbbbbbbbbbbbbbb']);
     // Транскрипт ядра сохранён отдельным источником — для сверки.
-    expect((await listMessages(pool, id, 50)).filter((m) => m.source === 'core')).toHaveLength(2);
+    expect((await listThreadTail(pool, id, 50)).filter((m) => m.source === 'core')).toHaveLength(2);
   });
 
   it('недобор ленты за 4с: последняя реплика посетителя уезжает в instructions', async () => {
@@ -2741,13 +3164,23 @@ describe('POST /w/v1/:token/dialogs/:id/escalate', () => {
     expect(created.agent.instructions).toContain('Меня зовут Пётр');
   });
 
-  it('повторный /escalate во время эскалации → 409, второй сессии НЕТ', async () => {
+  it('повторный /escalate во время эскалации → 409 escalation_in_progress, второй сессии НЕТ', async () => {
     const { token, id } = await seedChatDialog();
     await pool.query(`UPDATE dialogs SET status='escalating' WHERE id=$1`, [id]);
     const res = await app.inject({ method: 'POST', url: `/w/v1/${token}/dialogs/${id}/escalate`,
       headers: { origin: ORIGIN }, payload: { visitor_key: VISITOR, messages_count: 2 } });
     expect(res.statusCode).toBe(409);
     expect(res.json().error.code).toBe('escalation_in_progress');
+    expect(core.calls).toHaveLength(0);
+  });
+
+  it('эскалация завершённого диалога → 409 dialog_not_active (ДРУГОЙ код: ждать бесполезно)', async () => {
+    const { token, id } = await seedChatDialog();
+    await pool.query(`UPDATE dialogs SET status='ended' WHERE id=$1`, [id]);
+    const res = await app.inject({ method: 'POST', url: `/w/v1/${token}/dialogs/${id}/escalate`,
+      headers: { origin: ORIGIN }, payload: { visitor_key: VISITOR, messages_count: 2 } });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error.code).toBe('dialog_not_active');
     expect(core.calls).toHaveLength(0);
   });
 
@@ -2792,17 +3225,26 @@ import type { AppDeps } from '../app.ts';
 import { CoreHttpError } from '../core/client.ts';
 import type { ParticipantToken, TranscriptMessage } from '../core/types.ts';
 import { casDialogStatus, setDialogStatus, type DialogRow } from '../db/repositories/dialogs.ts';
-import { insertMessage, listLastMessages } from '../db/repositories/messages.ts';
+import { listThreadTail } from '../db/repositories/messages.ts';
 import type { WidgetRow } from '../db/repositories/widgets.ts';
-import { ApiError } from '../http/errors.ts';
+import { ApiError, mapCoreError } from '../http/errors.ts';
+import { ensureSessionBudget } from './budget.ts';
+import { persistTranscript } from './transcriptSync.ts';
 import { openCoreSession } from './openSession.ts';
 import { buildContinuationInstructions, DIGEST_MAX_MESSAGES, type ThreadLine } from './threadDigest.ts';
 
-/** Лента ядра флашится раз в 5с; ждать дольше — терять UX, поэтому 4с потолок. */
+/**
+ * Лента ядра флашится раз в 5с, а воркер продолжения ретраит пустой fetch до
+ * ~6с своего дедлайна. Ждать столько же на ручке — терять UX: 4с потолок, а
+ * недобор компенсируется дописыванием реплики в instructions.
+ */
 export const TRANSCRIPT_POLL_DEADLINE_MS = 4_000;
 export const TRANSCRIPT_POLL_INTERVAL_MS = 500;
 
-export type EscalateInput = { widget: WidgetRow; dialog: DialogRow; messagesCount: number };
+export type EscalateInput = {
+  widget: WidgetRow; dialog: DialogRow; messagesCount: number;
+  visitorKey: string; ipHash: string;
+};
 export type EscalateResult = {
   dialog_id: string; channel: 'voice'; core_session_id: string;
   participant_token: ParticipantToken; continued_from: string; transcript_complete: boolean;
@@ -2829,6 +3271,15 @@ async function pollTranscript(
 export async function escalateDialog(deps: AppDeps, input: EscalateInput): Promise<EscalateResult> {
   const fromSession = input.dialog.current_core_session_id;
   if (!fromSession) throw new ApiError(409, 'no_live_session', 'Нечего эскалировать: живой сессии нет.');
+  if (input.dialog.status !== 'active') {
+    // Отдельный код: клиенту это НЕ «эскалация уже идёт», а «диалог не в том
+    // состоянии» — он должен переоткрыть нить, а не ждать и повторять.
+    throw new ApiError(409, 'dialog_not_active', 'Диалог не в активном состоянии — откройте его заново.');
+  }
+
+  // Капы ДО всего: голосовая сессия стоит денег ровно как стартовая (§6.3).
+  // Проверяем ПЕРЕД CAS, чтобы отказ не оставил диалог в 'escalating'.
+  await ensureSessionBudget(deps, { visitorKey: input.visitorKey, ipHash: input.ipHash });
 
   // CAS: вторая параллельная эскалация НЕ создаст вторую платную сессию.
   if (!(await casDialogStatus(deps.pool, input.dialog.id, 'active', 'escalating'))) {
@@ -2839,27 +3290,23 @@ export async function escalateDialog(deps: AppDeps, input: EscalateInput): Promi
     // 1. Закрываем чат: continue_from требует ЗАВЕРШЁННУЮ сессию.
     await deps.core.endSession(fromSession);
 
-    // 2. Ждём оседания ленты. Двойная страховка: ядро само ретраит пустой fetch
-    //    до ~4.5с на своей стороне, мы добираем недостающее в instructions.
+    // 2. Ждём оседания ленты. Двойная страховка: воркер продолжения сам ретраит
+    //    пустой fetch истории до ~6с общего дедлайна, а мы добираем
+    //    недостающее в instructions.
     const messages = await pollTranscript(deps, fromSession, input.messagesCount);
-    for (const message of messages) {
-      await insertMessage(deps.pool, {
-        dialogId: input.dialog.id,
-        role: message.role === 'agent' ? 'agent' : 'user',
-        text: message.text, source: 'core', coreSessionId: fromSession, seq: message.seq,
-      });
-    }
+    // Тот же дедуп, что в сверке: клиент уже записал эти реплики своим путём.
+    await persistTranscript(deps, { dialog: input.dialog, sessionId: fromSession, messages });
     const transcriptComplete = messages.length >= input.messagesCount;
 
     // 3. Недобор — дописываем последнюю реплику посетителя из НАШЕГО журнала.
     let pending: string | undefined;
     if (!transcriptComplete) {
-      const journal = await listLastMessages(deps.pool, input.dialog.id, 50);
+      const journal = await listThreadTail(deps.pool, input.dialog.id, 50);
       pending = journal.filter((m) => m.source === 'client' && m.role === 'user').at(-1)?.text;
     }
 
     // 4. Выжимка нити: continue_from нетранзитивен, «одна правда» у BFF.
-    const thread: ThreadLine[] = (await listLastMessages(deps.pool, input.dialog.id, DIGEST_MAX_MESSAGES * 2))
+    const thread: ThreadLine[] = (await listThreadTail(deps.pool, input.dialog.id, DIGEST_MAX_MESSAGES * 2))
       .filter((m) => m.source === 'client')
       .map((m) => ({ role: m.role, text: m.text }));
     const instructions = buildContinuationInstructions(
@@ -2884,7 +3331,7 @@ export async function escalateDialog(deps: AppDeps, input: EscalateInput): Promi
       // 402 — денег нет, диалог мёртв; остальное — возвращаем в active, клиент
       // уйдёт в chat_fallback (новый чат с continue_from).
       await setDialogStatus(deps.pool, input.dialog.id, err.status === 402 ? 'error' : 'active');
-      throw new ApiError(err.status === 402 ? 402 : err.status === 503 ? 503 : 422, err.code, err.message);
+      throw mapCoreError(err);
     }
     await setDialogStatus(deps.pool, input.dialog.id, 'active');
     throw err;
@@ -2906,7 +3353,10 @@ app.post<{ Params: { token: string; id: string }; Body: { visitor_key?: unknown;
     if (!Number.isInteger(messagesCount) || messagesCount < 0) {
       throw new ApiError(422, 'invalid_messages_count', 'messages_count — целое ≥ 0.');
     }
-    return reply.code(201).send(await escalateDialog(app.deps, { widget, dialog, messagesCount }));
+    return reply.code(201).send(await escalateDialog(app.deps, {
+      widget, dialog, messagesCount, visitorKey,
+      ipHash: hashIp(req.ip, app.deps.config.ipHashSalt),
+    }));
   },
 );
 ```
@@ -2915,9 +3365,11 @@ Run: `npx vitest run test/escalate.test.ts` → PASS.
 
 - [ ] **Step 5: Мутпробы эскалации (деньги + протокол)**
 
-1. Заменить `casDialogStatus(..., 'active', 'escalating')` на `setDialogStatus(..., 'escalating')` → тест «повторный /escalate → 409» FAIL. Вернуть.
+1. Заменить `casDialogStatus(..., 'active', 'escalating')` на `setDialogStatus(..., 'escalating')` → тест «повторный /escalate → 409 escalation_in_progress» FAIL. Вернуть.
 2. Убрать `await deps.core.endSession(fromSession)` → тест полного пути FAIL (первый вызов ядра окажется транскриптом). Вернуть.
 3. Убрать `continueFrom: fromSession` → тест полного пути FAIL. Вернуть.
+3a. Убрать вызов `ensureSessionBudget` из `escalateDialog` → тест «кап считает и ЭСКАЛАЦИЮ» (T3, `caps.test.ts`) FAIL: ядро будет тронуто. Вернуть.
+3b. Убрать проверку `input.dialog.status !== 'active'` → тест «эскалация завершённого диалога → 409 dialog_not_active» FAIL (ответ станет `escalation_in_progress` или 201). Вернуть.
 4. В `pollTranscript` вернуть `best` сразу после первого запроса (без ожидания `wanted`) → тест «недобор ленты» останется зелёным, а вот полный путь с задержанной лентой не покрыт → ДОБАВИТЬ тест: первый опрос отдаёт 1 сообщение, второй — 2; ожидание `transcript_complete === true` и ≥2 вызовов `/transcript`. С мутацией FAIL, без — PASS.
 5. Поднять `INSTRUCTIONS_MAX` до `100_000` → тест потолка в `threadDigest.test.ts` FAIL. Вернуть.
 
@@ -2990,6 +3442,7 @@ Run: `npx vitest run test/sweeper.test.ts` → FAIL.
 ```ts
 import type { AppDeps } from '../app.ts';
 import { applyFinalizedUsage, listStaleActiveDialogs, setDialogStatus } from '../db/repositories/dialogs.ts';
+import { purgeOldIpCounters } from '../db/repositories/quotas.ts';
 
 const TERMINAL = new Set(['finalized', 'expired']);
 
@@ -3008,8 +3461,11 @@ export async function sweepOnce(deps: AppDeps, opts: { staleMinutes: number; bat
     try {
       const card = await deps.core.getSession(sessionId);
       if (!TERMINAL.has(card.status)) continue;
+      // Идемпотентно по sessionId: вебхук мог долететь между выборкой и этим
+      // моментом — тогда деньги уже учтены и второй раз не прибавятся.
       await applyFinalizedUsage(deps.pool, {
         dialogId: dialog.id,
+        sessionId,
         usage: (card.usage_summary ?? {}) as Record<string, number>,
         creditsTotal: card.credits_total ?? 0,
       });
@@ -3035,6 +3491,9 @@ export function startSweeper(
     if (running) return; // предыдущий проход ещё идёт — тик пропускаем
     running = true;
     void sweepOnce(deps, { staleMinutes, batch })
+      // Тем же тиком подметаем суточные счётчики: иначе таблица растёт по
+      // строке на IP в день и не чистится никем.
+      .then(() => purgeOldIpCounters(deps.pool, 7))
       .catch((err: unknown) => deps.log.error({ err }, 'проход свипера сорвался'))
       .finally(() => { running = false; });
   }, intervalMs);
@@ -3059,29 +3518,22 @@ git commit -m "feat(escalation): чат→голос через continue_from + 
 ```
 
 ---
-### Task 5: Embed — лоадер `w.<hash>.js` + шим + iframe-каркас + чат по data-channel
+### Task 5: Backend-обвязка embed + лоадер `w.<hash>.js` с шимом
 
 **Files:**
-- Create: `embed/loader/package.json`, `embed/loader/vite.config.ts`, `embed/loader/src/loader.ts`, `embed/loader/scripts/make-shim.mjs`, `embed/loader/scripts/size-check.mjs`
-- Create: `embed/app/package.json`, `embed/app/vite.config.ts`, `embed/app/index.html`, `embed/app/src/main.ts`, `embed/app/src/App.vue`
-- Create: `embed/app/src/lib/{bridge.ts,echoGuard.ts,resender.ts,api.ts,frames.ts,room.ts}`
-- Create: `embed/app/src/components/{ChatFeed.vue,Composer.vue,Bubble.vue}`
 - Create: `backend/src/routes/appPage.ts`; Modify: `backend/src/app.ts` (`@fastify/static` + appPage)
-- Test: `embed/loader/test/loader.test.ts`, `embed/app/test/{echoGuard,resender,frames,bridge}.test.ts`, `backend/test/appPage.test.ts`
+- Create: `embed/loader/package.json`, `embed/loader/vite.config.ts`, `embed/loader/src/loader.ts`, `embed/loader/scripts/make-shim.mjs`, `embed/loader/scripts/size-check.mjs`
+- Test: `backend/test/appPage.test.ts`, `embed/loader/test/loader.test.ts`
 
 **Interfaces:**
-- Consumes (T3): `GET /w/v1/:token/config`, `POST /w/v1/:token/dialogs`, `POST /w/v1/:token/dialogs/:id/messages`, `POST …/reenter`, `POST …/end`; `PublicMessage`.
+- Consumes (T1–T3): `findWidgetByToken`, `normalizeOrigin`, `AppDeps`, `buildTestApp`, `GET /w/v1/:token/config`.
 - Produces:
-  - Лоадер: глобальный гард `window.__askiSiteWidget`; очередь `window.AskiWidgetQueue: LoaderBoot[]`, `type LoaderBoot = { token: string; base: string }`.
-  - postMessage-протокол (обе стороны валидируют origin И source):
-    - iframe→хост: `{ src: 'aski-widget', type: 'ready' }`, `{ src, type: 'state', visitorKey: string, dialogId: string | null }`, `{ src, type: 'close' }`, `{ src, type: 'call', active: boolean }`
+  - Backend: `appPageRoutes: FastifyPluginAsync` — `GET /app/:token` (HTML iframe-приложения с CSP `frame-ancestors` из `allowed_origins`); статика `/w.js`, `/w.<hash>.js`, `/assets/*`, `/demo.html`.
+  - Лоадер: `boot(input: LoaderBoot): Promise<void>`; глобальный гард `window.__askiSiteWidget`; очередь `window.AskiWidgetQueue: LoaderBoot[]`, `type LoaderBoot = { token: string; base: string }`.
+  - postMessage-протокол (обе стороны валидируют origin И source) — контракт, который реализует T6:
+    - iframe→хост: `{ src: 'aski-widget', type: 'ready' }`, `{ src, type: 'state', visitorKey: string, dialogId: string | null }`, `{ src, type: 'close' }`
     - хост→iframe: `{ src: 'aski-widget-host', type: 'init', visitorKey: string, dialogId: string | null, parentOrigin: string }`, `{ src, type: 'visibility', visible: boolean }`
-  - `embed/app/src/lib/echoGuard.ts`: `normalizeEcho(text: string): string`; `createEchoGuard(opts: { windowMs: number; now: () => number }): { remember(text: string): void; isEcho(text: string): boolean }`
-  - `embed/app/src/lib/resender.ts`: `createResender(send: () => void, opts: { intervalMs: number; maxAttempts: number }): { start(): void; stop(): void; bump(): void }`
-  - `embed/app/src/lib/frames.ts`: `type WorkerFrame`, `type ClientFrame`, `parseWorkerFrame(raw: Uint8Array | string): WorkerFrame | null`, `encodeClientFrame(frame: ClientFrame): Uint8Array`
-  - `embed/app/src/lib/api.ts`: `class WidgetApi` с `config()`, `startDialog(visitorKey, dialogId?)`, `reenter(dialogId, visitorKey)`, `journal(dialogId, visitorKey, role, text, seq)`, `end(dialogId, visitorKey)`, `escalate(dialogId, visitorKey, messagesCount)`, `lead(dialogId, visitorKey, payload)`.
-  - `embed/app/src/lib/room.ts`: `class CoreRoom` — `connect(url, token)`, `publish(frame: ClientFrame)`, `on(event, handler)`, `disconnect()`; события `frame`, `agentJoined`, `disconnected`.
-  - Backend: `GET /app/:token` (HTML iframe-приложения с CSP `frame-ancestors`), статика `/w.js`, `/w.<hash>.js`, `/assets/*`, `/demo.html`.
+  - Артефакты сборки: `embed/loader/dist/w.<hash>.js` (иммутабельный) + `embed/loader/dist/w.js` (шим, кэш 60с), gzip ≤ 8 КБ.
 
 - [ ] **Step 1: Тест страницы `/app/:token` — FAIL**
 
@@ -3176,7 +3628,37 @@ export const appPageRoutes: FastifyPluginAsync = async (app) => {
 };
 ```
 
-Зарегистрировать `@fastify/static` (root `embed/loader/dist` на `/`, `embed/app/dist/assets` на `/assets`, `embed/public` на `/`) и `appPageRoutes` в `app.ts`.
+Зарегистрировать статику и `appPageRoutes` в `app.ts`. `@fastify/static` НЕЛЬЗЯ регистрировать дважды с одним `prefix` — второй вызов упадёт с `FST_ERR_DEC_ALREADY_PRESENT` (`decorateReply: false` у второго это лечит лишь частично и оставляет два конфликтующих хендлера на `/`). Вместо этого один register со СПИСКОМ корней:
+
+```ts
+import fastifyStatic from '@fastify/static';
+import { fileURLToPath } from 'node:url';
+
+await app.register(fastifyStatic, {
+  // Порядок важен: первый корень, где нашёлся файл, побеждает.
+  root: [
+    fileURLToPath(new URL('../../embed/loader/dist', import.meta.url)), // /w.js, /w.<hash>.js
+    fileURLToPath(new URL('../../embed/public', import.meta.url)),      // /demo.html
+  ],
+  prefix: '/',
+  index: false,
+  // Хэшированный бандл иммутабелен; шим обязан протухать быстро.
+  setHeaders: (res, path) => {
+    res.setHeader('Cache-Control', /w\.[^.]+\.js$/.test(path)
+      ? 'public, max-age=31536000, immutable'
+      : 'public, max-age=60');
+  },
+});
+
+await app.register(fastifyStatic, {
+  root: fileURLToPath(new URL('../../embed/app/dist/assets', import.meta.url)),
+  prefix: '/assets/',
+  decorateReply: false, // reply.sendFile уже задекорирован первым register
+  index: false,
+});
+
+await app.register(appPageRoutes);
+```
 
 Run: `npx vitest run test/appPage.test.ts` → PASS.
 
@@ -3491,7 +3973,34 @@ if (size > LIMIT) { console.error('БЮДЖЕТ ПРЕВЫШЕН — лоаде�
 
 Run: `cd embed/loader && npm run build` → бандл собран, шим создан, размер в бюджете (иначе шаг красный — резать код лоадера, а не поднимать лимит).
 
-- [ ] **Step 6: Тесты чистых модулей iframe-приложения — FAIL**
+- [ ] **Step 6: Commit**
+
+```bash
+git add backend/src/routes/appPage.ts backend/src/app.ts backend/test/appPage.test.ts embed/loader
+git commit -m "feat(embed): страница iframe с frame-ancestors + лоадер w.<hash>.js и шим (Э4-T5)"
+```
+
+---
+### Task 6: iframe-приложение — чат по data-channel
+
+**Files:**
+- Create: `embed/app/package.json`, `embed/app/vite.config.ts`, `embed/app/index.html`, `embed/app/src/main.ts`, `embed/app/src/App.vue`
+- Create: `embed/app/src/lib/{bridge.ts,echoGuard.ts,resender.ts,api.ts,frames.ts,room.ts}`
+- Create: `embed/app/src/components/{ChatFeed.vue,Composer.vue,Bubble.vue,StateBanner.vue}`
+- Test: `embed/app/test/{echoGuard,resender,frames,bridge,chat}.test.ts`, `embed/app/test/helpers/mount.ts`
+
+**Interfaces:**
+- Consumes (T3, T5): `GET /w/v1/:token/config`, `POST /w/v1/:token/dialogs`, `POST …/reenter`, `POST|GET …/messages`, `POST …/end` (все отдают `next_seq`); postMessage-контракт лоадера; `data-widget-token` на `#app`.
+- Produces:
+  - `embed/app/src/lib/echoGuard.ts`: `normalizeEcho(text: string): string`; `createEchoGuard(opts: { windowMs: number; now: () => number }): { remember(text: string): void; isEcho(text: string): boolean }`
+  - `embed/app/src/lib/resender.ts`: `createResender(send: () => void, opts: { intervalMs: number; maxAttempts: number }): { start(): void; stop(): void; bump(): void }`
+  - `embed/app/src/lib/frames.ts`: `type WorkerFrame`, `type ClientFrame`, `parseWorkerFrame(raw: Uint8Array | string): WorkerFrame | null`, `encodeClientFrame(frame: ClientFrame): Uint8Array`
+  - `embed/app/src/lib/bridge.ts`: `createBridge(opts: { allowedOrigins: string[]; onInit: (p: { visitorKey: string; dialogId: string | null }) => void; onVisibility: (visible: boolean) => void }): { ready(): void; listen(): void; sendState(visitorKey: string, dialogId: string | null): void; close(): void }`
+  - `embed/app/src/lib/api.ts`: `class WidgetApi` — `config()`, `startDialog(visitorKey, dialogId?)`, `reenter(dialogId, visitorKey)`, `journal(dialogId, visitorKey, role, text, seq)`, `end(dialogId, visitorKey)`, `escalate(dialogId, visitorKey, messagesCount)`, `lead(dialogId, visitorKey, payload)`; ошибки бросает как `ApiFailure = { status: number; code: string; message: string }`.
+  - `embed/app/src/lib/room.ts`: `class CoreRoom` — `connect(url, token, opts: { audio: boolean })`, `publish(frame: ClientFrame)`, `setMicrophoneEnabled(on: boolean)`, `disconnect()`; колбэки `onFrame`, `onAgentJoined`, `onDisconnected`.
+  - `embed/app/dist/` — собранное приложение, которое отдаёт `GET /app/:token` из T5.
+
+- [ ] **Step 1: Тесты чистых модулей iframe-приложения — FAIL**
 
 `embed/app/test/echoGuard.test.ts`:
 
@@ -3623,7 +4132,7 @@ describe('фреймы pv1', () => {
 
 Run: `cd embed/app && npx vitest run` → FAIL.
 
-- [ ] **Step 7: Реализация чистых модулей**
+- [ ] **Step 2: Реализация чистых модулей**
 
 `embed/app/src/lib/echoGuard.ts`:
 
@@ -3736,7 +4245,7 @@ export function parseWorkerFrame(raw: Uint8Array | string): WorkerFrame | null {
 
 Run: `cd embed/app && npx vitest run` → PASS.
 
-- [ ] **Step 8: Тест моста postMessage — FAIL, затем реализация**
+- [ ] **Step 3: Тест моста postMessage — FAIL, затем реализация**
 
 `embed/app/test/bridge.test.ts`:
 
@@ -3787,7 +4296,7 @@ describe('мост iframe↔хост', () => {
 
 Run: `npx vitest run test/bridge.test.ts` → сначала FAIL, после реализации PASS.
 
-- [ ] **Step 9: Vue-каркас чата (лента, композер, журнал, дедуп)**
+- [ ] **Step 4: Vue-каркас чата (лента, композер, журнал, дедуп)**
 
 `embed/app/index.html` — `<div id="app" data-widget-token=""></div>` + `<script type="module" src="/src/main.ts">`; сборка Vite с `base: '/assets/'`, `build.outDir: 'dist'`, `rollupOptions.input: 'index.html'`.
 
@@ -3847,6 +4356,11 @@ export class CoreRoom {
     void this.room.localParticipant.publishData(encodeClientFrame(frame), { reliable: true });
   }
 
+  async setMicrophoneEnabled(on: boolean): Promise<void> {
+    if (!this.room) throw new Error('микрофон без комнаты не включить');
+    await this.room.localParticipant.setMicrophoneEnabled(on);
+  }
+
   async disconnect(): Promise<void> {
     for (const element of this.audio) element.remove();
     this.audio.clear();
@@ -3856,46 +4370,244 @@ export class CoreRoom {
 }
 ```
 
-`App.vue` (чат-часть; FSM и голос — T6):
-- `onMounted`: `bridge.ready()`; по `init` → `WidgetApi.startDialog(visitorKey, dialogId)` (или `reenter`, если `dialogId` есть и сервер вернул живую сессию — 410 переводит на `startDialog` с продолжением); рендер `messages` из ответа.
-- `CoreRoom.connect(participant_token.livekit_url, participant_token.token, { audio: false })`, затем `readyResender = createResender(() => room.publish({ type: 'client_ready' }), { intervalMs: 3000, maxAttempts: 20 }); readyResender.start()`; любой фрейм воркера → `readyResender.bump()`; `onAgentJoined` → `readyResender.start()` повторно (агент вошёл позже нас).
-- Отправка: `text.trim().slice(0, 2000)` → оптимистичный пузырь `{ role:'user' }` со стабильным `id` (`crypto.randomUUID()`), `echoGuard.remember(text)`, `room.publish({ type:'user_text', text })`, `api.journal(dialogId, visitorKey, 'user', text, ++seq)`, локальный `typing = true`.
-- Приём `transcript`: `speaker==='respondent' && echoGuard.isEcho(text)` → ДРОП; `speaker==='agent'` → пузырь + `typing = false` + `api.journal(..., 'agent', text, ++seq)`.
-- Композер: `<textarea maxlength="2000">`, Enter отправляет, Shift+Enter — перенос, гард `event.isComposing` (IME), кнопка disabled на пустом тексте.
-- Рендер строго `{{ message.text }}`; `v-html` в проекте отсутствует (проверить `grep -r "v-html" embed/app/src` → пусто).
-- `beforeunload`/`pagehide` → `room.disconnect()`: иначе воркер узнаёт об уходе только по ICE-таймауту и жжёт кредиты.
+Тест `embed/app/test/chat.test.ts` (`@vue/test-utils` + `happy-dom`), пишется ПЕРВЫМ:
 
-Тест компонента `embed/app/test/chat.test.ts` (`@vue/test-utils` + `happy-dom`): смонтировать `App` с подставными `WidgetApi`/`CoreRoom`; проверить (1) отправка рисует пузырь и публикует `user_text`; (2) обратный `transcript speaker=respondent` с тем же текстом НЕ создаёт второго пузыря; (3) `transcript speaker=agent` создаёт пузырь агента и гасит typing; (4) текст `<img src=x onerror=alert(1)>` попадает в DOM как ТЕКСТ (`wrapper.html()` содержит `&lt;img`).
+```ts
+import { describe, expect, it } from 'vitest';
+import { mountWidget } from './helpers/mount.ts';
 
-- [ ] **Step 10: Мутпроба дедупа и XSS**
+describe('чат', () => {
+  it('отправка рисует пузырь, публикует user_text и пишет журнал', async () => {
+    const { wrapper, api, sent } = await mountWidget();
+    await wrapper.find('textarea').setValue('Меня зовут Пётр');
+    await wrapper.find('[data-test=send]').trigger('click');
+    expect(wrapper.findAll('[data-test=bubble-user]')).toHaveLength(1);
+    expect(sent).toContainEqual({ type: 'user_text', text: 'Меня зовут Пётр' });
+    expect(api.journal).toHaveBeenCalledWith('d1', expect.any(String), 'user', 'Меня зовут Пётр', 1);
+  });
 
-1. В `App.vue` убрать вызов `echoGuard.isEcho` → тест (2) FAIL. Вернуть.
-2. Заменить `{{ message.text }}` на `v-html="message.text"` → тест (4) FAIL. Вернуть.
+  it('обратное эхо (transcript speaker=respondent) НЕ создаёт второго пузыря', async () => {
+    const { wrapper, room } = await mountWidget();
+    await wrapper.find('textarea').setValue('Меня зовут Пётр');
+    await wrapper.find('[data-test=send]').trigger('click');
+    room.emitFrame({ type: 'transcript', speaker: 'respondent', text: 'Меня зовут Пётр', interrupted: false });
+    await wrapper.vm.$nextTick();
+    expect(wrapper.findAll('[data-test=bubble-user]')).toHaveLength(1);
+  });
+
+  it('ответ агента рисует пузырь и гасит индикатор набора', async () => {
+    const { wrapper, room, api } = await mountWidget();
+    await wrapper.find('textarea').setValue('привет');
+    await wrapper.find('[data-test=send]').trigger('click');
+    expect(wrapper.find('[data-test=typing]').exists()).toBe(true);
+    room.emitFrame({ type: 'transcript', speaker: 'agent', text: 'Здравствуйте!', interrupted: false });
+    await wrapper.vm.$nextTick();
+    expect(wrapper.findAll('[data-test=bubble-agent]')).toHaveLength(1);
+    expect(wrapper.find('[data-test=typing]').exists()).toBe(false);
+    expect(api.journal).toHaveBeenLastCalledWith('d1', expect.any(String), 'agent', 'Здравствуйте!', 2);
+  });
+
+  it('текст реплики попадает в DOM как ТЕКСТ, а не как разметка', async () => {
+    const { wrapper, room } = await mountWidget();
+    room.emitFrame({ type: 'transcript', speaker: 'agent', text: '<img src=x onerror=alert(1)>', interrupted: false });
+    await wrapper.vm.$nextTick();
+    expect(wrapper.html()).toContain('&lt;img');
+    expect(wrapper.find('img').exists()).toBe(false);
+  });
+
+  it('нумерация журнала продолжается с next_seq сервера — после reload реплики не глотаются', async () => {
+    // Сервер отдал историю из 4 клиентских реплик: следующая — пятая.
+    const { wrapper, api } = await mountWidget({ startResult: { next_seq: 5, messages: [] } });
+    await wrapper.find('textarea').setValue('продолжаю');
+    await wrapper.find('[data-test=send]').trigger('click');
+    expect(api.journal).toHaveBeenCalledWith('d1', expect.any(String), 'user', 'продолжаю', 5);
+  });
+
+  it('client_ready ре-шлётся и перезапускается при позднем входе агента', async () => {
+    const { room, sent } = await mountWidget();
+    expect(sent.filter((f) => f.type === 'client_ready')).toHaveLength(1);
+    room.emitAgentJoined();
+    expect(sent.filter((f) => f.type === 'client_ready').length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('уход со страницы рвёт комнату: иначе воркер жжёт кредиты до ICE-таймаута', async () => {
+    const { room } = await mountWidget();
+    window.dispatchEvent(new Event('pagehide'));
+    expect(room.disconnect).toHaveBeenCalled();
+  });
+});
+```
+
+Run: `cd embed/app && npx vitest run test/chat.test.ts` → FAIL. Затем реализация.
+
+`embed/app/index.html` — `<div id="app" data-widget-token=""></div>` + `<script type="module" src="/src/main.ts">`; сборка Vite с `base: '/assets/'`, `build.outDir: 'dist'`, `rollupOptions.input: 'index.html'`.
+
+`embed/app/src/App.vue` (чат-часть; FSM, голос и лид — T7):
+
+```vue
+<script setup lang="ts">
+import { computed, onMounted, onBeforeUnmount, ref } from 'vue';
+import ChatFeed from './components/ChatFeed.vue';
+import Composer from './components/Composer.vue';
+import { WidgetApi } from './lib/api.ts';
+import { createBridge } from './lib/bridge.ts';
+import { createEchoGuard } from './lib/echoGuard.ts';
+import { createResender } from './lib/resender.ts';
+import { CoreRoom } from './lib/room.ts';
+import type { WorkerFrame } from './lib/frames.ts';
+
+type Bubble = { id: string; role: 'user' | 'agent'; text: string };
+
+const token = (document.getElementById('app')!.dataset.widgetToken ?? '');
+const api = new WidgetApi(token);
+const bubbles = ref<Bubble[]>([]);
+const typing = ref(false);
+const visitorKey = ref<string | null>(null);
+const dialogId = ref<string | null>(null);
+const seq = ref(1);                       // следующий номер журнала
+const userTextsSent = ref(0);             // для messages_count эскалации (T7)
+const agentReplies = ref(0);
+const coreMessageCount = computed(() => userTextsSent.value + agentReplies.value);
+
+const echo = createEchoGuard({ windowMs: 30_000, now: () => Date.now() });
+let readyResender: ReturnType<typeof createResender> | null = null;
+
+const room = new CoreRoom({
+  onFrame: handleFrame,
+  onAgentJoined: () => readyResender?.start(), // агент вошёл позже нас
+  onDisconnected: () => { /* фазу считает FSM из T7 */ },
+});
+
+const bridge = createBridge({
+  allowedOrigins: [],                     // заполнится из /config в onMounted
+  onInit: ({ visitorKey: key, dialogId: saved }) => void openThread(key, saved),
+  onVisibility: () => undefined,
+});
+
+function push(role: 'user' | 'agent', text: string): void {
+  // Стабильный id, а не индекс: по индексу Vue переиспользует узлы и ломает
+  // анимацию/выделение при вставке в середину.
+  bubbles.value.push({ id: crypto.randomUUID(), role, text });
+}
+
+function handleFrame(frame: WorkerFrame): void {
+  readyResender?.bump();
+  if (frame.type !== 'transcript') return;
+  if (frame.speaker === 'respondent') {
+    // Своё эхо гасим; чужой respondent-transcript (STT в голосе) — рисуем.
+    if (echo.isEcho(frame.text)) return;
+    push('user', frame.text);
+    return;
+  }
+  typing.value = false;
+  push('agent', frame.text);
+  if (userTextsSent.value > 0) agentReplies.value += 1; // greeting не в счёт
+  void api.journal(dialogId.value!, visitorKey.value!, 'agent', frame.text, seq.value++);
+}
+
+async function openThread(key: string, saved: string | null): Promise<void> {
+  visitorKey.value = key;
+  const started = saved
+    ? await api.reenter(saved, key).catch(() => api.startDialog(key, saved))
+    : await api.startDialog(key);
+  applyStart(started);
+}
+
+function applyStart(started: {
+  dialog_id: string; participant_token: { livekit_url: string; token: string };
+  messages: { role: 'user' | 'agent'; text: string }[]; next_seq: number;
+}): void {
+  dialogId.value = started.dialog_id;
+  // Нумерацию журнала продолжаем с серверной: свой счётчик после reload
+  // обнулился бы, и новые реплики глотал бы дедуп по (dialog, source, seq).
+  seq.value = started.next_seq;
+  bubbles.value = started.messages.map((m) => ({ id: crypto.randomUUID(), role: m.role, text: m.text }));
+  // Счётчик ленты ядра принадлежит СЕССИИ, а не нити: новая сессия начинает
+  // с нуля, иначе messages_count эскалации попросит несуществующие реплики.
+  userTextsSent.value = 0;
+  agentReplies.value = 0;
+  bridge.sendState(visitorKey.value!, dialogId.value);
+  void connect(started.participant_token, { audio: false });
+}
+
+async function connect(pt: { livekit_url: string; token: string }, opts: { audio: boolean }): Promise<void> {
+  await room.connect(pt.livekit_url, pt.token, opts);
+  readyResender?.stop();
+  readyResender = createResender(() => room.publish({ type: 'client_ready' }), { intervalMs: 3000, maxAttempts: 20 });
+  readyResender.start();
+}
+
+async function send(text: string): Promise<void> {
+  const clean = text.trim().slice(0, 2000); // воркер режет ровно тут
+  if (!clean) return;
+  push('user', clean);
+  echo.remember(clean);
+  room.publish({ type: 'user_text', text: clean });
+  userTextsSent.value += 1;
+  typing.value = true;
+  await api.journal(dialogId.value!, visitorKey.value!, 'user', clean, seq.value++);
+}
+
+const leave = (): void => { void room.disconnect(); };
+
+onMounted(async () => {
+  const config = await api.config();
+  bridge.setAllowedOrigins(config.allowed_origins);
+  bridge.listen();
+  bridge.ready();
+  // pagehide надёжнее beforeunload на мобильных: iOS часто не шлёт второй.
+  window.addEventListener('pagehide', leave);
+});
+onBeforeUnmount(() => window.removeEventListener('pagehide', leave));
+</script>
+
+<template>
+  <div class="widget">
+    <ChatFeed :bubbles="bubbles" :typing="typing" />
+    <Composer :disabled="false" @send="send" />
+  </div>
+</template>
+```
+
+`ChatFeed.vue` — лента: `v-for="b in bubbles" :key="b.id"`, пузырь рисует `{{ b.text }}` и ставит `:data-test="b.role === 'user' ? 'bubble-user' : 'bubble-agent'"`; индикатор `<div v-if="typing" data-test="typing">`. `v-html` в проекте ЗАПРЕЩЁН — реплики влияемы посетителем.
+
+`Composer.vue` — `<textarea maxlength="2000">` + кнопка `[data-test=send]`; Enter отправляет, Shift+Enter переносит, `event.isComposing` гасит отправку (IME набирает иероглифы Enter'ом); кнопка `:disabled` на пустом тексте.
+
+Run: `npx vitest run test/chat.test.ts` → PASS. Проверить `grep -rn "v-html" embed/app/src` → пусто.
+
+- [ ] **Step 5: Мутпроба дедупа и XSS**
+
+1. В `handleFrame` убрать вызов `echo.isEcho` → тест «обратное эхо НЕ создаёт второго пузыря» FAIL. Вернуть.
+2. Заменить `{{ b.text }}` в `ChatFeed.vue` на `v-html="b.text"` → тест «текст попадает в DOM как ТЕКСТ» FAIL. Вернуть.
 3. В `createResender` перенести `if (acked) stop()` ПЕРЕД `send()` → тест «гасим ПОСЛЕ отправки» FAIL. Вернуть.
+4. В `applyStart` заменить `seq.value = started.next_seq` на `seq.value = 1` → тест «нумерация продолжается с next_seq» FAIL. Вернуть.
+5. В `applyStart` убрать обнуление `userTextsSent`/`agentReplies` → тест T7 «messages_count = свои реплики + ответы» после продолжения нити FAIL. Вернуть.
 
-- [ ] **Step 11: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add embed backend/src/routes/appPage.ts backend/src/app.ts backend/test/appPage.test.ts
-git commit -m "feat(embed): лоадер w.<hash>.js + шим + iframe-чат по data-channel с дедупом эха (Э4-T5)"
+git add embed/app
+git commit -m "feat(embed): iframe-приложение — чат по data-channel с дедупом эха и журналом (Э4-T6)"
 ```
 
 ---
-### Task 6: Embed — FSM эскалации, голос, баннер «Продолжить», лид-форма
+### Task 7: iframe-приложение — FSM эскалации, голос с микрофоном, баннер «Продолжить», лид-форма
 
 **Files:**
 - Create: `embed/app/src/lib/fsm.ts`
-- Create: `embed/app/src/components/{VoicePanel.vue,ResumeBanner.vue,LeadForm.vue,StateBanner.vue}`
-- Modify: `embed/app/src/App.vue` (подключение FSM, эскалация, голос, лид)
-- Test: `embed/app/test/{fsm.test.ts,escalationFlow.test.ts,leadForm.test.ts}`
+- Create: `embed/app/src/components/{VoicePanel.vue,ResumeBanner.vue,LeadForm.vue}`
+- Modify: `embed/app/src/App.vue` (подключение FSM, эскалация, голос, лид), `embed/app/src/lib/room.ts` (микрофон, отписка от видео)
+- Test: `embed/app/test/{fsm.test.ts,escalationFlow.test.ts,micro.test.ts,leadForm.test.ts}`
 
 **Interfaces:**
-- Consumes (T4, T5): `POST /w/v1/:token/dialogs/:id/escalate` → `{ dialog_id, channel:'voice', core_session_id, participant_token, continued_from, transcript_complete }`; `POST /w/v1/:token/dialogs/:id/lead`; `POST /w/v1/:token/dialogs` (с `dialog_id` — продолжение); `CoreRoom`, `createResender`, `createEchoGuard`, `parseWorkerFrame`, `WidgetApi`.
+- Consumes (T4, T6): `POST /w/v1/:token/dialogs/:id/escalate` → `{ dialog_id, channel:'voice', core_session_id, participant_token, continued_from, transcript_complete }`; `POST /w/v1/:token/dialogs/:id/lead`; `POST /w/v1/:token/dialogs` (с `dialog_id` — продолжение); `CoreRoom`, `createResender`, `createEchoGuard`, `parseWorkerFrame`, `WidgetApi`, `coreMessageCount`.
 - Produces:
   - `type DialogPhase = 'idle' | 'chat' | 'escalating' | 'voice' | 'chat_fallback' | 'paused' | 'ended' | 'error'`
   - `type DialogEvent = { type: 'start' } | { type: 'connected' } | { type: 'escalate' } | { type: 'voice_ready' } | { type: 'escalate_failed'; code: 'insufficient_credits' | 'unavailable' | 'invalid' } | { type: 'session_ended'; reason: string } | { type: 'resume' } | { type: 'disconnected' } | { type: 'fatal'; code: string }`
   - `nextPhase(phase: DialogPhase, event: DialogEvent): DialogPhase`
   - `bannerFor(phase: DialogPhase, code?: string): { text: string; action: 'resume' | 'restart' | 'none' }`
+  - `CoreRoom.setMicrophoneEnabled(on: boolean): Promise<void>` (уже объявлен в T6) + `CoreRoom.unsubscribeVideo(): void`
+  - `type MicState = 'off' | 'requesting' | 'on' | 'denied' | 'failed'` в `App.vue`
 
 - [ ] **Step 1: Тест FSM — FAIL**
 
@@ -4028,7 +4740,63 @@ Run: `npx vitest run test/fsm.test.ts` → PASS.
 
 - [ ] **Step 3: Тест сценария эскалации в приложении — FAIL**
 
-`embed/app/test/escalationFlow.test.ts` (монтируем `App` с подставными `WidgetApi` и `CoreRoom`; фабрики — в `test/helpers/mount.ts`):
+`embed/app/test/helpers/mount.ts` — общая фабрика (её же используют `chat.test.ts` из T6, `micro.test.ts` и `leadForm.test.ts`):
+
+```ts
+import { mount } from '@vue/test-utils';
+import { vi } from 'vitest';
+import App from '../../src/App.vue';
+import type { ClientFrame, WorkerFrame } from '../../src/lib/frames.ts';
+
+/** Успешный ответ /escalate — один на все тесты голоса. */
+export const VOICE_OK = {
+  dialog_id: 'd1', channel: 'voice' as const, core_session_id: 'sess_bbbbbbbbbbbbbbbb',
+  participant_token: {
+    token: 'jwt-voice', identity: 'respondent-x',
+    livekit_url: 'wss://lk.example', expires_at: '2026-08-13T11:00:00Z',
+  },
+  continued_from: 'sess_aaaaaaaaaaaaaaaa', transcript_complete: true,
+};
+
+export async function mountWidget(overrides: { startResult?: Partial<typeof START> } = {}) {
+  const START = {
+    dialog_id: 'd1', channel: 'chat' as const,
+    participant_token: { token: 'jwt', identity: 'respondent-core', livekit_url: 'wss://lk.example', expires_at: '2026-08-13T10:00:00Z' },
+    messages: [] as { role: 'user' | 'agent'; text: string }[], next_seq: 1,
+  };
+  const sent: ClientFrame[] = [];
+  // Подставной CoreRoom: тесты дёргают emit*-хелперы вместо живого LiveKit.
+  const room = {
+    connect: vi.fn(async () => undefined),
+    publish: vi.fn((f: ClientFrame) => { sent.push(f); }),
+    setMicrophoneEnabled: vi.fn(async () => undefined),
+    disconnect: vi.fn(async () => undefined),
+    emitFrame: (f: WorkerFrame) => handlers.onFrame(f),
+    emitAgentJoined: () => handlers.onAgentJoined(),
+    emitDisconnected: () => handlers.onDisconnected(),
+    emitVideoPublication: () => { const p = { kind: 'video', setSubscribed: vi.fn() }; handlers.onPublication?.(p); return p; },
+    emitAudioTrack: () => { const t = { kind: 'audio', attach: vi.fn(() => document.createElement('audio')) }; handlers.onTrack?.(t); return t; },
+  };
+  const api = {
+    config: vi.fn(async () => ({ allowed_origins: ['https://shop.example'], text_max_length: 2000 })),
+    startDialog: vi.fn(async () => ({ ...START, ...overrides.startResult })),
+    reenter: vi.fn(async () => ({ ...START, ...overrides.startResult })),
+    journal: vi.fn(async () => undefined),
+    escalate: vi.fn(() => escalatePromise),
+    lead: vi.fn(async () => ({ lead_id: 'l1' })),
+    end: vi.fn(async () => undefined),
+    resolveEscalate: (v: unknown) => { resolveEsc(v); return flush(); },
+    rejectEscalate: (e: unknown) => { rejectEsc(e); return flush(); },
+  };
+  // … проброс room/api в App через provide; handlers перехватываются из
+  // конструктора CoreRoom; flush() = await nextTick() дважды.
+  const wrapper = mount(App, { global: { provide: { api, room } } });
+  await flush();
+  return { wrapper, api, room, sent };
+}
+```
+
+`embed/app/test/escalationFlow.test.ts`:
 
 ```ts
 import { describe, expect, it, vi } from 'vitest';
@@ -4066,19 +4834,48 @@ describe('эскалация в голос', () => {
     expect(api.escalate).toHaveBeenCalledWith('d1', expect.any(String), 2);
   });
 
-  it('resume_welcome повторяется 3с×5 и гаснет на первом фрейме воркера', async () => {
+  it('resume_welcome НЕ уходит до появления агента: фрейм в пустую комнату теряется навсегда', async () => {
     vi.useFakeTimers();
     const { wrapper, api, room, sent } = await mountWidget();
     await wrapper.find('[data-test=escalate]').trigger('click');
-    await api.resolveEscalate({ /* … как выше … */ } as never);
+    await api.resolveEscalate(VOICE_OK);
     sent.length = 0;
+    vi.advanceTimersByTime(12_000);
+    expect(sent.filter((f) => f.type === 'resume_welcome')).toHaveLength(0);
+    vi.useRealTimers();
+  });
+
+  it('resume_welcome стартует по appearance агента и повторяется 3с×5', async () => {
+    vi.useFakeTimers();
+    const { wrapper, api, room, sent } = await mountWidget();
+    await wrapper.find('[data-test=escalate]').trigger('click');
+    await api.resolveEscalate(VOICE_OK);
+    sent.length = 0;
+    room.emitAgentJoined();
+    expect(sent.filter((f) => f.type === 'resume_welcome')).toHaveLength(1);
     vi.advanceTimersByTime(9000);
     expect(sent.filter((f) => f.type === 'resume_welcome').length).toBeGreaterThanOrEqual(3);
-    room.emitFrame({ type: 'transcript', speaker: 'agent', text: 'Слушаю вас', interrupted: false });
+    vi.advanceTimersByTime(60_000);
+    expect(sent.filter((f) => f.type === 'resume_welcome').length).toBeLessThanOrEqual(5);
+    vi.useRealTimers();
+  });
+
+  it('гасится РЕЧЬЮ агента, а не любым кадром: pong/session_timer ничего не доказывают', async () => {
+    vi.useFakeTimers();
+    const { wrapper, api, room, sent } = await mountWidget();
+    await wrapper.find('[data-test=escalate]').trigger('click');
+    await api.resolveEscalate(VOICE_OK);
+    room.emitAgentJoined();
+    sent.length = 0;
+    // Служебные кадры НЕ считаются подтверждением: аватар всё ещё молчит.
+    room.emitFrame({ type: 'session_timer', remaining_s: 590 });
+    vi.advanceTimersByTime(9000);
+    expect(sent.filter((f) => f.type === 'resume_welcome').length).toBeGreaterThanOrEqual(2);
+    // А вот реплика агента — доказательство, что welcome-back доехал.
+    room.emitFrame({ type: 'transcript', speaker: 'agent', text: 'Рад продолжить!', interrupted: false });
     const after = sent.length;
     vi.advanceTimersByTime(30_000);
-    // Один добивающий фрейм после ack допустим, но не бесконечный поток.
-    expect(sent.length - after).toBeLessThanOrEqual(1);
+    expect(sent.length - after).toBeLessThanOrEqual(1); // один добивающий допустим
     vi.useRealTimers();
   });
 
@@ -4116,17 +4913,134 @@ describe('эскалация в голос', () => {
     expect(api.startDialog).toHaveBeenLastCalledWith(expect.any(String), 'd1');
   });
 
-  it('в голосе видеотрек аватара НЕ подписывается — UI аудио-only', async () => {
+  it('видеотрек аватара реально ОТПИСЫВАЕТСЯ: платить за egress видео в аудио-UI незачем', async () => {
     const { wrapper, api, room } = await mountWidget();
     await wrapper.find('[data-test=escalate]').trigger('click');
-    await api.resolveEscalate({ /* … */ } as never);
+    await api.resolveEscalate(VOICE_OK);
     expect(room.connect).toHaveBeenLastCalledWith(expect.any(String), expect.any(String), { audio: true });
-    expect(room.videoSubscribed).toBe(false);
+    // Комната отдаёт публикацию видео — клиент обязан её погасить вызовом
+    // setSubscribed(false), а не «просто не рисовать» (трек всё равно течёт).
+    const publication = room.emitVideoPublication();
+    expect(publication.setSubscribed).toHaveBeenCalledWith(false);
+  });
+
+  it('аудиотрек, наоборот, подписывается и ПРИКРЕПЛЯЕТСЯ — без attach() голоса не слышно', async () => {
+    const { wrapper, api, room } = await mountWidget();
+    await wrapper.find('[data-test=escalate]').trigger('click');
+    await api.resolveEscalate(VOICE_OK);
+    const track = room.emitAudioTrack();
+    expect(track.attach).toHaveBeenCalled();
+    expect(document.querySelectorAll('audio').length).toBeGreaterThan(0);
   });
 });
 ```
 
 Run: `npx vitest run test/escalationFlow.test.ts` → FAIL.
+
+- [ ] **Step 3a: Тест микрофона — FAIL**
+
+Голосовой разговор односторонний, пока клиент не ОПУБЛИКУЕТ микрофон: `connect` сам его не включает, и аватар будет говорить в пустоту.
+
+`embed/app/test/micro.test.ts`:
+
+```ts
+import { describe, expect, it, vi } from 'vitest';
+import { mountWidget, VOICE_OK } from './helpers/mount.ts';
+
+const goVoice = async () => {
+  const ctx = await mountWidget();
+  await ctx.wrapper.find('[data-test=escalate]').trigger('click');
+  await ctx.api.resolveEscalate(VOICE_OK);
+  return ctx;
+};
+
+describe('микрофон в голосовом режиме', () => {
+  it('публикуется сразу после входа в голосовую комнату', async () => {
+    const { room } = await goVoice();
+    expect(room.setMicrophoneEnabled).toHaveBeenCalledWith(true);
+  });
+
+  it('включается ПОСЛЕ connect: до комнаты публиковать нечего', async () => {
+    const { room } = await goVoice();
+    expect(room.connect).toHaveBeenCalledBefore(room.setMicrophoneEnabled as never);
+  });
+
+  it('отказ в доступе (NotAllowedError) → понятный баннер, разговор не падает', async () => {
+    const { wrapper, room } = await mountWidget();
+    room.setMicrophoneEnabled.mockRejectedValueOnce(
+      Object.assign(new Error('Permission denied'), { name: 'NotAllowedError' }),
+    );
+    await wrapper.find('[data-test=escalate]').trigger('click');
+    await wrapper.vm.$nextTick();
+    expect(wrapper.text()).toContain('Микрофон недоступен');
+    expect(wrapper.text()).toContain('разрешите доступ');
+    // Фаза остаётся voice: аватара СЛЫШНО, просто нас не слышат.
+    expect(wrapper.find('[data-test=voice-panel]').exists()).toBe(true);
+  });
+
+  it('кнопка mute гасит и возвращает публикацию', async () => {
+    const { wrapper, room } = await goVoice();
+    await wrapper.find('[data-test=mic-toggle]').trigger('click');
+    expect(room.setMicrophoneEnabled).toHaveBeenLastCalledWith(false);
+    await wrapper.find('[data-test=mic-toggle]').trigger('click');
+    expect(room.setMicrophoneEnabled).toHaveBeenLastCalledWith(true);
+  });
+
+  it('в чат-режиме микрофон не трогаем вовсе', async () => {
+    const { room } = await mountWidget();
+    expect(room.setMicrophoneEnabled).not.toHaveBeenCalled();
+  });
+});
+```
+
+Run: `npx vitest run test/micro.test.ts` → FAIL.
+
+- [ ] **Step 3b: Реализация микрофона и отписки от видео**
+
+В `embed/app/src/lib/room.ts` добавить отписку от видео (в T6 объявлен только `setMicrophoneEnabled`):
+
+```ts
+import { RoomEvent, Track, type RemoteTrackPublication } from 'livekit-client';
+
+// В connect(), в ветке opts.audio:
+room.on(RoomEvent.TrackPublished, (publication: RemoteTrackPublication) => {
+  // UI аудио-only. «Просто не рисовать» видео недостаточно: подписка живёт,
+  // трафик идёт и оплачивается. Гасим саму подписку.
+  if (publication.kind === Track.Kind.Video) publication.setSubscribed(false);
+});
+```
+
+и в `App.vue` — включение микрофона сразу после входа в голосовую комнату:
+
+```ts
+const micState = ref<MicState>('off');
+
+async function enableMic(): Promise<void> {
+  micState.value = 'requesting';
+  try {
+    await room.setMicrophoneEnabled(true);
+    micState.value = 'on';
+  } catch (err) {
+    // Разговор НЕ прерываем: аватара слышно, просто нас — нет. Пользователю
+    // нужен путь наружу (разрешить доступ), а не оверлей ошибки.
+    micState.value = (err as Error).name === 'NotAllowedError' ? 'denied' : 'failed';
+  }
+}
+
+async function toggleMic(): Promise<void> {
+  const next = micState.value !== 'on';
+  try {
+    await room.setMicrophoneEnabled(next);
+    micState.value = next ? 'on' : 'off';
+  } catch {
+    micState.value = 'failed';
+  }
+}
+```
+
+`VoicePanel.vue` (`data-test="voice-panel"`): кнопка `[data-test=mic-toggle]` и баннер по `micState` — `denied` → «Микрофон недоступен: разрешите доступ в настройках браузера», `failed` → «Микрофон не включился — проверьте устройство».
+
+Run: `npx vitest run test/micro.test.ts` → PASS.
 
 - [ ] **Step 4: Реализация эскалации в `App.vue`**
 
@@ -4142,11 +5056,12 @@ async function escalate(): Promise<void> {
     await room.connect(voice.participant_token.livekit_url, voice.participant_token.token, { audio: true });
     readyResender = createResender(() => room.publish({ type: 'client_ready' }), { intervalMs: 3000, maxAttempts: 20 });
     readyResender.start();
-    // resume_welcome ОБЯЗАТЕЛЕН для voice+continue_from: первичный greeting
-    // гасится, и без него аватар молчит до первой реплики респондента.
-    welcomeResender = createResender(() => room.publish({ type: 'resume_welcome' }), { intervalMs: 3000, maxAttempts: 5 });
-    welcomeResender.start();
+    // Микрофон публикуем САМИ: connect его не включает, и без этого разговор
+    // односторонний — аватар говорит, а нас не слышно.
+    await enableMic();
     phase.value = nextPhase(phase.value, { type: 'voice_ready' });
+    // resume_welcome НЕ шлём здесь: до входа агента data-фрейм теряется
+    // безвозвратно. Ресендер заводится в onAgentJoined (см. ниже).
   } catch (err) {
     const code = (err as ApiFailure).code;
     const status = (err as ApiFailure).status;
@@ -4159,19 +5074,39 @@ async function escalate(): Promise<void> {
 }
 ```
 
-`coreMessageCount` — счётчик того, что ОБЯЗАНО осесть в ленте ядра:
+`coreMessageCount` уже объявлен в T6 (`userTextsSent + agentReplies`, greeting не считается, обнуляется в `applyStart` вместе со сменой сессии). Перебор из-за нуджа сторожа простоя безопасен: BFF не доберёт ленту за 4с, вернёт `transcript_complete:false` и допишет последнюю реплику в instructions.
+
+Обработчики присутствия и подтверждений — здесь ключевая правка протокола:
 
 ```ts
-// Ядро персистит только user_text и порождённые ими ответы. Greeting, нудж и
-// прощание сторожа простоя в ленту НЕ попадают — их не считаем.
-const userTextsSent = ref(0);
-const agentRepliesAfterFirstUserText = ref(0);
-const coreMessageCount = computed(() => userTextsSent.value + agentRepliesAfterFirstUserText.value);
+let welcomeResender: ReturnType<typeof createResender> | null = null;
+
+// Агент вошёл в комнату. ТОЛЬКО отсюда стартует resume_welcome: фрейм,
+// отправленный до его появления, теряется безвозвратно (LiveKit data-фреймы
+// не буферизуются), а мы бы «отстрелялись» в пустоту и замолчали навсегда.
+function onAgentJoined(): void {
+  readyResender?.start();
+  if (phase.value !== 'voice' || !isContinuation.value) return;
+  welcomeResender?.stop();
+  welcomeResender = createResender(
+    () => room.publish({ type: 'resume_welcome' }),
+    { intervalMs: 3000, maxAttempts: 5 },
+  );
+  welcomeResender.start();
+}
+
+// В handleFrame (T6) добавить:
+//   readyResender?.bump()                      — на ЛЮБОМ кадре: он доказывает,
+//                                                что воркер в комнате;
+//   welcomeResender?.bump() ТОЛЬКО на transcript speaker='agent' — подтверждение
+//   тут не «воркер жив», а «аватар ЗАГОВОРИЛ». session_timer и pong приходят и
+//   от молчащего воркера, и гашение по ним вернуло бы ровно ту немоту, ради
+//   которой resume_welcome и существует.
 ```
 
-`agentRepliesAfterFirstUserText` инкрементится в обработчике `transcript speaker=agent` только при `userTextsSent.value > 0`. Перебор из-за нуджа сторожа безопасен: BFF не доберёт ленту за 4с, вернёт `transcript_complete:false` и допишет последнюю реплику в instructions.
+`isContinuation` — `ref(false)`, взводится в `escalate()` (голосовая сессия всегда `continue_from`) и в `resumeThread()`; в обычной чат-сессии остаётся `false`, и `resume_welcome` не шлётся вовсе (в chat он всё равно no-op).
 
-Ре-старт `readyResender` на `onAgentJoined`. `welcomeResender.bump()` и `readyResender.bump()` — на ЛЮБОМ фрейме воркера. `onDisconnected` → `phase = nextPhase(phase, { type: 'disconnected' })`.
+`onDisconnected` → `phase = nextPhase(phase, { type: 'disconnected' })`.
 
 `ResumeBanner.vue` — текст из `bannerFor(phase, lastErrorCode)`, кнопка `[data-test=resume]` при `action==='resume'` вызывает `resumeThread()`:
 
@@ -4247,10 +5182,13 @@ Run: `npx vitest run test/leadForm.test.ts` → PASS.
 - [ ] **Step 6: Мутпробы клиентского протокола**
 
 1. Убрать `await room.disconnect()` перед `api.escalate` → тест порядка FAIL. Вернуть.
-2. Поменять местами `client_ready` и `resume_welcome` → тест порядка фреймов FAIL. Вернуть.
-3. В `nextPhase` вернуть `'error'` на `disconnected` в фазе `escalating` → тест «обрыв в escalating не ошибка» FAIL. Вернуть.
-4. Считать greeting в `coreMessageCount` (инкремент без проверки `userTextsSent > 0`) → тест `messages_count` FAIL (ожидалось 2, стало 3). Вернуть.
-5. Заменить `{ audio: true }` на `{ audio: false }` в голосовом `connect` → тест аудио FAIL. Вернуть.
+2. Перенести старт `welcomeResender` из `onAgentJoined` обратно в `escalate()` (сразу после connect) → тест «resume_welcome НЕ уходит до появления агента» FAIL. Вернуть.
+3. Гасить `welcomeResender` по любому кадру (`welcomeResender?.bump()` рядом с `readyResender?.bump()`) → тест «гасится РЕЧЬЮ агента» FAIL. Вернуть.
+4. В `nextPhase` вернуть `'error'` на `disconnected` в фазе `escalating` → тест «обрыв в escalating не ошибка» FAIL. Вернуть.
+5. Считать greeting в `coreMessageCount` (инкремент без проверки `userTextsSent > 0`) → тест `messages_count` FAIL (ожидалось 2, стало 3). Вернуть.
+6. Заменить `{ audio: true }` на `{ audio: false }` в голосовом `connect` → тест аудиотрека FAIL. Вернуть.
+7. Убрать `await enableMic()` из `escalate()` → тест «микрофон публикуется сразу после входа» FAIL. Вернуть.
+8. В `room.ts` убрать `publication.setSubscribed(false)` для видео → тест отписки FAIL. Вернуть.
 
 - [ ] **Step 7: Полный прогон и commit**
 
@@ -4258,21 +5196,19 @@ Run: `cd embed/app && npx vitest run` → PASS. `cd embed/loader && npx vitest r
 
 ```bash
 git add embed/app/src embed/app/test
-git commit -m "feat(embed): FSM эскалации, голосовая панель, баннер «Продолжить», лид-форма (Э4-T6)"
+git commit -m "feat(embed): FSM эскалации, голос с микрофоном, баннер «Продолжить», лид-форма (Э4-T7)"
 ```
 
 ---
-### Task 7: Compose + деплой дев + провижининг ядра + `widget_smoke.py` (ГЕЙТ ФАЗЫ)
+### Task 8: Compose + деплой дев + провижининг ядра
 
 **Files:**
-- Create: `infra/Dockerfile`, `infra/compose.yaml`, `infra/.env.example`, `embed/public/demo.html`
-- Create: `scripts/widget_smoke.py`
+- Create: `infra/Dockerfile`, `infra/compose.yaml`, `infra/.env.example`, `infra/deploy.sh`, `embed/public/demo.html`
 - Create: `README.md` (запуск, провижининг, ручной чек-лист голоса)
-- Modify: `backend/src/routes/health.ts` (проверка достижимости ядра в `/healthz?deep=1`)
 
 **Interfaces:**
-- Consumes: всё, что произвели T1–T6.
-- Produces: живой стенд `http://185.125.102.133:8200` (compose-проект `site-widget`), тенант ядра «site-widget» с подпиской на вебхуки, зелёный `widget_smoke.py` (6 сценариев §8 спеки), чек-лист ручного браузерного голоса.
+- Consumes: всё, что произвели T1–T7.
+- Produces: живой стенд (compose-проект `site-widget`, порт 8200), тенант ядра «site-widget» с балансом-предохранителем и подпиской на вебхуки, `demo.html` со вставленным `publish_token`, зафиксированные в README фактические значения (`CORE_BASE_URL`, адрес приёмника глазами ядра, LiveKit-хост).
 
 - [ ] **Step 1: Dockerfile и compose**
 
@@ -4315,7 +5251,9 @@ name: site-widget
 services:
   backend:
     image: ${WIDGET_IMAGE:-site-widget-backend:local}
-    build: { context: .., dockerfile: infra/Dockerfile }
+    # Контекст — каталог с исходниками, который кладёт rsync (infra/deploy.sh).
+    # Локально это `..`, на стенде — `./src`; переопределяется переменной.
+    build: { context: "${WIDGET_BUILD_CONTEXT:-..}", dockerfile: infra/Dockerfile }
     restart: unless-stopped
     env_file: [.env]
     environment:
@@ -4353,14 +5291,24 @@ volumes:
 
 ```dotenv
 POSTGRES_PASSWORD=смени-меня
+# На стенде исходники лежат в ./src (их кладёт infra/deploy.sh). Локально
+# строку не задают — compose подставит дефолт `..`.
+WIDGET_BUILD_CONTEXT=./src
 # Ядро — ДРУГОЙ compose-проект: по имени сервиса НЕ разрезолвится.
 # Проверить фактический маршрут ДО деплоя (Step 3), а не полагаться на догадку.
 CORE_BASE_URL=http://172.17.0.1:8100/api
 CORE_TENANT_KEY=sk_test_подставить-из-tenant-create
 CORE_WEBHOOK_SECRET=подставить-из-tenant-webhook-set
-WIDGET_PUBLIC_ORIGIN=http://185.125.102.133:8200
-# LiveKit-хост берётся из participant_token.livekit_url ядра — подставить фактический.
-WIDGET_CSP_CONNECT_SRC='self' wss://ПОДСТАВИТЬ-livekit-хост
+# ВАЖНО (secure context): именно localhost, а НЕ IP стенда. Отсюда строится
+# app_url, по которому грузится iframe; страница на http://<IP> не является
+# secure context, и getUserMedia в ней мёртв даже через ssh -L. Ручной прогон
+# голоса ходит на http://localhost:8200/demo.html внутри туннеля.
+WIDGET_PUBLIC_ORIGIN=http://localhost:8200
+# LiveKit-хост берётся из participant_token.livekit_url ядра — подставить
+# фактический, и обязательно и wss://, и https:// (SDK ходит по обоим).
+WIDGET_CSP_CONNECT_SRC='self' wss://ПОДСТАВИТЬ-livekit-хост https://ПОДСТАВИТЬ-livekit-хост
+# trustProxy НЕ включаем: сервис слушает :8200 напрямую (иначе IP-кап обходится).
+TRUST_PROXY=0
 IP_HASH_SALT=случайная-соль-стенда
 MAX_DIALOGS_PER_VISITOR_PER_DAY=10
 MAX_DIALOGS_PER_IP_PER_DAY=30
@@ -4380,15 +5328,24 @@ PSQL="docker compose -f /opt/conversation-core/compose.yaml exec -T postgres psq
 $CORE tenant:create "site-widget" --test --json
 
 # 2. БЮДЖЕТ-ПРЕДОХРАНИТЕЛЬ: намеренно малый баланс. Ручки пополнения нет —
-#    только прямой UPDATE. 5000 credits (спека §6).
-$PSQL -c "UPDATE tenants SET credits_balance = 5000 WHERE public_id = 'ten_ПОДСТАВИТЬ';"
-$PSQL -c "SELECT public_id, credits_balance FROM tenants WHERE public_id = 'ten_ПОДСТАВИТЬ';"
+#    только прямой INSERT. Баланс живёт в ОТДЕЛЬНОЙ таблице tenant_balances
+#    (PK = tenant_id, внутренний int-id тенанта), колонки credits_balance в
+#    tenants НЕТ — сверено с origin/main:control-plane/src/Entity/TenantBalance.php.
+$PSQL -c "INSERT INTO tenant_balances (tenant_id, balance, updated_at)
+          SELECT id, 5000, now() FROM tenants WHERE public_id = 'ten_ПОДСТАВИТЬ'
+          ON CONFLICT (tenant_id) DO UPDATE SET balance = EXCLUDED.balance, updated_at = now();"
+$PSQL -c "SELECT t.public_id, b.balance FROM tenants t
+          JOIN tenant_balances b ON b.tenant_id = t.id WHERE t.public_id = 'ten_ПОДСТАВИТЬ';"
 
-# 3. Подписка на вебхуки — ТОЧЕЧНО, а не на всё подряд. Секрет из вывода.
+# 3. Порог credits.low. По умолчанию low_credits_threshold = 0, а значит
+#    событие НЕ придёт НИКОГДА и алерт из §6.1 мёртв. Ставим руками.
+$PSQL -c "UPDATE tenants SET low_credits_threshold = 1000 WHERE public_id = 'ten_ПОДСТАВИТЬ';"
+
+# 4. Подписка на вебхуки — ТОЧЕЧНО, а не на всё подряд. Секрет из вывода.
 $CORE tenant:webhook:set ten_ПОДСТАВИТЬ http://172.17.0.1:8200/w/v1/core-webhooks \
   --events session.finalized,transcript.ready,credits.low --json
 
-# 4. Проверить (НЕ полагаться!), что http и приватные адреса разрешены.
+# 5. Проверить (НЕ полагаться!), что http и приватные адреса разрешены.
 grep -E 'CORE_WEBHOOK_ALLOW_(HTTP|PRIVATE_TARGETS)' /opt/conversation-core/.env
 ```
 
@@ -4431,18 +5388,44 @@ docker compose -f /opt/site-widget/compose.yaml exec -T backend \
 </html>
 ```
 
-В `allowed_origins` виджета для дева положить `["http://localhost:8200", "http://185.125.102.133:8200"]`.
+В `allowed_origins` виджета для дева положить `["http://localhost:8200"]` — тот же origin, что `WIDGET_PUBLIC_ORIGIN`. Добавлять туда `http://185.125.102.133:8200` НЕ надо: страница по IP не secure context, голос там всё равно не заработает, а лишний разрешённый origin — лишняя дыра. Если чат нужно показать по IP без голоса — добавить адрес осознанно и записать в README, что голос по нему не поддерживается.
 
 - [ ] **Step 5: Раскатка**
 
+`build.context: ..` в compose означает, что образ собирается ИЗ РЕПОЗИТОРИЯ. Копировать на сервер только `compose.yaml` + `.env` недостаточно — `docker compose up --build` упадёт, потому что контекста там нет. Для MVP берём самый простой из честных вариантов: заливаем исходники и собираем на месте (CI с публикацией образа в GHCR — после MVP; тогда `WIDGET_IMAGE` в compose уже готов принять тег).
+
+`infra/deploy.sh`:
+
 ```bash
-ssh root@185.125.102.133 mkdir -p /opt/site-widget
-scp infra/compose.yaml root@185.125.102.133:/opt/site-widget/compose.yaml
-scp infra/.env.example root@185.125.102.133:/opt/site-widget/.env   # затем заполнить руками, chmod 600
-ssh root@185.125.102.133 'cd /opt/site-widget && docker compose config --quiet && docker compose up -d --build'
-ssh root@185.125.102.133 'cd /opt/site-widget && docker compose exec -T backend node backend/node_modules/.bin/node-pg-migrate -m backend/migrations up'
-ssh root@185.125.102.133 'curl -fsS -w " HTTP %{http_code}\n" http://localhost:8200/healthz'
+#!/usr/bin/env bash
+# Раскатка дев-стенда site-widget: исходники → сервер → сборка на месте.
+set -euo pipefail
+
+HOST="${HOST:-root@185.125.102.133}"
+DIR="${DIR:-/opt/site-widget}"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+ssh "$HOST" "mkdir -p $DIR"
+
+# MTU 1400 на этом сервере: большие передачи подвисают, поэтому rsync, а не
+# один толстый scp. node_modules и dist не везём — собираются в образе.
+rsync -az --delete \
+  --exclude '.git' --exclude 'node_modules' --exclude 'dist' --exclude '.env' \
+  "$ROOT/" "$HOST:$DIR/src/"
+
+scp "$ROOT/infra/compose.yaml" "$HOST:$DIR/compose.yaml"
+ssh "$HOST" "test -f $DIR/.env || { echo 'НЕТ $DIR/.env — заполни из infra/.env.example и chmod 600'; exit 1; }"
+
+ssh "$HOST" "cd $DIR && docker compose config --quiet && docker compose up -d --build"
+ssh "$HOST" "cd $DIR && docker compose exec -T backend npx --no-install node-pg-migrate -m backend/migrations up"
+ssh "$HOST" "curl -fsS -w ' HTTP %{http_code}\n' http://localhost:8200/healthz"
 ```
+
+Чтобы compose нашёл контекст, в серверный `$DIR/.env` добавляется строка `WIDGET_BUILD_CONTEXT=./src` (локально переменной нет и подставляется дефолт `..`). `WIDGET_IMAGE` оставляем как переключатель на будущий образ из реестра.
+
+Про путь миграций: при npm workspaces бинарь `node-pg-migrate` лежит НЕ в `backend/node_modules/.bin`, а в корневом `/app/node_modules/.bin` (npm поднимает зависимости в корень). Прямой путь `backend/node_modules/.bin/node-pg-migrate` не существует и упадёт — поэтому `npx --no-install node-pg-migrate`, который найдёт бинарь сам. Альтернатива, если хочется явности: `node /app/node_modules/.bin/node-pg-migrate -m backend/migrations up`.
+
+Run: `bash infra/deploy.sh` → `HTTP 200` на `/healthz`.
 
 Завести первый виджет прямым SQL (кабинета в MVP нет):
 
@@ -4465,7 +5448,25 @@ curl -fsS http://185.125.102.133:8200/w/v1/<TOKEN>/config | head -c 400
 curl -fsS -o /dev/null -w '%{http_code}\n' http://185.125.102.133:8200/w.js
 ```
 
-- [ ] **Step 6: `widget_smoke.py` — 6 сценариев спеки §8**
+- [ ] **Step 6: Commit**
+
+```bash
+git add infra embed/public/demo.html README.md
+git commit -m "feat(deploy): дев-стенд site-widget + провижининг тенанта ядра (Э4-T8)"
+```
+
+---
+### Task 9: `widget_smoke.py` — 6 сценариев §8 + ГЕЙТ ФАЗЫ
+
+**Files:**
+- Create: `scripts/widget_smoke.py`
+- Modify: `README.md` (ручной чек-лист голоса), `backend/src/routes/health.ts` (проверка достижимости ядра в `/healthz?deep=1`)
+
+**Interfaces:**
+- Consumes: живой стенд из T8, `publish_token` демо-виджета, venv воркера ядра (`livekit-rtc`).
+- Produces: `SMOKE-RESULT: <исход> exit=<код> verdicts=<n>` последней строкой; коды выхода 0/1/2/3 как у `chat_smoke.py` ядра; пройденный ручной чек-лист браузерного голоса.
+
+- [ ] **Step 1: `widget_smoke.py` — 6 сценариев спеки §8**
 
 `scripts/widget_smoke.py` — по образцу `scripts/chat_smoke.py` ядра (stdlib + `livekit-rtc` из venv воркера ядра; строительные блоки — `HttpResponse/http`, `WebhookReceiver`, `poll_until`, `verify_signature`, коды выхода 0/1/2/3 — переносятся с пометкой «(из chat_smoke.py ядра)»).
 
@@ -4503,9 +5504,14 @@ def scenario_1_chat_and_echo_dedup(ctx) -> None:
     ctx.dialog_id = started["dialog_id"]
     token = started["participant_token"]
 
-    signals = ctx.run_chat(token, question="Меня зовут Пётр")
+    # Комната остаётся ЖИВОЙ до сценария 3 (см. его докстринг): выход участника
+    # разбудил бы сторож простоя и закрыл chat-сессию раньше эскалации.
+    signals = ctx.run_chat(token, question="Меня зовут Пётр", keep_open=True)
     assert signals.greeting_seen, "greeting (transcript speaker=agent) не пришёл"
     assert signals.answer_seen, "ответ агента не пришёл"
+    # Столько реплик ОБЯЗАНО осесть в ленте ядра: наш user_text + ответ агента.
+    # Greeting в ленту не идёт (служебные реплики chat не персистятся).
+    ctx.core_message_count = 2
     # Эхо: воркер вернул нашу же реплику как transcript speaker=respondent.
     assert signals.respondent_echo_seen, (
         "воркер НЕ вернул эхо — сценарий дедупа непроверяем, "
@@ -4532,20 +5538,42 @@ def scenario_2_reenter(ctx) -> None:
     assert identity.startswith("respondent-"), f"identity без префикса: {identity}"
     assert identity != ctx.previous_identity, "identity переиспользована — выкинет живого участника"
     assert any(m["text"] == "Меня зовут Пётр" for m in res["messages"]), "история не отдана"
-    # Вход по новому токену не рвёт диалог.
-    ctx.join_and_leave(res["participant_token"])
+    assert res["next_seq"] >= 2, f"next_seq не продолжает нумерацию журнала: {res['next_seq']}"
+    # Свой текст в истории ОДИН раз: сверка ленты ядра дедупится по тексту, и
+    # повторное открытие вкладки не обязано удваивать реплики.
+    mine = [m for m in res["messages"] if m["text"] == "Меня зовут Пётр"]
+    assert len(mine) == 1, f"история задвоилась после re-enter: {mine}"
+    # Вторым участником в ту же комнату НЕ входим: живой чат-клиент сценария 1
+    # остаётся единственным. Проверяем лишь, что токен выписан на новую identity.
 
 
 def scenario_3_escalate_to_voice(ctx) -> None:
-    """(3) escalate{messages_count} → voice-token → resume_welcome → аватар заговорил."""
+    """(3) escalate{messages_count} → voice-token → resume_welcome → аватар заговорил.
+
+    ⚠️ ПОРЯДОК: chat-комнату НЕ покидаем до вызова /escalate. Уход участника
+    взводит сторож простоя воркера, и он может закрыть chat-сессию раньше нас —
+    тогда диалог уедет в ended, а /escalate честно ответит 409 dialog_not_active,
+    и смок покажет ЛОЖНЫЙ красный. Комнату рвёт сам /escalate через POST /end,
+    ровно как в браузере (T7 отключается сам ПЕРЕД вызовом, но там между этими
+    двумя действиями миллисекунды, а не сетевой roundtrip смока).
+    """
     res = ctx.http("POST", f"/w/v1/{ctx.token}/dialogs/{ctx.dialog_id}/escalate",
-                   json={"visitor_key": ctx.visitor_key, "messages_count": 2},
-                   headers={"Origin": ctx.origin}).json()
-    assert res["channel"] == "voice"
-    assert res["continued_from"], "связь с прошлой сессией потеряна"
-    signals = ctx.run_voice(res["participant_token"])
+                   json={"visitor_key": ctx.visitor_key, "messages_count": ctx.core_message_count},
+                   headers={"Origin": ctx.origin}, expect_error=True)
+    if res.status == 409 and res.json()["error"]["code"] == "dialog_not_active":
+        raise AssertError(
+            "диалог уже не активен к моменту эскалации: сторож простоя закрыл "
+            "chat-сессию раньше. Это НЕ баг эскалации — смок обязан держать "
+            "chat-комнату живой между сценариями 1-3")
+    assert res.status == 201, f"эскалация не прошла: {res.status} {res.text[:300]}"
+    body = res.json()
+    assert body["channel"] == "voice"
+    assert body["continued_from"], "связь с прошлой сессией потеряна"
+    ctx.drop_chat_room()  # комнаты уже нет: /end снёс её на стороне ядра
+    signals = ctx.run_voice(body["participant_token"])
     # В продолжении greeting гасится — заговорить аватар обязан ИМЕННО по
-    # resume_welcome (client_ready → resume_welcome, повтор 3с×5).
+    # resume_welcome (client_ready сразу, resume_welcome ПОСЛЕ входа агента,
+    # повтор 3с×5).
     assert signals.agent_spoke, "аватар молчит: resume_welcome не сработал"
 
 
@@ -4572,11 +5600,19 @@ def scenario_5_webhook_to_usage(ctx) -> None:
         lambda: ctx.psql_fields(
             "SELECT count(*) FROM core_events WHERE type = 'session.finalized'")[0] != "0",
         timeout=90, what="вебхук session.finalized")
-    usage, credits, status = ctx.psql_fields(
-        f"SELECT usage::text, credits_total, status FROM dialogs WHERE id = '{ctx.dialog_id}'")
-    assert "chat_token" in usage, f"токенный учёт не доехал в usage: {usage}"
-    assert int(credits) > 0, f"credits_total нулевой: {credits}"
+    usage, credits, status, settled = ctx.psql_fields(
+        f"SELECT usage::text, credits_total, status, settled_session_ids::text "
+        f"FROM dialogs WHERE id = '{ctx.dialog_id}'")
+    # Ассертим ЮНИТЫ метра, а не credits: прайс chat_token = 0.001 credits за
+    # токен с округлением per-turn, и на коротком диалоге credits_total честно
+    # бывает нулём. Нулевой usage — вот это поломка учёта.
+    parsed = json.loads(usage)
+    assert parsed.get("chat_token", 0) > 0, f"токенный учёт не доехал в usage: {usage}"
+    assert int(credits) >= 0, f"credits_total отрицательный: {credits}"
     assert status == "ended", f"статус диалога не сведён: {status}"
+    # Каждая сессия нити учтена ровно один раз (защита от гонки со свипером).
+    ids = json.loads(settled)
+    assert len(ids) == len(set(ids)), f"сессия учтена дважды: {ids}"
 
 
 def scenario_6_negatives(ctx) -> None:
@@ -4608,9 +5644,15 @@ def scenario_6_negatives(ctx) -> None:
         "отвергнутый вебхук всё равно записан"
 ```
 
-`run_chat` / `run_voice` — тот же приём, что `chat_dialog` в `chat_smoke.py`: `rtc.Room`, `data_received` копит фреймы, `client_ready` публикуется сразу после входа; для voice — дополнительно `resume_welcome` через 0.5с после появления agent-участника, с повтором 3с×5, и ожидание `transcript speaker=agent` (либо аудио-трека) как признака «аватар заговорил». Финальная строка — `SMOKE-RESULT: <исход> exit=<код> verdicts=<n>`.
+`run_chat` / `run_voice` — тот же приём, что `chat_dialog` в `chat_smoke.py`: `rtc.Room`, `data_received` копит фреймы, `client_ready` публикуется сразу после входа. Отличия:
 
-- [ ] **Step 7: Прогон смока**
+- `run_chat(..., keep_open=True)` НЕ вызывает `room.disconnect()` и возвращает живую комнату в `ctx` — её рвёт `ctx.drop_chat_room()` уже после `/escalate` (сторож простоя иначе закроет chat-сессию между сценариями).
+- `run_voice` шлёт `resume_welcome` строго ПОСЛЕ появления agent-участника (событие `participant_connected` с identity на `agent-`, плюс проверка уже вошедших в `room.remote_participants` — вошедший раньше нас события не породит), повторяет 3с×5 и гасит повтор по `transcript speaker=agent`. Признак «аватар заговорил» — именно этот кадр либо подписка на аудио-трек; `session_timer`/`pong` не считаются.
+- Микрофон питон-клиент НЕ публикует: смок проверяет, что аватар ЗАГОВОРИЛ, а распознавание речи проверяет ручной браузерный прогон (Step 3).
+
+Финальная строка — `SMOKE-RESULT: <исход> exit=<код> verdicts=<n>`.
+
+- [ ] **Step 2: Прогон смока**
 
 ```bash
 scp scripts/widget_smoke.py root@185.125.102.133:/opt/site-widget/widget_smoke.py
@@ -4619,28 +5661,38 @@ ssh root@185.125.102.133 'cd /opt/site-widget && /opt/conversation-core/worker/.
 
 Ожидаемое: `SMOKE-RESULT: OK exit=0 verdicts=6`. Красный смок — чинить код, а НЕ ослаблять ассерт.
 
-- [ ] **Step 8: Ручной браузерный смок голоса (P0-3) + README**
+- [ ] **Step 3: Ручной браузерный смок голоса (P0-3) + README**
 
 `README.md` — раздел «Ручной прогон голоса» (чек-лист, каждый пункт отмечается):
 
 ```
 1. ssh -L 8200:localhost:8200 root@185.125.102.133
-2. Открыть http://localhost:8200/demo.html  (localhost = secure context; по IP голос НЕ заработает)
+2. Открыть http://localhost:8200/demo.html
+   ⚠️ ИМЕННО localhost: страница по http://<IP> НЕ secure context, и микрофон
+   там не запросится вовсе. WIDGET_PUBLIC_ORIGIN на стенде обязан быть
+   http://localhost:8200, иначе iframe уедет на IP-origin и голос умрёт.
 3. Кнопка виджета → панель открылась, greeting пришёл текстом
 4. Написать «Меня зовут Пётр» → свой пузырь ОДИН (эхо не задвоило) → ответ агента
-5. Перезагрузить страницу → история на месте, диалог продолжается (re-enter)
-6. «Продолжить голосом» → прелоадер «Соединяю с голосом…» ≤15с → браузер спросил микрофон
-7. Аватар ЗАГОВОРИЛ сам (resume_welcome сработал), не дожидаясь реплики
-8. Сказать «А доставка бесплатная?» → ответ голосом; своя реплика в ленте ОДИН раз
-9. Помолчать до silence-таймаута → баннер «Диалог приостановлен» + «Продолжить»
-10. «Продолжить» → новый чат помнит имя Пётр (нить не потеряна)
-11. Лид-форма: без чекбокса согласия кнопка неактивна; с ним — «Спасибо»
-12. Закрыть вкладку → в логах ядра сессия закрылась, кредиты не текут
+5. Перезагрузить страницу → история на месте и НЕ задвоилась, диалог продолжается
+6. Написать ещё реплику → она видна (нумерация журнала продолжилась с next_seq)
+7. «Продолжить голосом» → прелоадер «Соединяю с голосом…» ≤15с
+8. Браузер СПРОСИЛ доступ к микрофону → разрешить; индикатор микрофона активен
+9. Аватар ЗАГОВОРИЛ сам (resume_welcome сработал), не дожидаясь реплики
+10. Сказать «А доставка бесплатная?» → аватар ОТВЕТИЛ по существу (значит нас
+    слышно: микрофон реально опубликован), своя реплика в ленте ОДИН раз
+11. Нажать mute → сказать что-нибудь → реакции нет; снять mute → снова слышно
+12. Отказать в доступе к микрофону (отдельный прогон в приватном окне) →
+    баннер «Микрофон недоступен», аватара при этом СЛЫШНО, оверлея ошибки нет
+13. Помолчать до silence-таймаута → баннер «Диалог приостановлен» + «Продолжить»
+14. «Продолжить» → новый чат помнит имя Пётр (нить не потеряна)
+15. Лид-форма: без чекбокса согласия кнопка неактивна; с ним — «Спасибо»
+16. Закрыть вкладку → в логах ядра сессия закрылась, кредиты не текут
+17. Проверить остаток баланса тенанта и записать его в README
 ```
 
 Также в README: команды запуска, провижининг ядра, известные ограничения MVP (нет кабинета, нет TLS-сабдомена, голос только через `ssh -L`).
 
-- [ ] **Step 9: Завести issue в ядро (§6.4 спеки)**
+- [ ] **Step 4: Завести issue в ядро (§6.4 спеки)**
 
 Не чинится на стороне виджета — держатель `participant_token` может слать `user_text` в цикле мимо BFF:
 
@@ -4650,11 +5702,11 @@ gh issue create --repo ivanyadeshko/ai-conversation-core \
   --body "Найдено при Э4 (ai-site-widget). Браузер держит participant_token 1ч и может слать user_text в цикле мимо BFF: rate-limit в воркере нет, ядро НЕ режет chat-сессии по limits.max_credits (drain-to-zero только на settle), резервирования нет — N параллельных сессий жгут N×баланс. На стороне виджета закрыто лишь косвенно (малый баланс тенанта, max_duration_s=600, капы диалогов). Нужно: (1) rate-limit user_text на сессию в воркере; (2) honoring max_credits для канала chat."
 ```
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add infra scripts/widget_smoke.py embed/public/demo.html README.md backend/src/routes/health.ts
-git commit -m "feat(deploy): дев-стенд site-widget + провижининг ядра + widget_smoke (Э4-T7)"
+git add scripts/widget_smoke.py README.md backend/src/routes/health.ts
+git commit -m "feat(smoke): widget_smoke.py — 6 сценариев §8 + ручной чек-лист голоса (Э4-T9)"
 ```
 
 ---
@@ -4665,7 +5717,7 @@ git commit -m "feat(deploy): дев-стенд site-widget + провижини�
 
 1. **Автотесты:** `npm test --workspaces` зелёный целиком (backend vitest + embed/loader + embed/app), `cd embed/loader && npm run build` укладывается в 8 КБ gzip, `npm run contracts:check` подтверждает, что контракт совпадает с `origin/main` ядра.
 2. **Смок:** `widget_smoke.py` на дев-стенде → `SMOKE-RESULT: OK exit=0 verdicts=6` (все 6 сценариев §8: чат+дедуп эха, re-enter, эскалация в голос, лид, вебхук→usage, три негатива).
-3. **Ручной браузерный голос:** чек-лист README пройден целиком через `ssh -L 8200:localhost:8200` на `http://localhost:8200/demo.html`, включая пункты 7 (аватар заговорил сам), 9–10 (пауза по silence → «Продолжить» → нить помнит имя) и 12 (закрытие вкладки не течёт кредитами).
+3. **Ручной браузерный голос:** чек-лист README пройден целиком через `ssh -L 8200:localhost:8200` на `http://localhost:8200/demo.html`, включая пункты 8–10 (микрофон запрошен, аватар заговорил сам, ответил по существу сказанного), 11–12 (mute и отказ в доступе), 13–14 (пауза по silence → «Продолжить» → нить помнит имя) и 16 (закрытие вкладки не течёт кредитами).
 
 Дополнительно зафиксировать в README фактические значения, найденные на стенде: рабочий `CORE_BASE_URL`, адрес приёмника вебхуков глазами ядра, LiveKit-хост в `WIDGET_CSP_CONNECT_SRC`, остаток баланса тенанта после прогона.
 
@@ -4673,14 +5725,17 @@ git commit -m "feat(deploy): дев-стенд site-widget + провижини�
 
 ## Самопроверка плана (writing-plans self-review)
 
-Проведена по чек-листу до коммита; найденное исправлено ИНЛАЙН в тексте выше.
+Проведена по чек-листу до коммита; найденное исправлено ИНЛАЙН в тексте выше. Вторая редакция — после адверсариальной валидации (6 P0 + 12 P1 + right-sizing).
 
-**1. Покрытие спеки.** Каждый раздел SSOT привязан к таску: §2 архитектура → T1 (+ обязательная обвязка: миграции T1, rawBody T2, структурные логи T1, graceful shutdown T1, таймаут 45с и Idempotency-Key T2); §3 модель данных → T1 (таблица `visitors` СНЯТА, `visitor_key` в диалоге — как в спеке); §4 все 9 ручек → T3 (8) + T4 (`/escalate`); §5 embed → T5 (лоадер, шим, iframe, чат, дедуп, client_ready) + T6 (FSM, голос, баннер, лид, маппинг ошибок ядра в UX); §6 деньги → T1 (капы в схеме), T3 (капы в коде), T4 (свипер), T7 (малый баланс, issue в ядро); §7 деплой → T7; §8 тестирование → T1–T6 (vitest) + T7 (`widget_smoke.py` 6 сценариев + ручной чек-лист); §9 риски → закрыты по пунктам (гонка ленты — poll+instructions в T4, `source` в журнале — T1/T4, idle-фрагментация — `paused`/«Продолжить» в T6, PII — consent T3/T6 и хэш IP T1/T3).
-**Три пробела, найденные и закрытые в плане:** (а) буквальный Origin-check по `allowed_origins` убил бы штатный путь iframe (его Origin — наш) → правило доопределено в T3 + настоящая защита вынесена в `frame-ancestors` (T5); (б) кап по IP против «не храним meta» → введена таблица необратимых суточных счётчиков `ip_day_counters` вместо хранения IP; (в) `localStorage` внутри iframe партиционируется ITP → владельцем `visitor_key` сделан ЛОАДЕР (first-party), передача через postMessage.
+**1. Покрытие спеки.** Каждый раздел SSOT привязан к таску: §2 архитектура → Task 1 (обязательная обвязка: миграции, структурные логи, graceful shutdown — Task 1; rawBody, таймаут 45с и Idempotency-Key — Task 2); §3 модель данных → Task 1 (таблица `visitors` СНЯТА, `visitor_key` прямо в диалоге — как в спеке); §4 все 9 ручек → Task 3 (8) + Task 4 (`/escalate`); §5 embed → Task 5 (страница iframe, лоадер, шим) + Task 6 (чат, дедуп эха, `client_ready`, журнал) + Task 7 (FSM, голос, микрофон, баннер, лид, маппинг ошибок ядра в UX); §6 деньги → Task 1 (схема капов и `settled_session_ids`), Task 3 (`ensureSessionBudget`), Task 4 (кап на эскалации + свипер), Task 8 (малый баланс, порог `credits.low`), Task 9 (issue в ядро); §7 деплой → Task 8; §8 тестирование → Task 1–7 (vitest) + Task 9 (`widget_smoke.py` 6 сценариев + ручной чек-лист); §9 риски → гонка ленты (poll + дописывание в instructions, Task 4), `source` в журнале и сверка (Task 2/4), idle-фрагментация как `paused`/«Продолжить» (Task 7), PII (consent Task 3/7, хэш IP Task 1/3).
 
-**2. Плейсхолдеры.** Пройден поиск по «TBD», «добавь валидацию», «аналогично Task N», «обработай ошибки». Найдено и исправлено ПРЯМО В СНИПЕТАХ: (а) в `reenter.ts` стояла заглушка `app_log_warn(deps, err)` — заменена настоящим вызовом `deps.log.warn(...)`, а расширение `AppDeps` полем `log` расписано отдельным абзацем того же шага (включая правку тестовых сборок deps); (б) в `config.ts` в снипете была опечатка `${raw!r ?? raw}` — заменена на `${raw}`, сопроводительная ремарка «поправить при наборе» удалена как сам по себе плейсхолдер; (в) шаги T5/T6, где Vue-компоненты описаны прозой, обеспечены конкретными тестами с точными селекторами `data-test`, так что «как» не остаётся на усмотрение исполнителя. Мутпробы расставлены во всех тасках, где есть деньги или протокол: T1 (идемпотентность журнала, CAS), T2 (подпись, дедуп, суммирование денег), T3 (капы до денег, `max_duration_s`, префикс identity, `/end` перед продолжением), T4 (CAS эскалации, `continue_from`, потолок инструкций, выборка свипера), T5 (дедуп эха, XSS, порядок гашения ре-отправщика), T6 (порядок disconnect→escalate, порядок `client_ready`→`resume_welcome`, `disconnected` в `escalating`, счёт `messages_count`, аудио).
+**Пробелы спеки, закрытые решениями плана:** (а) буквальный Origin-check убил бы штатный путь iframe → правило доопределено по методу, реальная граница вынесена в `frame-ancestors`; (б) кап по IP против «не храним meta» → необратимые суточные счётчики `ip_day_counters` вместо хранения IP; (в) `localStorage` в iframe партиционируется ITP → владельцем `visitor_key` сделан лоадер (first-party) с передачей через postMessage; (г) спека молчала про публикацию микрофона — без неё голос односторонний, поэтому в Task 7 заведены отдельные шаг, тесты и UX отказа в доступе.
 
-**3. Консистентность типов.** Сверены сквозные имена: `AppDeps` растёт по тактам T1 (`config`,`pool`) → T2 (`core`) → T3 (`log`), и каждая тестовая сборка deps обновляется в своём таске. `openCoreSession` (T3) вызывается из `startDialog` (T3) и `escalateDialog` (T4) с одной сигнатурой. `PublicMessage`/`toPublicMessage`/`MESSAGES_PAGE` объявлены один раз в `startDialog.ts` и импортируются в `reenter.ts`. `session_seq` — единственный источник ключа повторяемости `dlg:{id}:{seq}` во всех трёх путях создания сессии (старт, продолжение, эскалация); отдельный `escalation_attempt` из ранней редакции убран, чтобы не было двух счётчиков. Формы фреймов взяты из pv1: `user_text {type,text}`, `client_ready {type}`, `resume_welcome {type}`, `transcript {type,speaker:agent|respondent,text,interrupted}`, `session_ended {type,reason}` — `speaker` (data-channel), а НЕ `role` (REST ядра `agent|user`); нормализация `respondent→user` живёт в одном месте на запись в журнал. `TRANSCRIPT_POLL_DEADLINE_MS = 4000` согласован со спекой (~4с) и с ретраем ядра (~4.5с).
+**2. Плейсхолдеры.** Поиск по «TBD», «добавь валидацию», «аналогично Task N», «обработай ошибки» — чисто. Из первой редакции устранены две заглушки прямо в снипетах (`app_log_warn` → `deps.log.warn`, опечатка `${raw!r ?? raw}` → `${raw}`), из второй — проза вместо кода в Vue-шаге: `App.vue`, `room.ts`, `ChatFeed`/`Composer` теперь описаны кодом и тестами с точными селекторами `data-test`. Мутпробы стоят везде, где есть деньги или протокол: Task 1 (идемпотентность журнала, CAS), Task 2 (окно подписи, склейка `<t>.<body>`, длина хэша, дедуп событий, суммирование и НЕудвоение денег, дедуп сверки), Task 3 (Origin без заголовка, `trustProxy`, капы до денег, `max_duration_s`, префикс identity, `/end` перед продолжением, стабильность Idempotency-Key), Task 4 (CAS эскалации, `dialog_not_active`, кап на эскалации, `continue_from`, потолок инструкций, выборка свипера), Task 6 (дедуп эха, XSS, порядок гашения ре-отправщика, `next_seq`, сброс счётчика ленты), Task 7 (порядок disconnect→escalate, старт `resume_welcome` только по входу агента, гашение речью а не любым кадром, `disconnected` в `escalating`, счёт `messages_count`, аудио, микрофон, отписка от видео).
 
-**Остаточные риски, которые план не устраняет (осознанно):** `messages_count` считается клиентом эвристически — нудж сторожа простоя может дать перебор, и тогда `transcript_complete:false` уводит в путь «дописать последнюю реплику в instructions» (деградация UX, не поломка); `sandbox` на iframe оставлен по требованию спеки, но вместе с `allow-same-origin` он почти не ограничивает — реальная граница у `frame-ancestors`; `publish_token` публичен by design, и Origin-check не защищает от не-браузерных клиентов (страховка — капы и малый баланс).
+**3. Консистентность типов.** `AppDeps` объявлен целиком в Task 1 (`config`, `pool`, `log`, `core?`) и лишь ужесточается в Task 2 (`core` становится обязательным) — растущий по трём таскам тип из первой редакции был плохим швом. Логгер заполняется внутри `buildApp` через `AppDepsInput = Omit<AppDeps,'log'>`. Чтение журнала — ОДНА функция `listThreadTail` (хвост, хронологический порядок); прежняя пара `listMessages`/`listLastMessages` с расходящейся семантикой сведена в неё, рядом добавлены `maxClientSeq` и `hasSimilarMessage`. Ключ повторяемости выводится ИЗ `core_session_ids.length + 1` — отдельный счётчик `session_seq` удалён вместе с `bumpSessionSeq`, чтобы не держать два источника правды (и чтобы ретрай не покупал новую сессию). `applyFinalizedUsage` везде принимает `sessionId` и возвращает `boolean`. `mapCoreError` живёт в `http/errors.ts` и используется всеми тремя вызывающими. Формы фреймов — из pv1: `user_text {type,text}`, `client_ready {type}`, `resume_welcome {type}`, `transcript {type,speaker:agent|respondent,text,interrupted}`, `session_ended {type,reason}`; `speaker` (data-channel), а НЕ `role` (REST ядра `agent|user`), нормализация `respondent→user` — в одном месте. `TRANSCRIPT_POLL_DEADLINE_MS = 4000` согласован со спекой (~4с) и с ~6с дедлайном ретраев воркера продолжения.
+
+**Проверено по коду ядра (а не по памяти):** баланс тенанта живёт в `tenant_balances (tenant_id PK, balance bigint, updated_at)` — колонки `credits_balance` в `tenants` НЕТ, и SQL провижининга исправлен под реальную схему; `tenants.low_credits_threshold` по умолчанию `0`, поэтому без явного `UPDATE` событие `credits.low` не придёт никогда и алерт §6.1 был бы мёртвым.
+
+**Остаточные риски, которые план не устраняет (осознанно):** `messages_count` считается клиентом эвристически — нудж сторожа простоя даёт перебор, и тогда `transcript_complete:false` уводит в путь «дописать последнюю реплику в instructions» (деградация UX, не поломка); `sandbox` на iframe оставлен по требованию спеки, но вместе с обязательным `allow-same-origin` почти не ограничивает — реальная граница у `frame-ancestors`; `publish_token` публичен by design, и Origin-check не боец против не-браузерных клиентов (страховка — капы, малый баланс и issue в ядро на rate-limit `user_text`); постоянство времени сравнения подписи проверяется ревью, а не тестом (поведенческого способа нет, тест на текст файла был бы проверкой реализации); двойной POST `/dialogs` БЕЗ `dialog_id` создаёт два диалога — общего ключа у них нет, и это ловится только суточным капом.
 
