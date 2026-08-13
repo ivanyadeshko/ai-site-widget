@@ -2,7 +2,10 @@ import { randomUUID } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import type { Pool } from 'pg';
+import type { AppDeps } from '../src/app.ts';
 import { insertDialog } from '../src/db/repositories/dialogs.ts';
+import { findWidgetByToken } from '../src/db/repositories/widgets.ts';
+import { openCoreSession } from '../src/dialogs/openSession.ts';
 import { buildTestApp } from './helpers/app.ts';
 import type { FakeCore } from './helpers/fakeCore.ts';
 import { seedWidget, truncateAll } from './helpers/db.ts';
@@ -12,6 +15,7 @@ const VISITOR = '11111111-1111-4111-8111-111111111111';
 let app: FastifyInstance;
 let core: FakeCore;
 let pool: Pool;
+let deps: AppDeps;
 
 const CREATED = (sid: string) => ({
   session_id: sid, room: 'r',
@@ -19,7 +23,7 @@ const CREATED = (sid: string) => ({
 });
 
 beforeEach(async () => {
-  ({ app, core, pool } = await buildTestApp({ maxDialogsPerVisitorPerDay: 2, maxDialogsPerIpPerDay: 3 }));
+  ({ app, core, pool, deps } = await buildTestApp({ maxDialogsPerVisitorPerDay: 2, maxDialogsPerIpPerDay: 3 }));
   await truncateAll(pool);
 });
 afterEach(async () => { await app.close(); await core.stop(); await pool.end(); });
@@ -151,6 +155,68 @@ describe('капы бюджет-предохранителя', () => {
     expect(creates).toHaveLength(2);
     expect(creates[0]!.headers['idempotency-key']).toBe(creates[1]!.headers['idempotency-key']);
     expect(creates[0]!.headers['idempotency-key']).toBe(`dlg:${dialog.id}:2`);
+  });
+
+  // ── ФИКС-РАУНД 1 (M3): квота списывается по ФАКТУ созданной сессии ────────
+  // Ревью нашло двойное списание: бамп стоял ПЕРЕД попыткой, а ключ
+  // повторяемости на то и заведён, чтобы ретрай получил ТУ ЖЕ сессию —
+  // посетитель с плохой сетью выжигал суточную квоту, не купив ничего.
+  const visitorCounter = async (): Promise<number> => {
+    const { rows } = await pool.query<{ started: number }>(
+      `SELECT started FROM visitor_day_counters WHERE visitor_key = $1 AND day = current_date`, [VISITOR]);
+    return rows[0]?.started ?? 0;
+  };
+
+  it('M3: ретрай с ТЕМ ЖЕ Idempotency-Key списывает квоту ОДИН раз, а не за каждую попытку', async () => {
+    const { token, id: widgetId } = await seedWidget(pool, { allowedOrigins: [ORIGIN] });
+    const dialog = await insertDialog(pool, { widgetId, visitorKey: VISITOR });
+    await pool.query(
+      `UPDATE dialogs SET core_session_ids='["sess_aaaaaaaaaaaaaaaa"]'::jsonb,
+              current_core_session_id='sess_aaaaaaaaaaaaaaaa', status='ended' WHERE id=$1`, [dialog.id]);
+    const cont = () => app.inject({
+      method: 'POST', url: `/w/v1/${token}/dialogs`, headers: { origin: ORIGIN },
+      remoteAddress: '203.0.113.20', payload: { visitor_key: VISITOR, dialog_id: dialog.id },
+    });
+
+    // Попытка 1: /end прошёл, создание оборвалось — СЕССИИ НЕТ, платить не за что.
+    core.enqueue({ status: 204, body: null });
+    core.enqueue({ status: 503, body: { error: { code: 'service_unavailable', message: 'ой' } } });
+    expect((await cont()).statusCode).toBe(503);
+    expect(await visitorCounter()).toBe(0);
+
+    // Попытка 2: ТОТ ЖЕ ключ, ядро отдаёт сессию — вот теперь платим. Один раз.
+    core.enqueue({ status: 204, body: null });
+    core.enqueue({ status: 201, body: { ...CREATED('sess_bbbbbbbbbbbbbbbb'), continued_from: 'sess_aaaaaaaaaaaaaaaa' } });
+    expect((await cont()).statusCode).toBe(201);
+    expect(await visitorCounter()).toBe(1);
+
+    const creates = core.calls.filter((c) => c.url === '/api/v1/sessions');
+    expect(creates[0]!.headers['idempotency-key']).toBe(creates[1]!.headers['idempotency-key']);
+  });
+
+  it('M3: ядро вернуло ТУ ЖЕ сессию (реплей по ключу) — второго списания нет, а РАЗНАЯ сессия платится честно', async () => {
+    const { token, id: widgetId } = await seedWidget(pool, { allowedOrigins: [ORIGIN] });
+    const dialog = await insertDialog(pool, { widgetId, visitorKey: VISITOR });
+    const widget = await findWidgetByToken(pool, token);
+    const args = {
+      widget: widget!, dialog, channel: 'chat' as const, instructions: 'и',
+      visitorKey: VISITOR, ipHash: 'хэш-ip',
+    };
+
+    core.enqueue({ status: 201, body: CREATED('sess_dddddddddddddddd') });
+    await openCoreSession(deps, args);
+    expect(await visitorCounter()).toBe(1);
+
+    // Тот же снимок диалога и тот же ключ — idempotency-хранилище ядра отдаёт
+    // УЖЕ созданную сессию. Платная сущность одна: счётчик стоит на месте.
+    core.enqueue({ status: 201, body: CREATED('sess_dddddddddddddddd') });
+    await openCoreSession(deps, args);
+    expect(await visitorCounter()).toBe(1);
+
+    // Обратный кейс: сессия ДРУГАЯ — это честная вторая покупка.
+    core.enqueue({ status: 201, body: CREATED('sess_eeeeeeeeeeeeeeee') });
+    await openCoreSession(deps, args);
+    expect(await visitorCounter()).toBe(2);
   });
 
   it('кап считает и ЭСКАЛАЦИЮ: она создаёт платную сессию так же, как старт (квота выбрана ДВУМЯ РЕАЛЬНЫМИ сессиями, не строками dialogs)', async () => {

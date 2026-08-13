@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { seedWidget, testPool, truncateAll } from './helpers/db.ts';
 import { findWidgetByToken } from '../src/db/repositories/widgets.ts';
-import { attachCoreSession, casDialogStatus, countDialogsStartedByVisitor, findDialogByClientReference, insertDialog } from '../src/db/repositories/dialogs.ts';
+import { attachCoreSession, casDialogStatus, countDialogsStartedByVisitor, findDialogByClientReference, findDialogById, insertDialog, setDialogStatus } from '../src/db/repositories/dialogs.ts';
 import { hasSimilarMessage, insertMessage, listThreadTail, maxClientSeq } from '../src/db/repositories/messages.ts';
 import { insertCoreEvent } from '../src/db/repositories/coreEvents.ts';
 import { bumpIpDayCounter } from '../src/db/repositories/quotas.ts';
@@ -41,6 +41,36 @@ describe('репозитории', () => {
     expect(fresh?.core_session_ids).toEqual(['sess_aaaaaaaaaaaaaaaa', 'sess_bbbbbbbbbbbbbbbb']);
     expect(fresh?.current_core_session_id).toBe('sess_bbbbbbbbbbbbbbbb');
     expect(fresh?.current_channel).toBe('voice');
+  });
+
+  it('ФИКС-РАУНД 1 (M3): attachCoreSession отдаёт true РОВНО на новой сессии — на этом признаке висит списание квоты', async () => {
+    const { id: widgetId } = await seedWidget(pool);
+    const dialog = await insertDialog(pool, { widgetId, visitorKey: VISITOR });
+    expect(await attachCoreSession(pool, { dialogId: dialog.id, sessionId: 'sess_aaaaaaaaaaaaaaaa', channel: 'chat' })).toBe(true);
+    // Ровно то, что видит ретрай, которому ядро вернуло ТУ ЖЕ сессию по ключу
+    // повторяемости: второй раз платить не за что.
+    expect(await attachCoreSession(pool, { dialogId: dialog.id, sessionId: 'sess_aaaaaaaaaaaaaaaa', channel: 'chat' })).toBe(false);
+    expect(await attachCoreSession(pool, { dialogId: dialog.id, sessionId: 'sess_bbbbbbbbbbbbbbbb', channel: 'voice' })).toBe(true);
+    const fresh = await findDialogByClientReference(pool, dialog.client_reference);
+    // Повторная привязка не задвоила историю сессий.
+    expect(fresh?.core_session_ids).toEqual(['sess_aaaaaaaaaaaaaaaa', 'sess_bbbbbbbbbbbbbbbb']);
+  });
+
+  it('ФИКС-РАУНД 1 (L4): воскресший диалог теряет ended_at — иначе он «живой и законченный» разом', async () => {
+    const { id: widgetId } = await seedWidget(pool);
+    const dialog = await insertDialog(pool, { widgetId, visitorKey: VISITOR });
+    await setDialogStatus(pool, dialog.id, 'ended');
+    expect((await findDialogById(pool, dialog.id))?.ended_at).not.toBeNull();
+
+    // Фолбэк/«Продолжить»: диалог продолжается новой сессией ядра.
+    await attachCoreSession(pool, { dialogId: dialog.id, sessionId: 'sess_cccccccccccccccc', channel: 'chat' });
+    expect((await findDialogById(pool, dialog.id))?.ended_at).toBeNull();
+
+    // И через статус — тоже: инвариант «ended_at есть РОВНО у терминальных».
+    await setDialogStatus(pool, dialog.id, 'ended');
+    expect((await findDialogById(pool, dialog.id))?.ended_at).not.toBeNull();
+    await setDialogStatus(pool, dialog.id, 'active');
+    expect((await findDialogById(pool, dialog.id))?.ended_at).toBeNull();
   });
 
   it('casDialogStatus переводит статус ТОЛЬКО из ожидаемого — защита от двойной эскалации', async () => {

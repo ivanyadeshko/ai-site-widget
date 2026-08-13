@@ -141,6 +141,41 @@ describe('POST /w/v1/:token/dialogs', () => {
     expect(fresh?.core_session_ids).toEqual(['sess_aaaaaaaaaaaaaaaa', 'sess_bbbbbbbbbbbbbbbb']);
   });
 
+  it('ФИКС-РАУНД 1 (L5): ядро не может продолжить нить → сессия БЕЗ памяти + history_lost, а не кирпич', async () => {
+    const { token, id: widgetId } = await seedWidget(pool, { allowedOrigins: [ORIGIN] });
+    const dialog = await insertDialog(pool, { widgetId, visitorKey: VISITOR });
+    await pool.query(
+      `UPDATE dialogs SET core_session_ids = '["sess_aaaaaaaaaaaaaaaa"]'::jsonb,
+              current_core_session_id = 'sess_aaaaaaaaaaaaaaaa', current_channel = 'chat', status = 'ended'
+        WHERE id = $1`, [dialog.id]);
+    await app.inject({ method: 'POST', url: `/w/v1/${token}/dialogs/${dialog.id}/messages`,
+      headers: { origin: ORIGIN }, payload: { visitor_key: VISITOR, role: 'user', text: 'Меня зовут Пётр', seq: 1 } });
+
+    core.enqueue({ status: 204, body: null });                                    // /end предыдущей
+    // Сессия существует, но продолжить её нельзя (закрылась без комнаты —
+    // истории физически нет). Повтор с тем же continue_from бессмыслен.
+    core.enqueue({ status: 422, body: { error: { code: 'session_not_continuable', message: 'нечего продолжать' } } });
+    core.enqueue({ status: 201, body: CREATED('sess_bbbbbbbbbbbbbbbb') });        // пересоздание без памяти
+
+    const res = await app.inject({ method: 'POST', url: `/w/v1/${token}/dialogs`,
+      headers: { origin: ORIGIN }, payload: { visitor_key: VISITOR, dialog_id: dialog.id } });
+
+    expect(res.statusCode).toBe(201);
+    expect(res.json().history_lost).toBe(true);
+    expect(res.json().continued_from).toBeUndefined();
+    // Журнал у КЛИЕНТА цел — потеряна память аватара, а не переписка.
+    expect(res.json().messages.map((m: { text: string }) => m.text)).toEqual(['Меня зовут Пётр']);
+
+    const creates = core.calls.filter((c) => c.url === '/api/v1/sessions');
+    expect(creates).toHaveLength(2);
+    expect(creates[0]!.body).toMatchObject({ continue_from: 'sess_aaaaaaaaaaaaaaaa' });
+    expect(creates[1]!.body).not.toHaveProperty('continue_from');
+    // Ключ ОБЯЗАН отличаться: тело изменилось, прежний дал бы 409
+    // idempotency_key_reuse. И он детерминированный — ретрай не купит третью.
+    expect(creates[1]!.headers['idempotency-key']).toBe(`${creates[0]!.headers['idempotency-key']}:nohist`);
+    expect((await findDialogById(pool, dialog.id))?.status).toBe('active');
+  });
+
   it('чужой visitor_key к существующему диалогу → 404, а не 403 (не оракул чужих id)', async () => {
     const { token, id: widgetId } = await seedWidget(pool, { allowedOrigins: [ORIGIN] });
     const dialog = await insertDialog(pool, { widgetId, visitorKey: VISITOR });

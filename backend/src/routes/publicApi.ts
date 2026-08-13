@@ -236,10 +236,9 @@ export const publicApiRoutes: FastifyPluginAsync = async (app) => {
   );
 
   // Эскалация chat→voice (§5 спеки). T4 заменил ТЕЛО прежней 501-заглушки:
-  // маршрут тот же, цепочка гардов та же, но read-only checkSessionBudget
-  // уступил место бампающему ensureSessionBudget ВНУТРИ escalateDialog — этот
-  // путь наконец реально создаёт платную сессию ядра, и его попытки обязаны
-  // тратить суточную квоту наравне со стартом диалога (решение №3 брифа T3).
+  // маршрут тот же, цепочка гардов та же. Квоту этот путь тратит наравне со
+  // стартом диалога (решение №3 брифа T3), но СПИСАНИЕ живёт в
+  // openCoreSession и происходит по факту созданной сессии — см. budget.ts (M3).
   app.post<{ Params: { token: string; id: string }; Body: { visitor_key?: unknown; messages_count?: unknown } }>(
     '/w/v1/:token/dialogs/:id/escalate',
     { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } },
@@ -248,8 +247,13 @@ export const publicApiRoutes: FastifyPluginAsync = async (app) => {
       const visitorKey = requireVisitorKey(req.body?.visitor_key);
       const dialog = await requireOwnedDialog(req, widget, req.params.id, visitorKey);
       const messagesCount = Number(req.body?.messages_count);
-      if (!Number.isInteger(messagesCount) || messagesCount < 0) {
-        throw new ApiError(422, 'invalid_messages_count', 'messages_count — целое ≥ 0.');
+      // ПОТОЛОК обязателен (фикс-раунд 1, M2): без него `messages_count: 1e9`
+      // с ПУБЛИЧНОЙ ручки задавал недостижимое условие выхода из опроса —
+      // сокет удерживался все 4с дедлайна, а каждый такой запрос множился в
+      // ~9 обращений к ядру. Дешёвый усилитель нагрузки на чужой сервис.
+      // Больше страницы журнала клиенту всё равно не отдать и не показать.
+      if (!Number.isInteger(messagesCount) || messagesCount < 0 || messagesCount > MESSAGES_PAGE) {
+        throw new ApiError(422, 'invalid_messages_count', `messages_count — целое от 0 до ${MESSAGES_PAGE}.`);
       }
       return reply.code(201).send(await escalateDialog(app.deps, {
         widget, dialog, messagesCount, visitorKey,

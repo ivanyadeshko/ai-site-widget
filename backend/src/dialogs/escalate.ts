@@ -6,7 +6,7 @@ import { casDialogStatus, setDialogStatus, type DialogRow } from '../db/reposito
 import { listThreadTail } from '../db/repositories/messages.ts';
 import type { WidgetRow } from '../db/repositories/widgets.ts';
 import { ApiError, mapCoreError } from '../http/errors.ts';
-import { ensureSessionBudget } from './budget.ts';
+import { checkSessionBudget } from './budget.ts';
 import { persistTranscript } from './transcriptSync.ts';
 import { openCoreSession } from './openSession.ts';
 import { buildContinuationInstructions, DIGEST_MAX_MESSAGES, type ThreadLine } from './threadDigest.ts';
@@ -38,6 +38,17 @@ async function pollTranscript(
       const page = await deps.core.getTranscript(sessionId);
       if (page.messages.length > best.length) best = page.messages;
       if (best.length >= wanted) return best;
+      // Лента ДЛИННЕЕ страницы (500 реплик), а мы просим меньше и всё равно
+      // не добрали: значит недостача не «лента ещё не осела», а наша
+      // однастраничность — ждать дедлайн бессмысленно, дальше нужна пагинация,
+      // которой этот опрос не делает. Уходим в ветку недобора немедленно (L1).
+      if (page.has_more) {
+        deps.log.warn(
+          { sessionId, wanted, got: best.length },
+          'лента ядра длиннее страницы — опрос прекращён, недобор компенсируем инструкциями',
+        );
+        return best;
+      }
     } catch (err) {
       deps.log.warn({ err, sessionId }, 'опрос транскрипта сорвался — продолжаем до дедлайна');
     }
@@ -67,10 +78,18 @@ export async function escalateDialog(deps: AppDeps, input: EscalateInput): Promi
     // состоянии» — он должен переоткрыть нить, а не ждать и повторять.
     throw new ApiError(409, 'dialog_not_active', 'Диалог не в активном состоянии — откройте его заново.');
   }
+  if (input.dialog.current_channel !== 'chat') {
+    // Эскалировать можно только ИЗ чата. Повторный /escalate по уже голосовому
+    // диалогу (двойной клик, застрявшая FSM, ре-вход в живую voice-сессию)
+    // иначе честно закрыл бы РАБОТАЮЩИЙ голосовой звонок и купил вместо него
+    // второй — за деньги и с потерей разговора (L6).
+    throw new ApiError(422, 'already_voice', 'Диалог уже в голосовом канале.');
+  }
 
-  // Капы ДО всего: голосовая сессия стоит денег ровно как стартовая (§6.3).
-  // Проверяем ПЕРЕД CAS, чтобы отказ не оставил диалог в 'escalating'.
-  await ensureSessionBudget(deps, { visitorKey: input.visitorKey, ipHash: input.ipHash });
+  // ДОПУСК до всего: голосовая сессия стоит денег ровно как стартовая (§6.3).
+  // Проверяем ПЕРЕД CAS, чтобы отказ не оставил диалог в 'escalating'. Само
+  // СПИСАНИЕ — в openCoreSession по факту новой сессии (M3).
+  await checkSessionBudget(deps, { visitorKey: input.visitorKey, ipHash: input.ipHash });
 
   // CAS: вторая параллельная эскалация НЕ создаст вторую платную сессию.
   if (!(await casDialogStatus(deps.pool, input.dialog.id, 'active', 'escalating'))) {
@@ -107,6 +126,10 @@ export async function escalateDialog(deps: AppDeps, input: EscalateInput): Promi
     const opened = await openCoreSession(deps, {
       widget: input.widget, dialog: input.dialog, channel: 'voice',
       instructions, continueFrom: fromSession,
+      visitorKey: input.visitorKey, ipHash: input.ipHash,
+      // historyOptional тут НЕ ставим: отказ ядра продолжить нить — сигнал
+      // уйти в chat_fallback (там продолжение и починится, L5), а не молча
+      // купить голос без памяти, которую посетитель ждёт услышать.
     });
     await setDialogStatus(deps.pool, input.dialog.id, 'active');
 

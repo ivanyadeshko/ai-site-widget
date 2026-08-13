@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import type { Pool } from 'pg';
 import type { AppDeps } from '../src/app.ts';
-import { escalateDialog } from '../src/dialogs/escalate.ts';
+import { escalateDialog, TRANSCRIPT_POLL_DEADLINE_MS } from '../src/dialogs/escalate.ts';
 import { findDialogById, insertDialog } from '../src/db/repositories/dialogs.ts';
 import { listThreadTail } from '../src/db/repositories/messages.ts';
 import { findWidgetByToken } from '../src/db/repositories/widgets.ts';
@@ -169,6 +169,52 @@ describe('POST /w/v1/:token/dialogs/:id/escalate', () => {
     // Лента добралась — довеска «недобранной реплики» в инструкциях быть не должно.
     const created = core.calls.at(-1)!.body as { agent: { instructions: string } };
     expect(created.agent.instructions).not.toContain('Ещё не попавшая в историю');
+  });
+
+  it('M2: messages_count без потолка = усилитель нагрузки на ядро → 422, ядро не тронуто', async () => {
+    // Ревью: 1e9 задавал НЕДОСТИЖИМОЕ условие выхода из опроса — публичная
+    // ручка держала сокет все 4с дедлайна и множила один запрос в ~9
+    // обращений к чужому сервису.
+    const { token, id } = await seedChatDialog();
+    const res = await app.inject({ method: 'POST', url: `/w/v1/${token}/dialogs/${id}/escalate`,
+      headers: { origin: ORIGIN }, payload: { visitor_key: VISITOR, messages_count: 1e9 } });
+    expect(res.statusCode).toBe(422);
+    expect(res.json().error.code).toBe('invalid_messages_count');
+    expect(core.calls).toHaveLength(0);
+  });
+
+  it('L1: has_more=true — опрос не выжигает дедлайн, а сразу уходит в ветку недобора', async () => {
+    // Лента длиннее страницы: недостача не «ещё не осела», а наша
+    // однастраничность — ждать 4с бессмысленно, это UX ни за что.
+    const { token, id } = await seedChatDialog();
+    core.enqueue({ status: 204, body: null });
+    core.enqueue({ status: 200, body: {
+      messages: [{ seq: 1, role: 'user', text: 'Меня зовут Пётр', created_at: '2026-08-13T10:00:00Z' }],
+      has_more: true,
+    } });
+    core.enqueue({ status: 201, body: { session_id: 'sess_bbbbbbbbbbbbbbbb', room: 'r', participant_token: TOKEN, continued_from: 'sess_aaaaaaaaaaaaaaaa' } });
+
+    const started = Date.now();
+    const res = await app.inject({ method: 'POST', url: `/w/v1/${token}/dialogs/${id}/escalate`,
+      headers: { origin: ORIGIN }, payload: { visitor_key: VISITOR, messages_count: 2 } });
+
+    expect(res.statusCode).toBe(201);
+    expect(res.json().transcript_complete).toBe(false);
+    expect(Date.now() - started).toBeLessThan(TRANSCRIPT_POLL_DEADLINE_MS);
+    expect(core.calls.filter((c) => c.url.includes('/transcript'))).toHaveLength(1);
+    // Недобор компенсирован тем же способом, что и по дедлайну.
+    const created = core.calls.at(-1)!.body as { agent: { instructions: string } };
+    expect(created.agent.instructions).toContain('Ещё не попавшая в историю');
+  });
+
+  it('L6: эскалация УЖЕ голосового диалога → 422 already_voice (иначе закрыли бы живой звонок и купили второй)', async () => {
+    const { token, id } = await seedChatDialog();
+    await pool.query(`UPDATE dialogs SET current_channel='voice' WHERE id=$1`, [id]);
+    const res = await app.inject({ method: 'POST', url: `/w/v1/${token}/dialogs/${id}/escalate`,
+      headers: { origin: ORIGIN }, payload: { visitor_key: VISITOR, messages_count: 2 } });
+    expect(res.statusCode).toBe(422);
+    expect(res.json().error.code).toBe('already_voice');
+    expect(core.calls).toHaveLength(0); // живой звонок не тронут, второй не куплен
   });
 
   it('эскалация завершённого диалога → 409 dialog_not_active (ДРУГОЙ код: ждать бесполезно)', async () => {

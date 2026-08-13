@@ -7,7 +7,7 @@ import { listThreadTail, maxClientSeq, type MessageRow } from '../db/repositorie
 import type { WidgetRow } from '../db/repositories/widgets.ts';
 import { ApiError, mapCoreError } from '../http/errors.ts';
 import type { ParticipantToken } from '../core/types.ts';
-import { ensureSessionBudget } from './budget.ts';
+import { checkSessionBudget } from './budget.ts';
 import { openCoreSession } from './openSession.ts';
 
 export type PublicMessage = { role: 'user' | 'agent'; text: string; seq: number; source: 'client' | 'core'; created_at: string };
@@ -20,13 +20,21 @@ export type StartDialogInput = { widget: WidgetRow; visitorKey: string; ipHash: 
 export type StartDialogResult = {
   dialog_id: string; channel: 'chat'; participant_token: ParticipantToken;
   continued_from?: string; messages: PublicMessage[]; next_seq: number;
+  /**
+   * Нить продолжена, но ядро не смогло отдать новой сессии память
+   * предшественника — аватар начнёт с чистого листа. Журнал у клиента цел,
+   * поэтому это не ошибка, а повод сказать посетителю правду (L5).
+   */
+  history_lost?: boolean;
 };
 
 export const MESSAGES_PAGE = 200;
 
 export async function startDialog(deps: AppDeps, input: StartDialogInput): Promise<StartDialogResult> {
-  // Капы ДО денег: сессия ядра — единственное, что жжёт кредиты.
-  await ensureSessionBudget(deps, { visitorKey: input.visitorKey, ipHash: input.ipHash });
+  // ДОПУСК до денег: сессия ядра — единственное, что жжёт кредиты. Само
+  // СПИСАНИЕ квоты живёт в openCoreSession и происходит по факту НОВОЙ сессии
+  // (M3): бамп-перед-попыткой списывал дважды за одну сессию на ретраях.
+  await checkSessionBudget(deps, { visitorKey: input.visitorKey, ipHash: input.ipHash });
 
   let dialog: DialogRow;
   let continueFrom: string | undefined;
@@ -64,13 +72,18 @@ export async function startDialog(deps: AppDeps, input: StartDialogInput): Promi
     const opened = await openCoreSession(deps, {
       widget: input.widget, dialog, channel: 'chat',
       instructions: input.widget.agent_config.instructions,
-      ...(continueFrom ? { continueFrom } : {}),
+      visitorKey: input.visitorKey, ipHash: input.ipHash,
+      // Продолжение нити — единственный путь, где память ЖЕЛАТЕЛЬНА, но не
+      // обязательна: отказ ядра продолжить сессию не должен превращать диалог
+      // в кирпич (L5). На первичном старте continueFrom нет и флаг не нужен.
+      ...(continueFrom ? { continueFrom, historyOptional: true } : {}),
     });
     await setDialogStatus(deps.pool, dialog.id, 'active');
     const rows = await listThreadTail(deps.pool, dialog.id, MESSAGES_PAGE);
     return {
       dialog_id: dialog.id, channel: 'chat', participant_token: opened.participant_token,
       ...(opened.continued_from ? { continued_from: opened.continued_from } : {}),
+      ...(opened.history_lost ? { history_lost: true } : {}),
       messages: rows.map(toPublicMessage),
       // Клиент продолжает нумерацию журнала отсюда: после reload у него свой
       // счётчик обнулился бы, и новые реплики затирались бы дедупом по (seq).
