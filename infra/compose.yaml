@@ -11,6 +11,12 @@ services:
       DATABASE_URL: postgres://widget:${POSTGRES_PASSWORD}@postgres:5432/site_widget
       PORT: "8200"
     ports: ["8200:8200"]
+    # Дев-стенд: ядро (conversation-core) биндит control-plane на 127.0.0.1:8100
+    # (loopback, IPv6-firewall-фикс) — снаружи docker-моста недостижимо. Единственный
+    # чистый маршрут BFF→ядро: присоединиться к сети ядра и ходить на внутренний
+    # `http://control-plane:8000/api` (CORE_BASE_URL в .env). Вебхук ядро→BFF идёт
+    # обратно на host-gateway conversation-core-сети (172.19.0.1:8200, опубликованный порт).
+    networks: [default, core]
     depends_on:
       postgres: { condition: service_healthy }
     healthcheck:
@@ -33,6 +39,15 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+
+networks:
+  default:
+  # Внешняя сеть ядра (conversation-core). BFF ходит в control-plane по ней.
+  # На другом стенде имя иное — переопределяется COMPOSE-переменной не нужно,
+  # правится здесь при переносе (дев: conversation-core_default).
+  core:
+    external: true
+    name: ${CORE_NETWORK:-conversation-core_default}
 
 volumes:
   widget-pgdata:
