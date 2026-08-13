@@ -1,0 +1,27 @@
+# Контекст сборки — либо репозиторий целиком (локально, build.context=..),
+# либо `src/` на стенде (deploy.sh кладёт его туда rsync'ом). Файл лежит в
+# корне репо, чтобы работать в ОБОИХ случаях: rsync копирует дотфайлы, значит
+# .dockerignore приезжает и в $DIR/src/.dockerignore.
+#
+# ГЛАВНАЯ ПРИЧИНА, а не гигиена: `infra/Dockerfile` (build-стадия) делает
+# `RUN npm ci` (ставит зависимости ПОД Linux/alpine в образе), а следом
+# `COPY . .` — без исключений это затирает свежепоставленный node_modules
+# ХОСТОВЫМ node_modules из контекста сборки. У vite/vite-loader зависимости
+# esbuild/rollup — платформенные нативные бинари
+# (node_modules/@esbuild/darwin-arm64 на этой машине); попав в образ поверх
+# linux-версии, они молча ломают `vite build` в контейнере с
+# ERR_DLOPEN/exec format error. node_modules и dist — единственные
+# каталоги, которых это касается, но список расширен на .git/.superpowers/
+# docs/coverage как обычная гигиена контекста и на .env* — сборка не должна
+# случайно запечь секреты в слой образа, даже если однажды .env окажется
+# рядом (deploy.sh и так исключает его из rsync — второй слой защиты).
+**/node_modules
+**/dist
+**/coverage
+.git
+.superpowers
+docs
+*.log
+.DS_Store
+.env
+.env.*

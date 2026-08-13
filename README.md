@@ -1,0 +1,269 @@
+# ai-site-widget
+
+Встраиваемый виджет-аватар для чужих сайтов (Aski, Э4/Ф3 распила): лоадер
+`w.js` (Shadow DOM, бюджет ≤8КБ gzip) → iframe-приложение (чат по
+data-channel + голос) → бэкенд (`:8200`, Fastify) → ядро (`ai-conversation-core`,
+LiveKit-агент). Собственной БД для разговоров у ядра виджет не спрашивает —
+держит свой Postgres (`dialogs`/`dialog_messages`/`leads`/квоты), общается с
+ядром через `contracts/openapi.core.yaml` (Session API + вебхуки).
+
+Структура репозитория:
+
+| Каталог | Что |
+|---|---|
+| `backend/` | Fastify: публичный API виджета, вебхуки ядра, `/app/:token`, статика `w.js`/embed-приложения |
+| `embed/loader/` | `w.js` — сниппет, который вставляет владелец сайта |
+| `embed/app/` | Vue 3 iframe-приложение (чат + голос) |
+| `embed/public/` | Статика демо-страницы (`demo.html`) |
+| `contracts/` | Синхронизированный контракт ядра (`core-api.d.ts` из `openapi.core.yaml`) |
+| `infra/` | Dockerfile, compose дев-стенда, `.env.example`, `deploy.sh` |
+| `.superpowers/sdd/` | SDD-леджер задачи (планы/брифы/отчёты тасков) |
+
+## Локальный запуск (docker compose)
+
+```bash
+cd infra
+cp .env.example .env
+# отредактировать .env — см. «Обязательные плейсхолдеры» ниже
+docker compose up -d --build
+docker compose exec -T backend npx --no-install node-pg-migrate -m backend/migrations up
+curl -fsS http://localhost:8200/healthz   # {"status":"ok","db":"ok"}
+```
+
+`build.context` по умолчанию — `..` (корень репо): локально `WIDGET_BUILD_CONTEXT`
+в `.env` не задают, эту строку удаляют/комментируют (в `.env.example` она стоит
+как `./src` — значение под стенд, см. ниже).
+
+Бэкенд без реального ядра поднимается и отвечает на `/healthz`, но
+`/w/v1/:token/dialogs` (старт диалога) упадёт — ходить некуда. Для полного
+локального цикла с ядром см. `ai-conversation-core` (свой стенд, свой `.env`).
+
+### Обязательные плейсхолдеры перед первым запуском
+
+`.env.example` содержит несколько значений, которые **обязаны** быть заменены
+до первого реального запроса — иначе не «не работает частично», а падает
+процесс целиком на конкретных путях. Оба факта проверены живым прогоном
+контейнера (`docker compose up` + `curl`), не из документации:
+
+- **`CORE_TENANT_KEY`** — уезжает в исходящий заголовок `Authorization: Bearer
+  <ключ>` к ядру (`backend/src/core/client.ts:44`). Placeholder с кириллицей
+  валит `TypeError: Cannot convert argument to a ByteString` — Fetch API
+  требует latin1 в значении заголовка. Падает КАЖДЫЙ вызов ядра (старт
+  диалога, эскалация, reenter), причём до сети, ещё в конструкторе `Headers`.
+- **`WIDGET_CSP_CONNECT_SRC`** — целиком уезжает в ответный заголовок
+  `Content-Security-Policy` (`backend/src/routes/appPage.ts`). Placeholder с
+  кириллицей валит `ERR_INVALID_CHAR: Invalid character in header content` —
+  Node требует latin1 в значении заголовка. Падает КАЖДЫЙ `GET /app/:token`,
+  то есть весь iframe (чат И голос) не грузится вообще, не только голос.
+
+Оба плейсхолдера в `.env.example` уже ASCII (`REPLACE-ME-...`) специально по
+этой причине — сохранённая кириллица была бы такой же миной, только без
+явного сигнала «это не настоящее значение».
+
+Прочие плейсхолдеры (`POSTGRES_PASSWORD`, `CORE_WEBHOOK_SECRET`,
+`IP_HASH_SALT`) в HTTP-заголовки не попадают — забытыми они деградируют
+безопасность/дедуп вебхука, но не роняют процесс.
+
+### Гоча docker-сборки: `.dockerignore`
+
+`infra/Dockerfile` (build-стадия) делает `RUN npm ci` (ставит зависимости под
+linux/alpine в образе), а следом `COPY . .`. Без корневого `.dockerignore`
+эта копия затирает свежепоставленный `node_modules` ХОСТОВЫМ node_modules из
+контекста сборки — а у `vite`/`vite`-лоадера зависимости `esbuild`/`rollup`
+платформенные (нативные бинарники, например `@esbuild/darwin-arm64` на
+macOS). Попав поверх linux-версии внутри контейнера, `vite build` падает.
+`.dockerignore` в корне репозитория (действует и локально при
+`build.context: ..`, и на стенде при `build.context: ./src` — `deploy.sh`
+рассылает дотфайлы rsync'ом как есть) исключает `node_modules`/`dist`
+везде — проверено полной локальной сборкой образа
+(`docker build -f infra/Dockerfile .`).
+
+## Раскатка на дев-стенд
+
+```bash
+HOST=root@185.125.102.133 DIR=/opt/site-widget bash infra/deploy.sh
+```
+
+Что делает `infra/deploy.sh`: rsync исходников (кроме `.git`/`node_modules`/
+`dist`/`.env`) в `$DIR/src` на сервере → `docker compose up -d --build`
+(контекст сборки — `$DIR/src`, см. `WIDGET_BUILD_CONTEXT=./src` в
+`.env.example`) → миграции → `curl /healthz`.
+
+**Предпосылка**: на сервере должен уже лежать `$DIR/.env`, заполненный из
+`infra/.env.example` (`chmod 600`) — скрипт падает с понятным сообщением,
+если файла нет. `.env` в rsync намеренно не улетает (секреты не должны жить
+в исходниках, которые гоняются туда-обратно).
+
+MTU на этом сервере — 1400: большие передачи по `scp` подвисают, поэтому
+rsync, а не один толстый scp (уже известная гоча стенда, см. `docs/dev_stand`
+в родственных репозиториях программы распила).
+
+## Провижининг тенанта в ядре (ручной ран, вне этого репозитория)
+
+Этот раздел исполняется НЕ отсюда — руками (или скриптово) на 185.125.102.133
+против `ai-conversation-core` (`/opt/conversation-core`). Здесь только
+готовые команды; я их не запускал (нет мандата трогать общий дев-стенд из
+задачи T8 — деплой и провижининг делает оркестратор).
+
+```bash
+CORE="docker compose -f /opt/conversation-core/compose.yaml exec -T control-plane bin/console"
+PSQL="docker compose -f /opt/conversation-core/compose.yaml exec -T postgres psql -U core -d conversation_core"
+
+# 1. Тенант + ключ (ключ показывается ОДИН раз — сразу в infra/.env виджета,
+#    CORE_TENANT_KEY).
+$CORE tenant:create "site-widget" --test --json
+
+# 2. Бюджет-предохранитель: намеренно малый баланс. Ручки пополнения нет —
+#    только прямой INSERT. Баланс — в ОТДЕЛЬНОЙ таблице tenant_balances
+#    (PK = tenant_id, внутренний int-id тенанта; колонки credits_balance в
+#    tenants НЕТ).
+$PSQL -c "INSERT INTO tenant_balances (tenant_id, balance, updated_at)
+          SELECT id, 5000, now() FROM tenants WHERE public_id = 'ten_ПОДСТАВИТЬ'
+          ON CONFLICT (tenant_id) DO UPDATE SET balance = EXCLUDED.balance, updated_at = now();"
+$PSQL -c "SELECT t.public_id, b.balance FROM tenants t
+          JOIN tenant_balances b ON b.tenant_id = t.id WHERE t.public_id = 'ten_ПОДСТАВИТЬ';"
+
+# 3. Порог credits.low. По умолчанию low_credits_threshold = 0 → событие
+#    низкого баланса не придёт никогда. Ставим руками.
+$PSQL -c "UPDATE tenants SET low_credits_threshold = 1000 WHERE public_id = 'ten_ПОДСТАВИТЬ';"
+
+# 4. Подписка на вебхуки — ТОЧЕЧНО. Секрет из вывода → CORE_WEBHOOK_SECRET
+#    виджета. Адрес — тот, по которому КОНТЕЙНЕР ЯДРА видит контейнер
+#    виджета (см. следующий раздел про маршрут, ДО того как вписывать сюда
+#    финальный адрес).
+$CORE tenant:webhook:set ten_ПОДСТАВИТЬ http://172.17.0.1:8200/w/v1/core-webhooks \
+  --events session.finalized,transcript.ready,credits.low --json
+
+# 5. Проверить (не полагаться на догадку), что http и приватные адреса
+#    разрешены — оба флага обязаны быть =1.
+grep -E 'CORE_WEBHOOK_ALLOW_(HTTP|PRIVATE_TARGETS)' /opt/conversation-core/.env
+```
+
+Если флаги не `=1` — дописать и пересоздать (`restart` env не подхватывает):
+
+```bash
+docker compose -f /opt/conversation-core/compose.yaml up -d --force-recreate control-plane webhook-dispatcher
+```
+
+### Маршрут контейнер виджета → ядро (проверять руками, не гадать)
+
+`172.17.0.1` (Docker bridge gateway) — рабочая ГИПОТЕЗА в `.env.example`
+(`CORE_BASE_URL`), не факт: у ядра свой compose-проект и своя сеть, и
+резолвится ли `172.17.0.1` из сети `site-widget` — надо проверить С МЕСТА
+(из контейнера виджета), а не с хоста:
+
+```bash
+docker compose -f /opt/site-widget/compose.yaml exec -T backend \
+  node -e "fetch('http://172.17.0.1:8100/health').then(r=>console.log('172.17.0.1 →',r.status)).catch(e=>console.log('172.17.0.1 ✗',e.message))"
+docker compose -f /opt/site-widget/compose.yaml exec -T backend \
+  node -e "fetch('http://185.125.102.133:8100/health').then(r=>console.log('host-IP →',r.status)).catch(e=>console.log('host-IP ✗',e.message))"
+```
+
+Победивший адрес → `CORE_BASE_URL` в `infra/.env` (с суффиксом `/api`).
+Симметрично, для `tenant:webhook:set` — адрес, по которому КОНТЕЙНЕР ЯДРА
+видит контейнер виджета:
+
+```bash
+docker compose -f /opt/conversation-core/compose.yaml exec -T control-plane \
+  curl -fsS http://172.17.0.1:8200/healthz
+```
+
+Оба адреса (`CORE_BASE_URL` со стороны виджета и адрес в `tenant:webhook:set`
+со стороны ядра) НЕ обязаны совпадать по хосту — это два разных направления
+через два независимых docker-bridge.
+
+## Демо-виджет (первый виджет, кабинета в MVP нет)
+
+```bash
+ssh root@185.125.102.133 "cd /opt/site-widget && docker compose exec -T postgres psql -U widget -d site_widget -c \"
+INSERT INTO widgets (publish_token, name, agent_config, kb_ids, allowed_origins, enabled)
+VALUES ('wgt_demo_\$(openssl rand -hex 8)', 'Демо-виджет',
+  '{\\\"instructions\\\":\\\"Ты консультант интернет-магазина. Отвечай коротко и по делу.\\\"}'::jsonb,
+  '[]'::jsonb, '[\\\"http://localhost:8200\\\"]'::jsonb, true)
+RETURNING publish_token;\""
+```
+
+**ДЕВИАЦИЯ от буквы брифа T8**: `allowed_origins` содержит только
+`http://localhost:8200`, БЕЗ `http://185.125.102.133:8200` — сам же брифа
+(шаг «Демо-страница») явно велит НЕ добавлять IP-адрес стенда: страница по
+IP не secure context, голос там не заработает, а лишний разрешённый origin
+(= лишняя дыра в `frame-ancestors`) ничего не даёт взамен. SQL-пример на шаге
+«Раскатка» того же брифа противоречил этому и включал IP — следую более
+позднему и обоснованному указанию, не более раннему тексту. Если понадобится
+показать чат (без голоса) по IP — добавить `http://185.125.102.133:8200`
+осознанно вторым элементом массива и обязательно пометить здесь, что голос
+по этому адресу не работает.
+
+Полученный `publish_token` вписать в `embed/public/demo.html`
+(`data-widget="..."`) и пересобрать образ (в MVP — правкой файла и повторным
+`bash infra/deploy.sh`; `?token=` через query — не реализовано).
+
+Проверки живости:
+
+```bash
+ssh root@185.125.102.133 'cd /opt/site-widget && docker compose logs backend --tail 100 | grep -i "listening\|error"'
+curl -fsS http://185.125.102.133:8200/w/v1/<TOKEN>/config | head -c 400
+curl -fsS -o /dev/null -w '%{http_code}\n' http://185.125.102.133:8200/w.js
+```
+
+## Ручной чек-лист голоса (secure context)
+
+Голос требует `getUserMedia`, а тот требует secure context. Страница по
+`http://185.125.102.133:8200/...` (голый IP) — НЕ secure context, и голос
+там не поднимется даже с валидным диалогом. Рабочий способ на деве —
+ssh-туннель на `localhost`:
+
+```bash
+ssh -L 8200:localhost:8200 root@185.125.102.133
+# в новой вкладке браузера:
+open http://localhost:8200/demo.html
+```
+
+1. Открыть `http://localhost:8200/demo.html` внутри туннеля — виджет должен
+   появиться (лоадер `w.js` → Shadow DOM → плашка).
+2. Начать чат текстом — реплики идут по data-channel, статус источника
+   (`source: core`/`client`) виден в журнале приложения (см. T6).
+3. Эскалировать в голос (кнопка/сценарий по FSM T7) — браузер обязан
+   запросить разрешение на микрофон. Разрешить.
+4. Убедиться, что аудио агента слышно, а не только текст (это и есть
+   `wss://<livekit>` из `WIDGET_CSP_CONNECT_SRC` — без него браузер молча
+   рубит соединение по CSP, в devtools будет `Refused to connect`).
+5. Проверить баннер «Продолжить» после паузы/тишины (FSM T7) — не должен
+   требовать заново проходить через IP-страницу без secure context.
+
+Если на шаге 4 тишина — первым делом смотреть devtools → Console на CSP
+violation (`connect-src`), это самый частый способ сломать именно голос, не
+трогая ничего в коде.
+
+## CI (`.github/workflows/ci.yml`)
+
+Гейт репозитория (`ubuntu-latest`, npm workspaces):
+
+1. `npm ci` — весь монорепо разом (общий `package-lock.json`).
+2. Тестовый Postgres — `infra/compose.test.yaml` (порт `55433`, БД
+   `widget_test`) — тот же compose-файл, что и локальный `npm run
+   db:test:up` в `backend/package.json`; порт совпадает с фолбэком
+   `DATABASE_URL` в `backend/test/helpers/globalSetup.ts`, отдельно
+   прокидывать переменную в CI не нужно.
+3. `npm run typecheck --workspaces --if-present` — `tsc` (backend),
+   `vue-tsc` (embed/app), `tsc` (embed/loader).
+4. `npm run test --workspaces --if-present` — vitest во всех трёх
+   воркспейсах; backend-тесты сами мигрируют тестовую БД на старте
+   (`globalSetup`).
+5. `npm run build --workspaces --if-present` — это ЖЕ бюджет-гейт `w.js`:
+   `embed/loader`'s `build`-скрипт цепочкой гоняет `vite build && make-shim
+   && size-check.mjs` (потолок 8КБ gzip); отдельного шага не заводил —
+   размер уже проверяется билдом, дублировать нечем.
+6. Отдельная джоба `docker-build` — просто `docker build -f infra/Dockerfile .`
+   без публикации (реестр образов — после MVP, см. `infra/deploy.sh`:
+   раскатка = rsync исходников + сборка на месте).
+
+`.github/workflows/ci.yml` проверен `actionlint` локально — чисто.
+
+## Известные ограничения MVP (не в скоупе T8)
+
+- Публикация образа в GHCR — после MVP; `compose.yaml` уже готов принять тег
+  через `WIDGET_IMAGE`, когда реестр появится.
+- Кабинета для управления виджетами нет — первый (и единственный на MVP)
+  виджет заводится прямым SQL (см. выше).
+- `?token=` вместо правки `demo.html` — не реализовано.

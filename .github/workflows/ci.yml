@@ -1,0 +1,86 @@
+name: ci
+
+# Один npm-workspace монорепо (backend + embed/loader + embed/app) — один
+# гейт: typecheck + тесты + сборка. Сборка = ЗАОДНО бюджет-гейт w.js:
+# `embed/loader` package.json wire'ит `vite build && make-shim && size-check`
+# в свой `build`-скрипт (потолок 8КБ gzip, embed/loader/scripts/size-check.mjs),
+# так что отдельного шага "budget" не нужно — `npm run build --workspaces`
+# падает сам, если бандл лоадера пролез за потолок.
+#
+# ubuntu-latest, а не self-hosted: у репозитория своих раннеров нет (см.
+# аналогичное решение в ai-conversation-core/.github/workflows/*-tests.yml).
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+# Свежий пуш в ту же ветку отменяет предыдущий прогон.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: typecheck + tests + build (incl. w.js budget gate)
+    runs-on: ubuntu-latest
+    # Потолок против повисшего шага, а не ожидаемое время: весь прогон —
+    # минуты (npm ci + postgres + vitest + два vite build).
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      # Ставит все 3 воркспейса разом (root package-lock.json общий).
+      - name: npm ci
+        run: npm ci
+
+      # Тестовый Postgres — тот же compose-файл, что описан в backend/package.json
+      # (`npm run db:test:up`) и которым разработчик поднимает БД локально:
+      # порт 55433, БД widget_test — совпадает с фолбэком DATABASE_URL в
+      # backend/test/helpers/globalSetup.ts, отдельно объявлять переменную
+      # окружения в CI не нужно.
+      - name: Start test postgres
+        run: docker compose -f infra/compose.test.yaml up -d --wait
+
+      # tsc (backend), vue-tsc (embed/app), tsc (embed/loader) — по каждому
+      # воркспейсу свой typecheck-скрипт.
+      - name: Typecheck
+        run: npm run typecheck --workspaces --if-present
+
+      # vitest run в каждом воркспейсе. backend-тесты сами мигрируют тестовую
+      # БД на старте (globalSetup) — миграции руками катать не нужно.
+      - name: Test
+        run: npm run test --workspaces --if-present
+
+      # tsc → dist (backend) + vite build → dist (embed/loader, embed/app).
+      # embed/loader заодно прогоняет size-check.mjs (бюджет 8КБ gzip) —
+      # это и есть бюджет-гейт w.js, встроенный в билд, а не отдельный шаг.
+      - name: Build (incl. w.js budget gate)
+        run: npm run build --workspaces --if-present
+
+      - name: Teardown test postgres
+        if: always()
+        run: docker compose -f infra/compose.test.yaml down -v
+
+  docker-build:
+    name: infra/Dockerfile builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # Гейт на сам факт сборки образа деплоя (infra/Dockerfile,
+      # build.context=`..` — весь репозиторий). Ничего никуда не пушится —
+      # публикация в GHCR осознанно вынесена за MVP (см. infra/deploy.sh:
+      # раскатка = rsync исходников + сборка на месте до появления реестра).
+      - name: docker build
+        run: docker build -f infra/Dockerfile -t site-widget-backend:ci .

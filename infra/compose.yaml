@@ -1,0 +1,38 @@
+name: site-widget
+services:
+  backend:
+    image: ${WIDGET_IMAGE:-site-widget-backend:local}
+    # Контекст — каталог с исходниками, который кладёт rsync (infra/deploy.sh).
+    # Локально это `..`, на стенде — `./src`; переопределяется переменной.
+    build: { context: "${WIDGET_BUILD_CONTEXT:-..}", dockerfile: infra/Dockerfile }
+    restart: unless-stopped
+    env_file: [.env]
+    environment:
+      DATABASE_URL: postgres://widget:${POSTGRES_PASSWORD}@postgres:5432/site_widget
+      PORT: "8200"
+    ports: ["8200:8200"]
+    depends_on:
+      postgres: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8200/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: widget
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: site_widget
+    volumes: ["widget-pgdata:/var/lib/postgresql/data"]   # ИМЕНОВАННЫЙ том: анонимные жгут inode
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U widget -d site_widget"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  widget-pgdata:
