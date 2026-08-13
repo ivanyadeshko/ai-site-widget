@@ -8,7 +8,11 @@ services:
     restart: unless-stopped
     env_file: [.env]
     environment:
-      DATABASE_URL: postgres://widget:${POSTGRES_PASSWORD}@postgres:5432/site_widget
+      # Хост БД — УНИКАЛЬНОЕ имя widget-db, НЕ "postgres": backend присоединён и к
+      # сети ядра (networks ниже), где у conversation-core свой контейнер с alias
+      # "postgres" → DNS "postgres" резолвился бы в чужую БД ядра (роли widget там
+      # нет → scram отдаёт 28P01 «password failed» вместо «нет роли», анти-энумерация).
+      DATABASE_URL: postgres://widget:${POSTGRES_PASSWORD}@widget-db:5432/site_widget
       PORT: "8200"
     ports: ["8200:8200"]
     # Дев-стенд: ядро (conversation-core) биндит control-plane на 127.0.0.1:8100
@@ -18,7 +22,7 @@ services:
     # обратно на host-gateway conversation-core-сети (172.19.0.1:8200, опубликованный порт).
     networks: [default, core]
     depends_on:
-      postgres: { condition: service_healthy }
+      widget-db: { condition: service_healthy }
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8200/healthz"]
       interval: 15s
@@ -26,7 +30,7 @@ services:
       retries: 5
       start_period: 20s
 
-  postgres:
+  widget-db:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
