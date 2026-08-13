@@ -1,0 +1,23 @@
+{
+  "name": "@aski/site-widget-app",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "NODE_OPTIONS=--no-experimental-webstorage vitest run",
+    "typecheck": "vue-tsc -p tsconfig.json --noEmit",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "livekit-client": "^2.21.0",
+    "vue": "^3.5.41"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.8",
+    "@vue/test-utils": "^2.4.11",
+    "happy-dom": "^20.11.2",
+    "typescript": "~5.7.2",
+    "vite": "^7.0.0",
+    "vitest": "^3.0.0",
+    "vue-tsc": "^3.3.9"
+  }
+}
