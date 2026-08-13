@@ -173,28 +173,40 @@ describe('капы бюджет-предохранителя', () => {
     expect(core.calls).toHaveLength(2); // ровно 2 старта — эскалацию ядро не тронуло вообще
   });
 
-  it('заглушка /escalate НЕ бампает капы на 501-пути: ретраи FSM до T4 не съедают чужую квоту', async () => {
+  // T4 заменил тело 501-заглушки настоящей эскалацией, и прежняя формулировка
+  // этого теста («заглушка НЕ бампает капы») стала неверной по существу:
+  // реальный путь создаёт платную сессию ядра и ОБЯЗАН тратить квоту наравне
+  // со стартом (решение №3 плана; это проверяет тест выше). Сохраняем то, что
+  // осталось истинным и ценным: отказ ГАРДА — до единого обращения к ядру — не
+  // должен стоить визитору суточной квоты. Тест пиннит ПОРЯДОК внутри
+  // escalateDialog: проверка статуса стоит ПЕРЕД ensureSessionBudget; перенос
+  // бампа выше гарда снова начнёт съедать квоту на ретраях клиентской FSM.
+  it('отказ ГАРДА на /escalate НЕ бампает капы: ретраи FSM по неэскалируемому диалогу не съедают чужую квоту', async () => {
     const { token, id: widgetId } = await seedWidget(pool, { allowedOrigins: [ORIGIN] });
     const dialog = await insertDialog(pool, { widgetId, visitorKey: VISITOR });
     await pool.query(
-      `UPDATE dialogs SET current_core_session_id='sess_aaaaaaaaaaaaaaaa', current_channel='chat' WHERE id=$1`,
+      `UPDATE dialogs SET current_core_session_id='sess_aaaaaaaaaaaaaaaa', current_channel='chat',
+              status='ended' WHERE id=$1`,
       [dialog.id],
     );
 
-    // Пять "ретраев" клиентской FSM против вечно падающей заглушки — визитор
-    // ещё НИ РАЗУ не создавал реальную сессию, капа (=2) не должна тронуться.
+    // Пять «ретраев» клиентской FSM в диалог, который эскалировать нельзя, —
+    // визитор ещё НИ РАЗУ не создавал реальную сессию, капа (=2) не трогается.
     for (let i = 0; i < 5; i += 1) {
       const res = await app.inject({
         method: 'POST', url: `/w/v1/${token}/dialogs/${dialog.id}/escalate`,
         headers: { origin: ORIGIN }, remoteAddress: '203.0.113.12',
         payload: { visitor_key: VISITOR, messages_count: 0 },
       });
-      expect(res.statusCode).toBe(501);
+      expect(res.statusCode).toBe(409);
+      expect(res.json().error.code).toBe('dialog_not_active');
     }
-    // После пяти вызовов заглушки визитор всё ещё может СТАРТОВАТЬ диалог —
-    // счётчик не бампался НИ РАЗУ реальным (бампающим) путём.
+    expect(core.calls).toHaveLength(0); // ядро на этом пути не трогали вовсе
+    // После пяти отказов визитор всё ещё может СТАРТОВАТЬ диалог дважды —
+    // счётчик не бампался НИ РАЗУ.
     core.enqueue({ status: 201, body: CREATED('sess_bbbbbbbbbbbbbbbb') });
-    const started = await post(token, { visitor_key: VISITOR }, '203.0.113.12');
-    expect(started.statusCode).toBe(201);
+    core.enqueue({ status: 201, body: CREATED('sess_cccccccccccccccc') });
+    expect((await post(token, { visitor_key: VISITOR }, '203.0.113.12')).statusCode).toBe(201);
+    expect((await post(token, { visitor_key: VISITOR }, '203.0.113.12')).statusCode).toBe(201);
   });
 });

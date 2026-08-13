@@ -7,7 +7,7 @@ import { hashIp } from '../db/repositories/quotas.ts';
 import { findWidgetByToken, type WidgetRow } from '../db/repositories/widgets.ts';
 import { ApiError, mapCoreError, sendApiError } from '../http/errors.ts';
 import { originVerdict } from '../http/originGuard.ts';
-import { checkSessionBudget } from '../dialogs/budget.ts';
+import { escalateDialog } from '../dialogs/escalate.ts';
 import { reenterDialog } from '../dialogs/reenter.ts';
 import { MESSAGES_PAGE, startDialog, toPublicMessage } from '../dialogs/startDialog.ts';
 
@@ -235,32 +235,26 @@ export const publicApiRoutes: FastifyPluginAsync = async (app) => {
     },
   );
 
-  // Заглушка на T4 (эскалация chat→voice, §5 спеки): здесь только цепочка
-  // гардов + read-only checkSessionBudget — то, что должно защищать ЛЮБОЙ путь
-  // создания платной сессии (решение №3 брифа T3), и что уже проверяет
-  // caps.test.ts. Сама эскалация (continue_from между каналами, закрытие
-  // текущей chat-сессии, выдача voice-токена) — предмет T4; успешный путь тут
-  // намеренно не собран, роут отвечает 501.
-  //
-  // ФИКС-РАУНД 1: НЕ ensureSessionBudget (бампающая) — эта заглушка сама
-  // сессию не создаёт, только проверяет, влез бы будущий вызов в капы.
-  // Бамп здесь заставил бы клиентские ретраи ВЕЧНО падающего 501-эндпоинта
-  // (до T4) незаметно съедать суточную квоту легитимного визитора ещё до
-  // того, как он реально попробует начать разговор — см. caps.test.ts.
-  // T4: заменить ТЕЛО этого роута на настоящую эскалацию (и checkSessionBudget
-  // на ensureSessionBudget внутри неё, раз она наконец реально создаёт
-  // сессию) — маршрут уже существует, НЕ регистрировать новый.
-  app.post<{ Params: { token: string; id: string }; Body: { visitor_key?: unknown } }>(
+  // Эскалация chat→voice (§5 спеки). T4 заменил ТЕЛО прежней 501-заглушки:
+  // маршрут тот же, цепочка гардов та же, но read-only checkSessionBudget
+  // уступил место бампающему ensureSessionBudget ВНУТРИ escalateDialog — этот
+  // путь наконец реально создаёт платную сессию ядра, и его попытки обязаны
+  // тратить суточную квоту наравне со стартом диалога (решение №3 брифа T3).
+  app.post<{ Params: { token: string; id: string }; Body: { visitor_key?: unknown; messages_count?: unknown } }>(
     '/w/v1/:token/dialogs/:id/escalate',
     { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } },
     async (req, reply) => {
       const widget = await requireWidget(req, req.params.token, true);
       const visitorKey = requireVisitorKey(req.body?.visitor_key);
-      await requireOwnedDialog(req, widget, req.params.id, visitorKey);
-      await checkSessionBudget(app.deps, {
-        visitorKey, ipHash: hashIp(req.ip, app.deps.config.ipHashSalt),
-      });
-      throw new ApiError(501, 'not_implemented', 'Эскалация реализуется в T4.');
+      const dialog = await requireOwnedDialog(req, widget, req.params.id, visitorKey);
+      const messagesCount = Number(req.body?.messages_count);
+      if (!Number.isInteger(messagesCount) || messagesCount < 0) {
+        throw new ApiError(422, 'invalid_messages_count', 'messages_count — целое ≥ 0.');
+      }
+      return reply.code(201).send(await escalateDialog(app.deps, {
+        widget, dialog, messagesCount, visitorKey,
+        ipHash: hashIp(req.ip, app.deps.config.ipHashSalt),
+      }));
     },
   );
 };

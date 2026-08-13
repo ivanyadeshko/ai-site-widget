@@ -7,10 +7,22 @@ export type FakeReply = { status: number; body: unknown; delayMs?: number };
 export class FakeCore {
   readonly calls: FakeCall[] = [];
   private readonly queue: FakeReply[] = [];
+  private readonly stubs: { urlPart: string; reply: FakeReply }[] = [];
   private server!: Server;
   private port = 0;
 
   enqueue(reply: FakeReply): this { this.queue.push(reply); return this; }
+
+  /**
+   * ПОСТОЯННЫЙ ответ на все запросы, чей url содержит `urlPart`; очередь при
+   * этом НЕ расходуется. Добавлено в T4 под опрос транскрипта: число опросов
+   * там определяется временем (дедлайн 4с / шаг 500мс), а не сценарием, и
+   * зафиксировать его в очереди нельзя — недоеденные ответы съезжают на
+   * СЛЕДУЮЩИЙ вызов, и создание сессии получает чужой 200 вместо своего 201
+   * (ровно так падал тест «недобор ленты за 4с»). Стабы проверяются ПЕРЕД
+   * очередью, поэтому на тесты, которые их не заводят, изменение не влияет.
+   */
+  stub(urlPart: string, reply: FakeReply): this { this.stubs.push({ urlPart, reply }); return this; }
 
   /**
    * Сброс НЕДОРАЗОБРАННЫХ ответов между тестами: `core` в файле — один
@@ -19,7 +31,7 @@ export class FakeCore {
    * под мутацией, которая нарочно делает МЕНЬШЕ запросов, чем ожидалось),
    * иначе тихо просачивается в следующий тест и путает его результат.
    */
-  resetQueue(): void { this.queue.length = 0; }
+  resetQueue(): void { this.queue.length = 0; this.stubs.length = 0; }
 
   get baseUrl(): string { return `http://127.0.0.1:${this.port}/api`; }
 
@@ -35,7 +47,11 @@ export class FakeCore {
           headers: Object.fromEntries(Object.entries(req.headers).map(([k, v]) => [k, String(v)])),
           body: raw ? JSON.parse(raw) : null,
         });
-        const reply = this.queue.shift() ?? { status: 500, body: { error: { code: 'fake_unset', message: 'очередь фейка пуста' } } };
+        const url = req.url ?? '';
+        const stubbed = this.stubs.find((s) => url.includes(s.urlPart));
+        const reply = stubbed?.reply
+          ?? this.queue.shift()
+          ?? { status: 500, body: { error: { code: 'fake_unset', message: 'очередь фейка пуста' } } };
         const send = (): void => {
           res.writeHead(reply.status, { 'content-type': 'application/json' });
           res.end(reply.status === 204 ? '' : JSON.stringify(reply.body));
