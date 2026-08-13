@@ -1,0 +1,16 @@
+{
+  "name": "@aski/site-widget-loader",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "NODE_OPTIONS=--no-experimental-webstorage vitest run",
+    "typecheck": "tsc -p tsconfig.json",
+    "build": "vite build && node scripts/make-shim.mjs && node scripts/size-check.mjs"
+  },
+  "devDependencies": {
+    "happy-dom": "^20.11.2",
+    "typescript": "~5.7.2",
+    "vite": "^6.0.0",
+    "vitest": "^3.0.0"
+  }
+}

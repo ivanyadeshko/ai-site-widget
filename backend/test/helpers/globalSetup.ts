@@ -1,4 +1,6 @@
 import { execFileSync } from 'node:child_process';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 export default function setup(): void {
   process.env.DATABASE_URL ??= 'postgres://widget:widget@127.0.0.1:55433/widget_test';
@@ -7,4 +9,28 @@ export default function setup(): void {
     stdio: 'inherit',
     env: { ...process.env, DATABASE_URL: process.env.DATABASE_URL },
   });
+  ensureAppShellPlaceholder();
+}
+
+/**
+ * embed/app/dist/index.html — собранный shell iframe-приложения; появится
+ * только после T6 (`vite build` в embed/app). appPageRoutes (T5) читает его
+ * напрямую с диска синхронно с первым запросом: без файла КАЖДЫЙ тест
+ * `GET /app/:token` падает ENOENT ещё до проверяемой логики (CSP/frame-
+ * ancestors/токен). `dist/` — build-артефакт и намеренно не коммитится
+ * (корневой .gitignore), поэтому синтетическая заглушка та же, что опишет T6
+ * в `embed/app/index.html` (`<div id="app" data-widget-token="">`),
+ * создаётся здесь при старте тестового прогона и НЕ трогает git — T6
+ * перезапишет её настоящей сборкой через `vite build`.
+ */
+function ensureAppShellPlaceholder(): void {
+  const dir = fileURLToPath(new URL('../../../embed/app/dist/', import.meta.url));
+  const file = `${dir}index.html`;
+  if (existsSync(file)) return;
+  mkdirSync(`${dir}assets`, { recursive: true });
+  writeFileSync(
+    file,
+    '<!doctype html><html lang="ru"><head><meta charset="UTF-8" /></head>'
+      + '<body><div id="app" data-widget-token=""></div></body></html>\n',
+  );
 }

@@ -2,7 +2,18 @@
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "rootDir": ".",
-    "noEmit": true
+    "noEmit": true,
+    // T5: embed/loader добавил happy-dom как devDependency своей вёрстки
+    // тестов; npm workspaces хостит его в общий корневой node_modules, и
+    // vitest/optional-types.d.ts (`export type * as happyDomTypes from
+    // 'happy-dom'`) теперь РЕЗОЛВИТСЯ вместо no-op под `@ts-ignore` — а
+    // бандл типов happy-dom тянет `UnderlyingDefaultSource` из
+    // `node:stream/web`, которого нет в установленном @types/node@22.20.x
+    // (переименован/убран апстримом). Backend-код это не касается: он
+    // никогда не импортирует happy-dom, только test-файлы импортируют
+    // `vitest`, которая транзитивно тащит его типы. skipLibCheck отключает
+    // проверку ЧУЖИХ .d.ts (наш код по-прежнему проверяется строго).
+    "skipLibCheck": true
   },
   "include": ["src/**/*.ts", "test/**/*.ts"]
 }
