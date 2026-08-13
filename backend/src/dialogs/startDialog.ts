@@ -43,7 +43,16 @@ export async function startDialog(deps: AppDeps, input: StartDialogInput): Promi
     const last = existing.current_core_session_id ?? existing.core_session_ids.at(-1) ?? null;
     if (last) {
       // continue_from требует ЗАВЕРШЁННУЮ сессию; своя же незакрытая дала бы 422.
-      await deps.core.endSession(last);
+      // ФИКС-РАУНД 1: этот вызов раньше не был обёрнут — недоступность ядра
+      // здесь падала НЕ пойманным CoreHttpError и уходила в 500 internal
+      // (центральный путь «Продолжить» после silence). mapCoreError отдаёт
+      // клиенту то же 502/503/504, что и остальные обращения к ядру.
+      try {
+        await deps.core.endSession(last);
+      } catch (err) {
+        if (err instanceof CoreHttpError) throw mapCoreError(err);
+        throw err;
+      }
       continueFrom = last;
     }
     dialog = existing;

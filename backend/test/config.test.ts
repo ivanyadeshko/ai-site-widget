@@ -24,10 +24,10 @@ describe('loadConfig', () => {
     expect(cfg.publicOrigin).toBe('http://x');
   });
 
-  it('дефолты бюджет-предохранителя — из спеки §6', () => {
+  it('дефолты бюджет-предохранителя — из спеки §6, фикс-раунд 1 (капы по сессиям, не строкам dialogs)', () => {
     const cfg = loadConfig(FULL);
-    expect(cfg.maxDialogsPerVisitorPerDay).toBe(10);
-    expect(cfg.maxDialogsPerIpPerDay).toBe(30);
+    expect(cfg.maxDialogsPerVisitorPerDay).toBe(20);
+    expect(cfg.maxDialogsPerIpPerDay).toBe(60);
     expect(cfg.maxDurationS).toBe(600);
   });
 

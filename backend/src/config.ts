@@ -7,6 +7,13 @@ export type AppConfig = {
   publicOrigin: string;
   cspConnectSrc: string;
   ipHashSalt: string;
+  /**
+   * Суточный кап — фактически кап СОЗДАНИЙ СЕССИЙ ЯДРА (budget.ts), не строк
+   * dialogs (фикс-раунд 1). Имя поля/env-переменной оставлено как есть: его
+   * переименование задело бы AppConfig-литералы в test/coreWebhooks.test.ts и
+   * test/transcriptSync.test.ts — файлах коммита T2 фикс-раунда (c6c3ea3),
+   * трогать которые запрещено явно. См. task-3-report.md §фикс-раунд 1.
+   */
   maxDialogsPerVisitorPerDay: number;
   maxDialogsPerIpPerDay: number;
   maxDurationS: number;
@@ -51,8 +58,12 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
     publicOrigin: trimSlash(env.WIDGET_PUBLIC_ORIGIN!),
     cspConnectSrc: env.WIDGET_CSP_CONNECT_SRC!,
     ipHashSalt: env.IP_HASH_SALT!,
-    maxDialogsPerVisitorPerDay: int(env.MAX_DIALOGS_PER_VISITOR_PER_DAY, 10),
-    maxDialogsPerIpPerDay: int(env.MAX_DIALOGS_PER_IP_PER_DAY, 30),
+    // Фикс-раунд 1: капы теперь считают СОЗДАНИЯ СЕССИЙ (budget.ts), а не
+    // строки dialogs — продолжение нити после silence и эскалация тратят
+    // квоту наравне со стартом. Дефолты подняты (10→20, 30→60), иначе
+    // фрагментация одного разговора на несколько сессий душит легитимных.
+    maxDialogsPerVisitorPerDay: int(env.MAX_DIALOGS_PER_VISITOR_PER_DAY, 20),
+    maxDialogsPerIpPerDay: int(env.MAX_DIALOGS_PER_IP_PER_DAY, 60),
     maxDurationS: int(env.CORE_MAX_DURATION_S, 600),
     // Небезопасное значение требует ЯВНОГО согласия: дефолт закрыт.
     trustProxy: env.TRUST_PROXY === '1',

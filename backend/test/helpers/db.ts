@@ -6,7 +6,7 @@ export const testPool = (): Pool => createPool(process.env.DATABASE_URL!);
 
 export async function truncateAll(pool: Pool): Promise<void> {
   await pool.query(
-    'TRUNCATE widgets, dialogs, dialog_messages, leads, core_events, ip_day_counters RESTART IDENTITY CASCADE',
+    'TRUNCATE widgets, dialogs, dialog_messages, leads, core_events, ip_day_counters, visitor_day_counters RESTART IDENTITY CASCADE',
   );
 }
 

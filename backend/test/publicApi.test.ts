@@ -148,6 +148,21 @@ describe('POST /w/v1/:token/dialogs', () => {
       headers: { origin: ORIGIN }, payload: { visitor_key: randomUUID(), dialog_id: dialog.id } });
     expect(res.statusCode).toBe(404);
   });
+
+  it('ФИКС-РАУНД 1: ядро недоступно на /end при продолжении нити → mapCoreError (503), не 500 internal', async () => {
+    const { token, id: widgetId } = await seedWidget(pool, { allowedOrigins: [ORIGIN] });
+    const dialog = await insertDialog(pool, { widgetId, visitorKey: VISITOR });
+    await pool.query(
+      `UPDATE dialogs SET core_session_ids = '["sess_aaaaaaaaaaaaaaaa"]'::jsonb,
+              current_core_session_id = 'sess_aaaaaaaaaaaaaaaa', current_channel = 'chat', status = 'ended'
+        WHERE id = $1`, [dialog.id]);
+    // /end предыдущей сессии падает: ядро недоступно.
+    core.enqueue({ status: 503, body: { error: { code: 'core_unavailable', message: 'ядро не отвечает' } } });
+    const res = await app.inject({ method: 'POST', url: `/w/v1/${token}/dialogs`,
+      headers: { origin: ORIGIN }, payload: { visitor_key: VISITOR, dialog_id: dialog.id } });
+    expect(res.statusCode).toBe(503);
+    expect(res.json().error.code).toBe('core_unavailable');
+  });
 });
 
 describe('POST /w/v1/:token/dialogs/:id/reenter', () => {
@@ -221,6 +236,15 @@ describe('журнал, завершение и лид', () => {
     expect(res.statusCode).toBe(422);
   });
 
+  it('ФИКС-РАУНД 1: seq больше INT4 (2147483647) → 422 invalid_seq, не 500 (упало бы на INSERT в Postgres INTEGER)', async () => {
+    const { token } = await seedWidget(pool, { allowedOrigins: [ORIGIN] });
+    const id = await startDialog(token);
+    const res = await app.inject({ method: 'POST', url: `/w/v1/${token}/dialogs/${id}/messages`, headers: { origin: ORIGIN },
+      payload: { visitor_key: VISITOR, role: 'user', text: 'привет', seq: 2147483648 } });
+    expect(res.statusCode).toBe(422);
+    expect(res.json().error.code).toBe('invalid_seq');
+  });
+
   it('POST end закрывает сессию ядра и диалог', async () => {
     const { token } = await seedWidget(pool, { allowedOrigins: [ORIGIN] });
     const id = await startDialog(token);
@@ -229,6 +253,27 @@ describe('журнал, завершение и лид', () => {
     expect(res.statusCode).toBe(200);
     expect(core.calls.at(-1)!.url).toBe('/api/v1/sessions/sess_0123456789abcdef/end');
     expect((await findDialogById(pool, id))?.status).toBe('ended');
+  });
+
+  it('ФИКС-РАУНД 1: POST end — ядро недоступно → mapCoreError (503), не 500 internal', async () => {
+    const { token } = await seedWidget(pool, { allowedOrigins: [ORIGIN] });
+    const id = await startDialog(token);
+    core.enqueue({ status: 503, body: { error: { code: 'core_unavailable', message: 'ядро не отвечает' } } });
+    const res = await app.inject({ method: 'POST', url: `/w/v1/${token}/dialogs/${id}/end`, headers: { origin: ORIGIN }, payload: { visitor_key: VISITOR } });
+    expect(res.statusCode).toBe(503);
+    expect(res.json().error.code).toBe('core_unavailable');
+  });
+
+  it('ФИКС-РАУНД 1: POST lead — рейт-лимит режет спам задолго до сотни попыток (воспроизведено: 100 лидов на диалог)', async () => {
+    const { token } = await seedWidget(pool, { allowedOrigins: [ORIGIN] });
+    const id = await startDialog(token);
+    const statuses: number[] = [];
+    for (let i = 0; i < 15; i += 1) {
+      const res = await app.inject({ method: 'POST', url: `/w/v1/${token}/dialogs/${id}/lead`, headers: { origin: ORIGIN },
+        payload: { visitor_key: VISITOR, name: 'Пётр', phone: '+7 900 000-00-00', consent: true } });
+      statuses.push(res.statusCode);
+    }
+    expect(statuses.filter((s) => s === 429).length).toBeGreaterThan(0);
   });
 
   it('лид требует consent=true и хотя бы один контакт', async () => {
