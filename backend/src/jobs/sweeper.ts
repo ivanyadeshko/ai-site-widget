@@ -20,11 +20,56 @@ export async function sweepOnce(deps: AppDeps, opts: { staleMinutes: number; bat
   const stale = await listStaleActiveDialogs(deps.pool, opts.staleMinutes, opts.batch);
   let synced = 0;
   for (const dialog of stale) {
-    const sessionId = dialog.current_core_session_id;
-    if (!sessionId) continue;
+    const current = dialog.current_core_session_id;
+    if (!current) continue;
+
+    // ── #3 (whole-branch адверсарий, деньги): досинк ВСЕХ несведённых сессий ──
+    // нити, а не только «текущей». Эскалация финализирует chat-сессию S1 и
+    // переключает current на voice-сессию S2 (`endSession` возвращает void —
+    // деньги за S1 держатся ИСКЛЮЧИТЕЛЬНО на вебхуке `session.finalized`). Как
+    // только current съезжает на S2, прежний свипер S1 больше не видел вовсе:
+    // потеря вебхука S1 становилась невосстановимым money-leak за chat-часть
+    // КАЖДОЙ эскалированной нити. Теперь сводим деньги по любой сессии из
+    // core_session_ids, которой ещё нет в settled_session_ids (JSONB-разность).
+    // Текущую держим ОТДЕЛЬНО (ниже): по ней судим ещё и о живости диалога —
+    // статус закрываем только по её карточке.
+    const settledSet = new Set(dialog.settled_session_ids);
+    const owedPast = dialog.core_session_ids.filter((sid) => sid !== current && !settledSet.has(sid));
+    for (const sid of owedPast) {
+      let pastCard;
+      try {
+        pastCard = await deps.core.getSession(sid);
+      } catch (err) {
+        // Прошлую сессию не судим о живости диалога: её 404 не делает диалог
+        // зомби (текущая может быть жива), а транзиент — повод повторить на
+        // следующем проходе, не трогая статус. В обоих случаях идём дальше.
+        const status = err instanceof CoreHttpError ? err.status : undefined;
+        deps.log.warn(
+          { err, dialogId: dialog.id, sessionId: sid, status },
+          'свипер: досинк прошлой сессии нити не удался — пропускаем до следующего прохода',
+        );
+        continue;
+      }
+      if (!TERMINAL.has(pastCard.status)) continue;
+      // Идемпотентно по sessionId (гард settled_session_ids в applyFinalizedUsage):
+      // повторный settle уже сведённой сессии — no-op, деньги не двоятся.
+      const settled = await applyFinalizedUsage(deps.pool, {
+        dialogId: dialog.id,
+        sessionId: sid,
+        usage: (pastCard.usage_summary ?? {}) as Record<string, number>,
+        creditsTotal: pastCard.credits_total ?? 0,
+      });
+      if (settled) synced += 1;
+      deps.log.info(
+        { dialogId: dialog.id, sessionId: sid, settled },
+        'свипер досинхронил прошлую сессию эскалированной нити',
+      );
+    }
+
+    // ── Текущая сессия: и деньги, и статус диалога ──
     let card;
     try {
-      card = await deps.core.getSession(sessionId);
+      card = await deps.core.getSession(current);
     } catch (err) {
       if (err instanceof CoreHttpError && err.status === 404) {
         // ЗОМБИ (фикс-раунд 1, M1): ядро такой сессии не знает — ни сейчас, ни
@@ -36,7 +81,7 @@ export async function sweepOnce(deps: AppDeps, opts: { staleMinutes: number; bat
         // всё равно никогда не сойдётся, зато освободит выборку.
         await setDialogStatus(deps.pool, dialog.id, 'error');
         deps.log.error(
-          { dialogId: dialog.id, sessionId },
+          { dialogId: dialog.id, sessionId: current },
           'свипер: ядро не знает сессию диалога — терминализуем в error, деньги по ней уже не сойдутся',
         );
       } else {
@@ -45,7 +90,7 @@ export async function sweepOnce(deps: AppDeps, opts: { staleMinutes: number; bat
         // блокирует batch следующего прохода, но из-под свипера не исчезает.
         await touchDialog(deps.pool, dialog.id);
         deps.log.warn(
-          { err, dialogId: dialog.id, sessionId },
+          { err, dialogId: dialog.id, sessionId: current },
           'свипер: карточку сессии получить не удалось — диалог ротирован в хвост',
         );
       }
@@ -57,7 +102,7 @@ export async function sweepOnce(deps: AppDeps, opts: { staleMinutes: number; bat
     // моментом — тогда деньги уже учтены и второй раз не прибавятся.
     const settled = await applyFinalizedUsage(deps.pool, {
       dialogId: dialog.id,
-      sessionId,
+      sessionId: current,
       usage: (card.usage_summary ?? {}) as Record<string, number>,
       creditsTotal: card.credits_total ?? 0,
     });
@@ -68,7 +113,7 @@ export async function sweepOnce(deps: AppDeps, opts: { staleMinutes: number; bat
     // вебхуков теряется.
     if (settled) synced += 1;
     deps.log.info(
-      { dialogId: dialog.id, sessionId, status: card.status, settled },
+      { dialogId: dialog.id, sessionId: current, status: card.status, settled },
       'свипер досинхронил зависший диалог',
     );
   }

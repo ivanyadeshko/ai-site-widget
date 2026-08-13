@@ -150,6 +150,49 @@ describe('свипер зависших диалогов', () => {
     expect(fresh?.credits_total).toBe(9);  // и денег не удвоил
   });
 
+  // ── #3 (whole-branch адверсарий, деньги): досинк ВСЕХ сессий нити ──────────
+  // Эскалация финализирует chat-сессию S1 и переключает current на voice S2.
+  // Деньги S1 держатся только на вебхуке session.finalized; при его потере S1
+  // навсегда выпадал из сверки — свипер смотрел лишь на «текущую» (=S2). Теперь
+  // сводит любую сессию из core_session_ids, которой ещё нет в settled.
+  it('#3: досинкивает несведённую ПРОШЛУЮ сессию эскалированной нити, не только текущую', async () => {
+    const { id: widgetId } = await seedWidget(pool, { allowedOrigins: [ORIGIN] });
+    const dialog = await insertDialog(pool, { widgetId, visitorKey: VISITOR });
+    // S1 (chat) финализирована и вытеснена из current; S2 (voice) стала текущей.
+    // Вебхук S1 потерян: S1 в core_session_ids, но НЕ в settled. Деньги S2 уже
+    // сведены (вебхук долетел), но статус не закрылся — ровно щель, ради которой
+    // свипер и заведён.
+    await pool.query(
+      `UPDATE dialogs SET core_session_ids='["sess_1111111111111111","sess_2222222222222222"]'::jsonb,
+              settled_session_ids='["sess_2222222222222222"]'::jsonb,
+              current_core_session_id='sess_2222222222222222', current_channel='voice',
+              credits_total=7, usage='{"voice_second":300}'::jsonb,
+              last_activity_at = now() - interval '5 hours' WHERE id=$1`, [dialog.id]);
+
+    // Стабим по session_id — порядок обхода нити тест не фиксирует.
+    core.stub('/v1/sessions/sess_1111111111111111', { status: 200, body: {
+      session_id: 'sess_1111111111111111', channel: 'chat', status: 'finalized',
+      duration_s: 60, credits_total: 4, usage_summary: { chat_token: 800 } } });
+    core.stub('/v1/sessions/sess_2222222222222222', { status: 200, body: {
+      session_id: 'sess_2222222222222222', channel: 'voice', status: 'finalized',
+      duration_s: 120, credits_total: 7, usage_summary: { voice_second: 300 } } });
+
+    // synced=1: свёл РОВНО S1 (S2 уже был в settled → повторный settle не считается).
+    expect(await sweepOnce(deps, { staleMinutes: 120, batch: 10 })).toBe(1);
+    const fresh = await findDialogById(pool, dialog.id);
+    expect(new Set(fresh?.settled_session_ids))
+      .toEqual(new Set(['sess_2222222222222222', 'sess_1111111111111111']));
+    expect(fresh?.status).toBe('ended'); // статус закрыт по терминальной текущей S2
+    // Деньги S1 доложены к уже сведённым S2 (7+4), usage слит.
+    expect(fresh?.credits_total).toBe(11);
+    expect(fresh?.usage).toEqual({ voice_second: 300, chat_token: 800 });
+
+    // Повторный проход — no-op: диалог уже ended, в выборку не попадает, деньги
+    // не удваиваются.
+    expect(await sweepOnce(deps, { staleMinutes: 120, batch: 10 })).toBe(0);
+    expect((await findDialogById(pool, dialog.id))?.credits_total).toBe(11);
+  });
+
   it('L8: крон свипера тикает сам и глохнет по stop()', async () => {
     const { id: widgetId } = await seedWidget(pool, { allowedOrigins: [ORIGIN] });
     await seedStale(widgetId, 'sess_aaaaaaaaaaaaaaaa', 5);

@@ -116,8 +116,18 @@ export async function escalateDialog(deps: AppDeps, input: EscalateInput): Promi
     }
 
     // 4. Выжимка нити: continue_from нетранзитивен, «одна правда» у BFF.
+    // #8 (whole-branch адверсарий, PROMPT INJECTION): выжимка уезжает в
+    // agent.instructions новой voice-сессии — по контракту ядра это ПОЛНЫЙ
+    // системный промпт. Реплики ПОСЕТИТЕЛЯ берём при любом источнике (это всегда
+    // его слова — доверия к тому, что он их наговорил, эскалация не требует).
+    // Реплики АГЕНТА — ТОЛЬКО подтверждённые ядром (source='core'): POST
+    // /messages принимает от посетителя role='agent' (source='client'), и
+    // прежний фильтр `source==='client'` заводил такую ПОДДЕЛКУ в системный
+    // промпт как «память агента» (посетитель диктует «подтверди возврат»), а
+    // РЕАЛЬНО подтверждённые ответы (промоутнутые persistTranscript в 'core')
+    // — наоборот выбрасывал. Фильтр был перевёрнут ровно наизнанку.
     const thread: ThreadLine[] = (await listThreadTail(deps.pool, input.dialog.id, DIGEST_MAX_MESSAGES * 2))
-      .filter((m) => m.source === 'client')
+      .filter((m) => m.role === 'user' || (m.role === 'agent' && m.source === 'core'))
       .map((m) => ({ role: m.role, text: m.text }));
     const instructions = buildContinuationInstructions(
       input.widget.agent_config.instructions, thread, pending,
