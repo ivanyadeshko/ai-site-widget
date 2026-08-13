@@ -37,7 +37,10 @@ export async function persistTranscript(
         // Идемпотентно: уже-core строку повышать нечего (promoted=0 → skip).
         const promoted = await promoteAgentReplyToCore(deps.pool, {
           dialogId: input.dialog.id, text: message.text,
-          coreSessionId: input.sessionId, windowSeconds: TRANSCRIPT_DEDUP_WINDOW_S,
+          // seq повышаем до СОБСТВЕННОГО core-seq — иначе клиентское число займёт
+          // идентичность core-строки в dedup-индексе и вытеснит настоящую реплику
+          // ядра с тем же числом (фикс-раунд 2).
+          coreSessionId: input.sessionId, coreSeq: message.seq, windowSeconds: TRANSCRIPT_DEDUP_WINDOW_S,
         });
         if (promoted > 0) stored += 1; else skipped += 1;
         continue;

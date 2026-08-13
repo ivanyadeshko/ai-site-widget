@@ -90,6 +90,7 @@ describe('persistTranscript', () => {
     expect(rows).toHaveLength(1); // дубля НЕТ
     expect(rows[0]!.source).toBe('core'); // лейбл повышен ядром
     expect(rows[0]!.core_session_id).toBe('sess_0123456789abcdef');
+    expect(rows[0]!.seq).toBe(7); // ФИКС-РАУНД 2: seq повышен до СОБСТВЕННОГО core-seq (7), не остался клиентским (1)
 
     // Идемпотентность: повторный core-транскрипт не плодит дубль и не роняет лейбл.
     const again = await persistTranscript(app.deps, {
@@ -100,6 +101,32 @@ describe('persistTranscript', () => {
     const rows2 = await listThreadTail(pool, dialog.id, 50);
     expect(rows2).toHaveLength(1);
     expect(rows2[0]!.source).toBe('core');
+  });
+
+  it('ФИКС-РАУНД 2: промоут проставляет core-seq — независимая реплика ядра с тем же числом НЕ теряется', async () => {
+    const dialog = await makeDialog('sess_0123456789abcdef');
+    // Клиент оптимистично записал ответ агента "Hello" со СВОИМ seq=4.
+    await insertMessage(pool, {
+      dialogId: dialog.id, role: 'agent', text: 'Hello',
+      source: 'client', coreSessionId: null, seq: 4,
+    });
+    // Лента ядра: "Hello" со СВОИМ core-seq=1 (промоутится), И независимая "World"
+    // с core-seq=4 — то же число, что клиентский seq у "Hello". Без повышения seq
+    // промоут занял бы (core, sess, 4), а вставка "World" (core, sess, 4) молча
+    // дропнулась бы по dedup-индексу → перманентная потеря реальной реплики.
+    const result = await persistTranscript(app.deps, {
+      dialog, sessionId: 'sess_0123456789abcdef',
+      messages: [
+        { seq: 1, role: 'agent', text: 'Hello', created_at: '2026-08-13T10:00:00Z' },
+        { seq: 4, role: 'agent', text: 'World', created_at: '2026-08-13T10:00:05Z' },
+      ],
+    });
+    expect(result).toEqual({ fetched: 2, stored: 2, skipped: 0 }); // ОБЕ прошли
+    const rows = await listThreadTail(pool, dialog.id, 50);
+    expect(rows.map((r) => [r.text, r.source, r.seq])).toEqual([
+      ['Hello', 'core', 1], // повышен в СВОЙ core-seq=1 (не остался клиентским 4)
+      ['World', 'core', 4], // независимая реплика ядра сохранена, не съедена коллизией
+    ]);
   });
 });
 

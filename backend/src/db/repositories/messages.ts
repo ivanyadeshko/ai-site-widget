@@ -69,19 +69,45 @@ export async function maxClientSeq(db: Queryable, dialogId: string): Promise<num
  * ничего не трогает и дубля не плодит. Реплики ПОСЕТИТЕЛЯ (role=user) сюда не
  * попадают — там клиентская версия каноничнее (его точный ввод, не STT-догадка).
  * Возвращает число повышенных строк.
+ *
+ * ФИКС-РАУНД 2: повышаем И seq до СОБСТВЕННОГО core-seq реплики (coreSeq). Иначе
+ * промоутнутая строка сохраняла клиентский seq, а dedup-индекс
+ * (dialog_id, source, coalesce(core_session_id,''), seq) начинал считать это число
+ * идентичностью CORE-строки. Независимое, ещё не сохранённое core-сообщение той же
+ * сессии с собственным core-seq, случайно равным этому клиентскому числу (оба —
+ * маленькие целые), коллизило по индексу и `insertMessage ON CONFLICT DO NOTHING`
+ * дропал его НАВСЕГДА (reconcile тянет ленту с after_seq=0 каждый раз → дроп
+ * повторяется) — тихая перманентная потеря реальной реплики ядра.
+ *
+ * Повышаем РОВНО ОДНУ строку (LIMIT 1): одному core-сообщению соответствует один
+ * журнальный ряд, иначе два одинаковых client-текста слиплись бы в один core-seq
+ * прямо внутри UPDATE. Guard `NOT EXISTS(...)`: если целевая core-идентичность
+ * (source=core, эта сессия, этот seq) УЖЕ занята — это ровно та же реплика уже
+ * лежит как core, повышать нечего (no-op), а слепой UPDATE упал бы на уникальном
+ * индексе.
  */
 export async function promoteAgentReplyToCore(
   db: Queryable,
-  input: { dialogId: string; text: string; coreSessionId: string; windowSeconds: number },
+  input: { dialogId: string; text: string; coreSessionId: string; coreSeq: number; windowSeconds: number },
 ): Promise<number> {
   const { rowCount } = await db.query(
     `UPDATE dialog_messages
-        SET source = 'core', core_session_id = $3
-      WHERE dialog_id = $1 AND role = 'agent' AND source = 'client'
-        AND lower(btrim(regexp_replace(text, '\\s+', ' ', 'g')))
-            = lower(btrim(regexp_replace($2::text, '\\s+', ' ', 'g')))
-        AND created_at > now() - ($4 || ' seconds')::interval`,
-    [input.dialogId, input.text, input.coreSessionId, String(input.windowSeconds)],
+        SET source = 'core', core_session_id = $3, seq = $4
+      WHERE id = (
+              SELECT m.id FROM dialog_messages m
+               WHERE m.dialog_id = $1 AND m.role = 'agent' AND m.source = 'client'
+                 AND lower(btrim(regexp_replace(m.text, '\\s+', ' ', 'g')))
+                     = lower(btrim(regexp_replace($2::text, '\\s+', ' ', 'g')))
+                 AND m.created_at > now() - ($5 || ' seconds')::interval
+               ORDER BY m.id ASC
+               LIMIT 1
+            )
+        AND NOT EXISTS (
+              SELECT 1 FROM dialog_messages d2
+               WHERE d2.dialog_id = $1 AND d2.source = 'core'
+                 AND coalesce(d2.core_session_id, '') = $3 AND d2.seq = $4
+            )`,
+    [input.dialogId, input.text, input.coreSessionId, input.coreSeq, String(input.windowSeconds)],
   );
   return rowCount ?? 0;
 }
