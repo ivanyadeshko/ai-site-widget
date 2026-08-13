@@ -2,7 +2,6 @@
 import { computed, onMounted, onBeforeUnmount, ref } from 'vue';
 import ChatFeed from './components/ChatFeed.vue';
 import Composer from './components/Composer.vue';
-import StateBanner from './components/StateBanner.vue';
 import ResumeBanner from './components/ResumeBanner.vue';
 import VoicePanel from './components/VoicePanel.vue';
 import LeadForm from './components/LeadForm.vue';
@@ -26,7 +25,6 @@ const api = new WidgetApi(token);
 const bubbles = ref<Bubble[]>([]);
 const typing = ref(false);
 const phase = ref<DialogPhase>('chat');
-const pausedReason = ref('');
 const visitorKey = ref<string | null>(null);
 const dialogId = ref<string | null>(null);
 const seq = ref(1);                       // следующий номер журнала
@@ -35,6 +33,9 @@ const agentReplies = ref(0);
 const coreMessageCount = computed(() => userTextsSent.value + agentReplies.value);
 
 const micState = ref<MicState>('off');
+// Засов на асинхронное «Продолжить»: двойной клик по баннеру иначе заводил бы
+// ДВЕ сессии (два startDialog → две оплаченные continue_from).
+const resuming = ref(false);
 const lastErrorCode = ref<string | null>(null);
 // Голосовая сессия всегда идёт continue_from — только для неё шлём resume_welcome.
 const isContinuation = ref(false);
@@ -58,11 +59,21 @@ function startReadySender(): void {
 }
 
 // Агент вошёл (в т.ч. позже нас). client_ready — на любой вход. resume_welcome
-// повторяет ТОЛЬКО отсюда и только в продолжении: фрейм, ушедший до появления
-// агента, теряется безвозвратно (LiveKit data-фреймы не буферизуются).
+// повторяет ТОЛЬКО отсюда и только в голосовом продолжении: фрейм, ушедший до
+// появления агента, теряется безвозвратно (LiveKit data-фреймы не буферизуются).
+//
+// ФИКС-РАУНД 1 #4 (гонка взвода): room.connect() зовёт onAgentJoined СИНХРОННО из
+// цикла по уже присутствующим участникам — тогда phase ещё 'escalating' (voice
+// ставится ПОСЛЕ await connect+enableMic). Прежний гард `phase==='voice'` в этот
+// момент отбивал взвод повторяющего ресендера → оставался лишь одноразовый
+// resume_welcome (escalate()), который pv1 помечает «может быть молча проглочен в
+// окне инициализации» = немой аватар после continue_from. Условие теперь по
+// НЕтранзиентным признакам: продолжение (isContinuation, известно ДО connect) и
+// НЕ-чат (голос идёт как escalating→voice; в chat-продолжении resume_welcome —
+// pv1-noop, слать не нужно). Гашение по речи агента — welcomeResender.bump() (M3).
 function onAgentJoined(): void {
   startReadySender();
-  if (phase.value !== 'voice' || !isContinuation.value) return;
+  if (!isContinuation.value || phase.value === 'chat') return;
   welcomeResender?.stop();
   welcomeResender = createResender(() => room.publish({ type: 'resume_welcome' }), { intervalMs: 3000, maxAttempts: 5 });
   welcomeResender.start();
@@ -114,7 +125,6 @@ function handleFrame(frame: WorkerFrame): void {
     // прочее → конец. Решает FSM.
     typing.value = false;
     const reason = typeof frame.reason === 'string' ? frame.reason : '';
-    pausedReason.value = reason;
     phase.value = nextPhase(phase.value, { type: 'session_ended', reason });
     return;
   }
@@ -236,25 +246,25 @@ async function toggleMic(): Promise<void> {
   }
 }
 
-async function resume(): Promise<void> {
-  // «Продолжить» после паузы (StateBanner из T6): рвём прежнюю комнату и
-  // переоткрываем нить С dialog_id — на бэкенде это путь continue_from.
-  if (!visitorKey.value || !dialogId.value) return;
-  await room.disconnect();
-  const started = await api.startDialog(visitorKey.value, dialogId.value);
-  applyStart(started);
-}
-
+// ФИКС-РАУНД 1 #5: раньше в фазе paused рендерились ДВА баннера с двумя рабочими
+// кнопками «Продолжить» — T6 StateBanner (→resume()) и T7 ResumeBanner
+// (→resumeThread()). Оба делали ОДНО И ТО ЖЕ (continue_from той же нити), поэтому
+// StateBanner и resume() удалены: единственный путь продолжения — resumeThread.
 async function resumeThread(): Promise<void> {
   // «Продолжить» из ResumeBanner (paused / chat_fallback): новая сессия той же
   // нити (continue_from). Комнату рвём — chat_fallback уже без комнаты, пауза
   // могла оставить живую.
-  if (!visitorKey.value || !dialogId.value) return;
-  await room.disconnect();
-  const started = await api.startDialog(visitorKey.value, dialogId.value);
-  isContinuation.value = true;
-  phase.value = nextPhase(phase.value, { type: 'resume' });
-  applyStart(started);
+  if (resuming.value || !visitorKey.value || !dialogId.value) return;
+  resuming.value = true;
+  try {
+    await room.disconnect();
+    const started = await api.startDialog(visitorKey.value, dialogId.value);
+    isContinuation.value = true;
+    phase.value = nextPhase(phase.value, { type: 'resume' });
+    applyStart(started);
+  } finally {
+    resuming.value = false;
+  }
 }
 
 async function restart(): Promise<void> {
@@ -292,11 +302,11 @@ onBeforeUnmount(() => {
   <div class="widget">
     <ChatFeed :bubbles="bubbles" :typing="typing" />
     <VoicePanel v-if="phase === 'voice'" :mic-state="micState" @toggle-mic="toggleMic" />
-    <StateBanner v-if="phase === 'paused'" :reason="pausedReason" @continue="resume" />
     <ResumeBanner
       v-if="banner.text"
       :text="banner.text"
       :action="banner.action"
+      :busy="resuming"
       @resume="resumeThread"
       @restart="restart"
     />

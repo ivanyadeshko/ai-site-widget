@@ -57,6 +57,36 @@ export async function maxClientSeq(db: Queryable, dialogId: string): Promise<num
 }
 
 /**
+ * Повышает лейбл уже лежащей реплики АГЕНТА до source='core'. Клиент журналит
+ * ответ агента ПЕРВЫМ (оптимистично, source='client'), а подтверждённая копия
+ * из ленты ядра приезжает позже и совпадает по тексту — persistTranscript её
+ * дедупил ПРОЧЬ, и в витрине навсегда оставался client-лейбл. Из-за этого бейдж
+ * «⚠ не подтверждено ядром» ложно горел на КАЖДОМ ответе агента после reload —
+ * ровно противоположно замыслу (source нужен, чтобы ловить ПОДДЕЛКУ). Для реплик
+ * агента ядро авторитетнее: его копия ВЫТЕСНЯЕТ клиентский лейбл.
+ *
+ * Идемпотентно: обновляет только ещё client-строки, поэтому повторный core-синк
+ * ничего не трогает и дубля не плодит. Реплики ПОСЕТИТЕЛЯ (role=user) сюда не
+ * попадают — там клиентская версия каноничнее (его точный ввод, не STT-догадка).
+ * Возвращает число повышенных строк.
+ */
+export async function promoteAgentReplyToCore(
+  db: Queryable,
+  input: { dialogId: string; text: string; coreSessionId: string; windowSeconds: number },
+): Promise<number> {
+  const { rowCount } = await db.query(
+    `UPDATE dialog_messages
+        SET source = 'core', core_session_id = $3
+      WHERE dialog_id = $1 AND role = 'agent' AND source = 'client'
+        AND lower(btrim(regexp_replace(text, '\\s+', ' ', 'g')))
+            = lower(btrim(regexp_replace($2::text, '\\s+', ' ', 'g')))
+        AND created_at > now() - ($4 || ' seconds')::interval`,
+    [input.dialogId, input.text, input.coreSessionId, String(input.windowSeconds)],
+  );
+  return rowCount ?? 0;
+}
+
+/**
  * Есть ли уже в журнале такой текст этой роли в окне ±N секунд. Нужен на синке
  * транскрипта ядра: уникальный индекс ловит лишь повтор той же (source,seq)
  * пары, а одна и та же реплика приезжает ДВАЖДЫ разными путями — от клиента

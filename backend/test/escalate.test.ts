@@ -82,15 +82,19 @@ describe('POST /w/v1/:token/dialogs/:id/escalate', () => {
     expect(fresh?.status).toBe('active');
     expect(fresh?.current_channel).toBe('voice');
     expect(fresh?.core_session_ids).toEqual(['sess_aaaaaaaaaaaaaaaa', 'sess_bbbbbbbbbbbbbbbb']);
-    // ОТСТУПЛЕНИЕ ОТ БРИФА (факт, не вкус): бриф ждал ДВЕ строки source='core'
-    // на ленту из двух реплик — но `persistTranscript` (T2) намеренно дедупит
-    // ленту против журнала клиента по тексту+роли в окне 900с, иначе посетитель
-    // увидел бы каждую свою реплику дважды. Обе реплики ленты клиент уже
-    // записал сам → в журнал ложится РОВНО ОДНА новая, известная только ядру.
+    // ФИКС-РАУНД 1 (#1): дедуп ленты против журнала клиента расходится по роли.
+    // Реплики АГЕНТА, которые клиент записал оптимистично (source=client), лента
+    // ядра ПОВЫШАЕТ до source='core' — ядро авторитетнее для реплик агента (иначе
+    // бейдж «не подтверждено» ложно горит на каждом ответе после reload). Реплику
+    // ПОСЕТИТЕЛЯ оставляем клиентской (его точный ввод каноничнее STT-догадки).
+    // Задвоения по-прежнему нет: повышение — это UPDATE той же строки, не вставка.
     const thread = await listThreadTail(pool, id, 50);
     const fromCore = thread.filter((m) => m.source === 'core');
-    expect(fromCore).toHaveLength(1);
-    expect(fromCore[0]!.text).toBe('Чем могу помочь?');
+    // Оба ответа агента теперь core: свой (повышен) + известный только ядру (вставлен).
+    expect(fromCore.map((m) => m.text)).toEqual(['Здравствуйте, Пётр!', 'Чем могу помочь?']);
+    // Реплика посетителя осталась клиентской.
+    expect(thread.filter((m) => m.role === 'user').map((m) => [m.text, m.source]))
+      .toEqual([['Меня зовут Пётр', 'client']]);
     // И дедуп сработал: эхо ленты не задвоило уже записанные реплики.
     expect(thread.filter((m) => m.text === 'Меня зовут Пётр')).toHaveLength(1);
     expect(thread.filter((m) => m.text === 'Здравствуйте, Пётр!')).toHaveLength(1);

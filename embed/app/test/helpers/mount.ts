@@ -57,6 +57,10 @@ const shared = vi.hoisted(() => ({
   configResult: null as unknown,
   startResult: null as unknown,
   escalateCtl: null as null | EscalateCtl,
+  // Симуляция «агент УЖЕ в комнате к моменту connect»: реальный room.connect зовёт
+  // onAgentJoined синхронно из цикла по присутствующим участникам (room.ts) —
+  // именно так воспроизводится гонка взвода resume_welcome (фикс-раунд 1 #4).
+  agentJoinsOnConnect: false,
 }));
 
 // Комнату мокаем целиком: живой LiveKit в юнит-тесте недоступен. publish
@@ -65,7 +69,11 @@ const shared = vi.hoisted(() => ({
 // голосовой фазе не тащит client_ready прежней чат-комнаты.
 vi.mock('../../src/lib/room.ts', () => ({
   CoreRoom: class {
-    connect = vi.fn(async () => {});
+    connect = vi.fn(async () => {
+      // Агент уже в комнате → onAgentJoined приходит СИНХРОННО в connect (как в
+      // room.ts), пока фаза ещё не 'voice'. Иначе бы гонка #4 не воспроизводилась.
+      if (shared.agentJoinsOnConnect) shared.handlers?.onAgentJoined();
+    });
     setMicrophoneEnabled = vi.fn(async () => {});
     disconnect = vi.fn(async () => { shared.sent.length = 0; });
     publish = (frame: ClientFrame): void => { shared.sent.push(frame); };
@@ -151,6 +159,7 @@ afterEach(() => {
 export type MountOptions = {
   startResult?: Record<string, unknown>;
   dialogId?: string | null;
+  agentJoinsOnConnect?: boolean;
 };
 
 export type MountedRoom = {
@@ -182,6 +191,7 @@ export async function mountWidget(opts: MountOptions = {}): Promise<{
 }> {
   shared.sent.length = 0;
   shared.escalateCtl = null;
+  shared.agentJoinsOnConnect = opts.agentJoinsOnConnect ?? false;
   shared.configResult = defaultConfig();
   shared.startResult = { ...defaultStart(), ...opts.startResult };
 

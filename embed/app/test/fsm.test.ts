@@ -52,6 +52,8 @@ describe('FSM диалога', () => {
 
   it('баннеры: пауза даёт кнопку «Продолжить», 402 — рестарта нет', () => {
     expect(bannerFor('paused')).toEqual({ text: 'Диалог приостановлен', action: 'resume' });
+    // Терминальный конец: текст есть, кнопки продолжения НЕТ.
+    expect(bannerFor('ended')).toEqual({ text: 'Диалог завершён', action: 'none' });
     expect(bannerFor('error', 'insufficient_credits').action).toBe('none');
     expect(bannerFor('error', 'insufficient_credits').text).toContain('лимит');
     expect(bannerFor('chat_fallback').action).toBe('resume');

@@ -87,25 +87,51 @@ describe('источник реплики', () => {
   });
 });
 
-// ДЕВИАЦИЯ-ДОПОЛНЕНИЕ: Step 4 брифа дал App.vue как «чат-часть» без session_ended,
-// но StateBanner.vue — в списке файлов T6, а «session_ended{reason:silence} →
-// баннер + Продолжить (continue_from)» бриф-задание помечает критичной
-// обязанностью клиента. Тест закрепляет её и сам StateBanner.
+// Критичная обязанность клиента T6: «session_ended{reason:silence} → баннер +
+// Продолжить (continue_from)». ФИКС-РАУНД 1 #5: единственный баннер паузы теперь
+// ResumeBanner (T7) — data-test=resume-banner / кнопка resume; T6 StateBanner и
+// resume() удалены (двойная кнопка «Продолжить» на паузе). Контракт согласован с
+// escalationFlow.test (тоже ждёт [data-test=resume]).
 describe('пауза диалога (session_ended)', () => {
   it('баннер паузы, композер выключен, «Продолжить» переоткрывает нить с dialog_id (continue_from)', async () => {
     const { wrapper, api, room } = await mountWidget();
     room.emitFrame({ type: 'session_ended', reason: 'silence' });
     await wrapper.vm.$nextTick();
 
-    expect(wrapper.find('[data-test=state-banner]').exists()).toBe(true);
+    expect(wrapper.find('[data-test=resume-banner]').exists()).toBe(true);
+    expect(wrapper.text()).toContain('Диалог приостановлен');
     expect(wrapper.find('textarea').attributes('disabled')).toBeDefined();
 
-    await wrapper.find('[data-test=continue]').trigger('click');
+    await wrapper.find('[data-test=resume]').trigger('click');
     await flushPromises();
 
     // Повторный startDialog С dialog_id — это путь continue_from ядра.
     expect(api.startDialog).toHaveBeenCalledWith(expect.any(String), 'd1');
     expect(room.disconnect).toHaveBeenCalled();
-    expect(wrapper.find('[data-test=state-banner]').exists()).toBe(false); // фаза вернулась в chat
+    // Пауза-баннер исчез: фаза вернулась в chat (bannerFor('chat') пуст).
+    expect(wrapper.find('[data-test=resume]').exists()).toBe(false);
+  });
+
+  // ФИКС-РАУНД 1 #2: терминальный reason (не silence) — конец, а не пауза.
+  it('терминальный reason → «Диалог завершён» БЕЗ кнопки «Продолжить»', async () => {
+    const { wrapper, room } = await mountWidget();
+    room.emitFrame({ type: 'session_ended', reason: 'completed' });
+    await wrapper.vm.$nextTick();
+    expect(wrapper.text()).toContain('Диалог завершён');
+    expect(wrapper.find('[data-test=resume]').exists()).toBe(false); // продолжать нечего
+  });
+
+  // ФИКС-РАУНД 1 #3: двойной клик «Продолжить» не заводит две сессии.
+  it('двойной клик «Продолжить» заводит РОВНО одну сессию (guard)', async () => {
+    const { wrapper, api, room } = await mountWidget();
+    room.emitFrame({ type: 'session_ended', reason: 'silence' });
+    await wrapper.vm.$nextTick();
+    const before = api.startDialog.mock.calls.length;
+    const btn = wrapper.find('[data-test=resume]'); // ResumeBanner «Продолжить» → resumeThread
+    btn.trigger('click');
+    btn.trigger('click'); // второй клик подряд, до разрешения первого
+    await flushPromises();
+    expect(api.startDialog.mock.calls.length - before).toBe(1);
+    expect(room.disconnect).toHaveBeenCalledTimes(1);
   });
 });

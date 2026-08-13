@@ -39,6 +39,10 @@ export function nextPhase(phase: DialogPhase, event: DialogEvent): DialogPhase {
 
 export function bannerFor(phase: DialogPhase, code?: string): { text: string; action: 'resume' | 'restart' | 'none' } {
   if (phase === 'paused') return { text: 'Диалог приостановлен', action: 'resume' };
+  // Терминальный конец (session_ended с любым НЕ-silence reason: completed,
+  // duration_limit, …) — нить закрыта штатно, продолжать нечего: только текст,
+  // БЕЗ «Продолжить» (иначе кнопка подняла бы платную continue_from на мёртвой нити).
+  if (phase === 'ended') return { text: 'Диалог завершён', action: 'none' };
   if (phase === 'chat_fallback') return { text: 'Голосовая связь сейчас недоступна — продолжим текстом', action: 'resume' };
   if (phase === 'escalating') return { text: 'Соединяю с голосом…', action: 'none' };
   if (phase === 'error') {

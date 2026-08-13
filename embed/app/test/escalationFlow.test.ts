@@ -59,6 +59,22 @@ describe('эскалация в голос', () => {
     vi.useRealTimers();
   });
 
+  it('#4 гонка взвода: агент УЖЕ в комнате на voice-connect (phase=escalating) — повторяющий resume_welcome ВСЁ РАВНО взводится', async () => {
+    vi.useFakeTimers();
+    // agentJoinsOnConnect → onAgentJoined приходит СИНХРОННО внутри room.connect,
+    // когда phase ещё 'escalating' (voice ставится ПОСЛЕ await connect+enableMic).
+    const { wrapper, api, sent } = await mountWidget({ agentJoinsOnConnect: true });
+    await wrapper.find('[data-test=escalate]').trigger('click');
+    await api.resolveEscalate(VOICE_OK);
+    // Взвёлся именно ПОВТОРЯЮЩИЙ ресендер, а не только одноразовый resume_welcome:
+    // за 9с должно прилететь ещё как минимум пара тиков.
+    const before = sent.filter((f) => f.type === 'resume_welcome').length;
+    vi.advanceTimersByTime(9000);
+    const after = sent.filter((f) => f.type === 'resume_welcome').length;
+    expect(after - before).toBeGreaterThanOrEqual(2);
+    vi.useRealTimers();
+  });
+
   it('гасится РЕЧЬЮ агента, а не любым кадром: pong/session_timer ничего не доказывают', async () => {
     vi.useFakeTimers();
     const { wrapper, api, room, sent } = await mountWidget();

@@ -73,6 +73,34 @@ describe('persistTranscript', () => {
     expect(rows).toHaveLength(1); // задвоения нет
     expect(rows[0]!.source).toBe('client'); // осталась клиентская версия
   });
+
+  it('ответ АГЕНТА, записанный клиентом, ПОВЫШАЕТСЯ до source=core лентой ядра (не остаётся client)', async () => {
+    const dialog = await makeDialog('sess_0123456789abcdef');
+    // Клиент оптимистично записал ответ агента своим путём (source=client).
+    await insertMessage(pool, {
+      dialogId: dialog.id, role: 'agent', text: 'Здравствуйте!',
+      source: 'client', coreSessionId: null, seq: 1,
+    });
+    const result = await persistTranscript(app.deps, {
+      dialog, sessionId: 'sess_0123456789abcdef',
+      messages: [{ seq: 7, role: 'agent', text: 'Здравствуйте!', created_at: '2026-08-13T10:00:05Z' }],
+    });
+    expect(result).toEqual({ fetched: 1, stored: 1, skipped: 0 }); // повышение = «сложили в core»
+    const rows = await listThreadTail(pool, dialog.id, 50);
+    expect(rows).toHaveLength(1); // дубля НЕТ
+    expect(rows[0]!.source).toBe('core'); // лейбл повышен ядром
+    expect(rows[0]!.core_session_id).toBe('sess_0123456789abcdef');
+
+    // Идемпотентность: повторный core-транскрипт не плодит дубль и не роняет лейбл.
+    const again = await persistTranscript(app.deps, {
+      dialog, sessionId: 'sess_0123456789abcdef',
+      messages: [{ seq: 7, role: 'agent', text: 'Здравствуйте!', created_at: '2026-08-13T10:00:05Z' }],
+    });
+    expect(again).toEqual({ fetched: 1, stored: 0, skipped: 1 }); // уже core — повышать нечего
+    const rows2 = await listThreadTail(pool, dialog.id, 50);
+    expect(rows2).toHaveLength(1);
+    expect(rows2[0]!.source).toBe('core');
+  });
 });
 
 describe('reconcileTranscript', () => {

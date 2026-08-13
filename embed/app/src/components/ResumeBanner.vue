@@ -3,7 +3,9 @@
 //   action='resume'  → «Продолжить» (paused / chat_fallback) — новая сессия нити;
 //   action='restart' → «Начать заново» (диалог устарел) — новый диалог;
 //   action='none'    → только текст (escalating «Соединяю…», 402-лимит).
-defineProps<{ text: string; action: 'resume' | 'restart' | 'none' }>();
+// busy — на время асинхронного resume/restart кнопка гаснет (двойной клик иначе
+// заводит две сессии). Функциональный гард — в App; здесь только UX-дизейбл.
+withDefaults(defineProps<{ text: string; action: 'resume' | 'restart' | 'none'; busy?: boolean }>(), { busy: false });
 const emit = defineEmits<{ resume: []; restart: [] }>();
 </script>
 
@@ -15,6 +17,7 @@ const emit = defineEmits<{ resume: []; restart: [] }>();
       type="button"
       class="rbanner__btn"
       data-test="resume"
+      :disabled="busy"
       @click="emit('resume')"
     >
       Продолжить
@@ -24,6 +27,7 @@ const emit = defineEmits<{ resume: []; restart: [] }>();
       type="button"
       class="rbanner__btn"
       data-test="restart"
+      :disabled="busy"
       @click="emit('restart')"
     >
       Начать заново

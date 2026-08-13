@@ -1,7 +1,7 @@
 import type { AppDeps } from '../app.ts';
 import type { TranscriptMessage } from '../core/types.ts';
 import type { DialogRow } from '../db/repositories/dialogs.ts';
-import { hasSimilarMessage, insertMessage } from '../db/repositories/messages.ts';
+import { hasSimilarMessage, insertMessage, promoteAgentReplyToCore } from '../db/repositories/messages.ts';
 
 /** Окно, в котором реплика из ленты ядра считается той же, что уже в журнале. */
 export const TRANSCRIPT_DEDUP_WINDOW_S = 900;
@@ -12,8 +12,12 @@ export type SyncResult = { fetched: number; stored: number; skipped: number };
  * Положить ленту ядра в журнал БЕЗ дублей. Уникальный индекс тут бессилен: одна
  * и та же реплика приезжает двумя путями с разными ключами — от клиента
  * (source='client', его seq) и из ленты (source='core', seq ядра), — поэтому
- * дедупим по тексту+роли в окне. Витрина склеивается, а source остаётся, чтобы
- * на разборе инцидента было видно, кто что принёс.
+ * дедупим по тексту+роли в окне.
+ *
+ * При совпадении расходимся по роли: реплику ПОСЕТИТЕЛЯ оставляем клиентской
+ * (его точный ввод каноничнее STT-догадки ядра), а реплику АГЕНТА ПОВЫШАЕМ до
+ * source='core' — подтверждённая копия ядра вытесняет оптимистичный client-лейбл
+ * (иначе бейдж «не подтверждено» ложно горит на каждом ответе после reload).
  */
 export async function persistTranscript(
   deps: AppDeps,
@@ -26,6 +30,19 @@ export async function persistTranscript(
     if (await hasSimilarMessage(deps.pool, {
       dialogId: input.dialog.id, role, text: message.text, windowSeconds: TRANSCRIPT_DEDUP_WINDOW_S,
     })) {
+      if (role === 'agent') {
+        // Ядро авторитетнее для реплик АГЕНТА: клиент записал ответ ПЕРВЫМ
+        // (source=client), лента ядра ВЫТЕСНЯЕТ этот лейбл на 'core'. Иначе
+        // бейдж «не подтверждено» ложно горел бы на каждом ответе после reload.
+        // Идемпотентно: уже-core строку повышать нечего (promoted=0 → skip).
+        const promoted = await promoteAgentReplyToCore(deps.pool, {
+          dialogId: input.dialog.id, text: message.text,
+          coreSessionId: input.sessionId, windowSeconds: TRANSCRIPT_DEDUP_WINDOW_S,
+        });
+        if (promoted > 0) stored += 1; else skipped += 1;
+        continue;
+      }
+      // Реплика ПОСЕТИТЕЛЯ: клиентская версия каноничнее (точный ввод) — оставляем.
       skipped += 1;
       continue;
     }
