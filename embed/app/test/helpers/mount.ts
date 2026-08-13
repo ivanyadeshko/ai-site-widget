@@ -56,6 +56,8 @@ const shared = vi.hoisted(() => ({
   },
   configResult: null as unknown,
   startResult: null as unknown,
+  // Задать → первичный startDialog реджектит им (проверка ошибок открытия нити).
+  startError: null as unknown,
   escalateCtl: null as null | EscalateCtl,
   // Симуляция «агент УЖЕ в комнате к моменту connect»: реальный room.connect зовёт
   // onAgentJoined синхронно из цикла по присутствующим участникам (room.ts) —
@@ -90,7 +92,7 @@ vi.mock('../../src/lib/room.ts', () => ({
 vi.mock('../../src/lib/api.ts', () => ({
   WidgetApi: class {
     config = vi.fn(async () => shared.configResult);
-    startDialog = vi.fn(async () => shared.startResult);
+    startDialog = vi.fn(async () => { if (shared.startError) throw shared.startError; return shared.startResult; });
     reenter = vi.fn(async () => shared.startResult);
     journal = vi.fn(async () => ({ stored: true }));
     end = vi.fn(async () => ({ dialog_id: 'd1', status: 'ended' }));
@@ -160,6 +162,7 @@ export type MountOptions = {
   startResult?: Record<string, unknown>;
   dialogId?: string | null;
   agentJoinsOnConnect?: boolean;
+  startError?: { status: number; code: string; message: string };
 };
 
 export type MountedRoom = {
@@ -192,6 +195,7 @@ export async function mountWidget(opts: MountOptions = {}): Promise<{
   shared.sent.length = 0;
   shared.escalateCtl = null;
   shared.agentJoinsOnConnect = opts.agentJoinsOnConnect ?? false;
+  shared.startError = opts.startError ?? null;
   shared.configResult = defaultConfig();
   shared.startResult = { ...defaultStart(), ...opts.startResult };
 

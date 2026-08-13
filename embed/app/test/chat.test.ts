@@ -135,3 +135,39 @@ describe('пауза диалога (session_ended)', () => {
     expect(room.disconnect).toHaveBeenCalledTimes(1);
   });
 });
+
+// ФИКС whole-branch #1: провал ПЕРВИЧНОГО открытия нити (startDialog) должен вести
+// в error-фазу с понятным баннером, а не оставлять активный пустой чат (send()
+// публиковал бы user_text в null-комнату — молчаливый дроп). §5 спеки.
+describe('провал открытия диалога', () => {
+  it('402 на первичном startDialog → error-баннер про лимит, композер выключен (НЕ пустой чат)', async () => {
+    const { wrapper } = await mountWidget({ startError: { status: 402, code: 'insufficient_credits', message: 'нет средств' } });
+    expect(wrapper.text()).toContain('лимит');                                   // баннер лимита
+    expect(wrapper.find('textarea').attributes('disabled')).toBeDefined();       // композер выключен
+    expect(wrapper.find('[data-test=escalate]').exists()).toBe(false);           // не chat-фаза
+  });
+
+  it('503 на первичном startDialog → error-баннер «сервис недоступен, позже»', async () => {
+    const { wrapper } = await mountWidget({ startError: { status: 503, code: 'service_unavailable', message: 'позже' } });
+    expect(wrapper.text()).toContain('недоступен');
+    expect(wrapper.find('textarea').attributes('disabled')).toBeDefined();
+  });
+
+  // LOW #3: у restart не было засова resuming — двойной клик = 2 платных startDialog.
+  it('двойной клик «Начать заново» → ровно один startDialog (засов restart)', async () => {
+    const { wrapper, api } = await mountWidget({ startError: { status: 404, code: 'dialog_not_found', message: 'нет' } });
+    expect(wrapper.find('[data-test=restart]').exists()).toBe(true);             // error с действием restart
+    // Дальше рестарт должен пройти — снимаем ошибку у мока.
+    api.startDialog.mockResolvedValue({
+      dialog_id: 'd1', channel: 'chat',
+      participant_token: { token: 't', identity: 'i', livekit_url: 'wss://x', expires_at: '' },
+      messages: [], next_seq: 1,
+    });
+    const before = api.startDialog.mock.calls.length;
+    const btn = wrapper.find('[data-test=restart]');
+    btn.trigger('click');
+    btn.trigger('click');
+    await flushPromises();
+    expect(api.startDialog.mock.calls.length - before).toBe(1);
+  });
+});

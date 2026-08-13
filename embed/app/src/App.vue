@@ -147,12 +147,33 @@ function handleFrame(frame: WorkerFrame): void {
   void api.journal(dialogId.value!, visitorKey.value!, 'agent', t.text, seq.value++);
 }
 
+// Провал обращения к ядру → фаза error + понятный баннер. Разбор по статусу тот
+// же, что escalate-ветка, но исход другой: на ВХОДЕ откатываться в чат некуда
+// (диалог не открылся), поэтому 402/503/прочее → 'error' (fatal), а не
+// chat_fallback. Бэкенд к этому моменту уже пометил диалог error.
+function failWithCoreError(err: unknown): void {
+  const status = (err as ApiFailure).status;
+  lastErrorCode.value = status === 402 ? 'insufficient_credits'
+    : status === 503 ? 'service_unavailable'
+    : ((err as ApiFailure).code ?? null);
+  phase.value = nextPhase(phase.value, { type: 'fatal', code: lastErrorCode.value ?? 'open_failed' });
+}
+
 async function openThread(key: string, saved: string | null): Promise<void> {
   visitorKey.value = key;
-  const started: StartDialogResult | ReenterResult = saved
-    ? await api.reenter(saved, key).catch(() => api.startDialog(key, saved))
-    : await api.startDialog(key);
-  applyStart(started);
+  try {
+    // ФИКС whole-branch #1: раньше catch стоял ТОЛЬКО на fallback reenter→startDialog.
+    // Если падал сам первичный startDialog (402 при малом балансе тенанта — штатное
+    // состояние дев-предохранителя! — или 503), промис реджектился необработанным
+    // (void openThread): фаза оставалась 'chat', композер активен, а send()
+    // публиковал user_text в null-комнату (молчаливый дроп). §5: 402→error, 503→«позже».
+    const started: StartDialogResult | ReenterResult = saved
+      ? await api.reenter(saved, key).catch(() => api.startDialog(key, saved))
+      : await api.startDialog(key);
+    applyStart(started);
+  } catch (err) {
+    failWithCoreError(err);
+  }
 }
 
 function applyStart(started: {
@@ -269,11 +290,19 @@ async function resumeThread(): Promise<void> {
 
 async function restart(): Promise<void> {
   // Диалог устарел — заводим НОВЫЙ (без dialog_id) и сбрасываем сохранённую нить.
-  if (!visitorKey.value) return;
-  await room.disconnect();
-  const started = await api.startDialog(visitorKey.value);
-  bridge.sendState(visitorKey.value, null);
-  applyStart(started);
+  // ФИКС whole-branch #3: тот же засов, что в resumeThread. ResumeBanner дизейблит
+  // кнопку по :busy=resuming, но restart его не ставил → двойной клик = 2 платных
+  // startDialog. try/finally восстанавливает засов даже на ошибке.
+  if (resuming.value || !visitorKey.value) return;
+  resuming.value = true;
+  try {
+    await room.disconnect();
+    const started = await api.startDialog(visitorKey.value);
+    bridge.sendState(visitorKey.value, null);
+    applyStart(started);
+  } finally {
+    resuming.value = false;
+  }
 }
 
 async function submitLead(payload: LeadFields): Promise<void> {
