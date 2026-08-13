@@ -1,17 +1,24 @@
-import { Room, RoomEvent, type RemoteParticipant } from 'livekit-client';
+import { Room, RoomEvent, type RemoteParticipant, type RemoteTrack, type RemoteTrackPublication } from 'livekit-client';
 import { encodeClientFrame, parseWorkerFrame, type ClientFrame, type WorkerFrame } from './frames.ts';
+
+// Подписка/публикация трека НЕ решаются здесь: решение (гасить видео, прикреплять
+// аудио) принимает App через onPublication/onTrack. Так его видно в юнит-тестах,
+// где комната замокана и реальные RoomEvent'ы не летят.
+export type CorePublication = { kind: string; setSubscribed(subscribed: boolean): void };
+export type CoreTrack = { kind: string; attach(): HTMLMediaElement };
+
+export type CoreRoomHandlers = {
+  onFrame: (frame: WorkerFrame) => void;
+  onAgentJoined: () => void;
+  onDisconnected: () => void;
+  onPublication?: (pub: CorePublication) => void;
+  onTrack?: (track: CoreTrack) => void;
+};
 
 export class CoreRoom {
   private room: Room | null = null;
-  private readonly audio = new Set<HTMLMediaElement>();
 
-  constructor(
-    private readonly handlers: {
-      onFrame: (frame: WorkerFrame) => void;
-      onAgentJoined: () => void;
-      onDisconnected: () => void;
-    },
-  ) {}
+  constructor(private readonly handlers: CoreRoomHandlers) {}
 
   async connect(url: string, token: string, opts: { audio: boolean }): Promise<void> {
     const room = new Room();
@@ -25,17 +32,11 @@ export class CoreRoom {
     });
     room.on(RoomEvent.Disconnected, () => this.handlers.onDisconnected());
     if (opts.audio) {
-      room.on(RoomEvent.TrackSubscribed, (track) => {
-        // Подписка ≠ воспроизведение: без attach() голос молчит (урок монолита).
-        if (track.kind !== 'audio') { void track; return; }
-        const element = track.attach();
-        element.autoplay = true;
-        document.body.appendChild(element);
-        this.audio.add(element);
-      });
-      room.on(RoomEvent.TrackUnsubscribed, (track) => {
-        for (const element of track.detach()) { element.remove(); this.audio.delete(element); }
-      });
+      // Публикацию/трек не трогаем сами — отдаём App: он гасит видео и
+      // прикрепляет аудио. UI аудио-only, «просто не рисовать» видео мало —
+      // подписка живёт и трафик оплачивается, пока её не снять.
+      room.on(RoomEvent.TrackPublished, (pub: RemoteTrackPublication) => this.handlers.onPublication?.(pub));
+      room.on(RoomEvent.TrackSubscribed, (track: RemoteTrack) => this.handlers.onTrack?.(track));
     }
     await room.connect(url, token);
     // Агент мог войти РАНЬШЕ нас — событие для него не придёт.
@@ -57,8 +58,6 @@ export class CoreRoom {
   }
 
   async disconnect(): Promise<void> {
-    for (const element of this.audio) element.remove();
-    this.audio.clear();
     await this.room?.disconnect();
     this.room = null;
   }

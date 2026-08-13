@@ -3,54 +3,96 @@ import { computed, onMounted, onBeforeUnmount, ref } from 'vue';
 import ChatFeed from './components/ChatFeed.vue';
 import Composer from './components/Composer.vue';
 import StateBanner from './components/StateBanner.vue';
-import { WidgetApi, type ParticipantToken, type ReenterResult, type StartDialogResult } from './lib/api.ts';
+import ResumeBanner from './components/ResumeBanner.vue';
+import VoicePanel from './components/VoicePanel.vue';
+import LeadForm from './components/LeadForm.vue';
+import { WidgetApi, type ApiFailure, type ParticipantToken, type ReenterResult, type StartDialogResult } from './lib/api.ts';
 import { createBridge } from './lib/bridge.ts';
 import { createEchoGuard } from './lib/echoGuard.ts';
 import { createResender } from './lib/resender.ts';
-import { CoreRoom } from './lib/room.ts';
+import { CoreRoom, type CorePublication, type CoreTrack } from './lib/room.ts';
+import { bannerFor, nextPhase, type DialogPhase } from './lib/fsm.ts';
 import type { WorkerFrame } from './lib/frames.ts';
 
 // source: 'client' — реплика отрисована ОПТИМИСТИЧНО самим iframe (наш ввод);
 // 'core' — пришла транскриптом от ядра/воркера (подтверждена). Показываем в
 // пузыре, иначе подделанную реплику аватара из журнала не отличить (ревью T3).
 type Bubble = { id: string; role: 'user' | 'agent'; text: string; source: 'client' | 'core' };
-
-// Заготовка FSM: chat → paused (session_ended) сегодня; escalating/voice достроит
-// T7 поверх этого же ref, не переписывая ветвление chat.
-type Phase = 'chat' | 'paused' | 'escalating';
+type MicState = 'off' | 'requesting' | 'on' | 'denied' | 'failed';
+type LeadFields = { name: string; phone: string; email: string; comment: string; consent: boolean };
 
 const token = (document.getElementById('app')!.dataset.widgetToken ?? '');
 const api = new WidgetApi(token);
 const bubbles = ref<Bubble[]>([]);
 const typing = ref(false);
-const phase = ref<Phase>('chat');
+const phase = ref<DialogPhase>('chat');
 const pausedReason = ref('');
 const visitorKey = ref<string | null>(null);
 const dialogId = ref<string | null>(null);
 const seq = ref(1);                       // следующий номер журнала
-const userTextsSent = ref(0);             // для messages_count эскалации (T7)
+const userTextsSent = ref(0);             // для messages_count эскалации
 const agentReplies = ref(0);
 const coreMessageCount = computed(() => userTextsSent.value + agentReplies.value);
 
+const micState = ref<MicState>('off');
+const lastErrorCode = ref<string | null>(null);
+// Голосовая сессия всегда идёт continue_from — только для неё шлём resume_welcome.
+const isContinuation = ref(false);
+const leadOpen = ref(false);
+
+// Баннер FSM-фаз: единый источник текста/действия для ResumeBanner.
+const banner = computed(() => bannerFor(phase.value, lastErrorCode.value ?? undefined));
+
 const echo = createEchoGuard({ windowMs: 30_000, now: () => Date.now() });
 let readyResender: ReturnType<typeof createResender> | null = null;
+let welcomeResender: ReturnType<typeof createResender> | null = null;
+const voiceAudio: HTMLMediaElement[] = [];
 
-// ДЕВИАЦИЯ от буквы брифа: бриф давал `onAgentJoined: () => readyResender?.start()`,
-// но `createResender.start()` идемпотентен (`if (timer !== null) return`) — уже
-// запущенный ресендер на повторный start() не шлёт НИЧЕГО, и «поздний вход
-// агента» не давал бы немедленного пере-client_ready (тест это ловит). Правильный
-// приём — пере-СОЗДАТЬ ресендер: он шлёт фрейм сразу и заново тикает. Тот же
-// хелпер зовём и из connect, и из onAgentJoined.
+// createResender.start() идемпотентен: уже запущенный на повторный start() молчит.
+// Поэтому «поздний вход агента» требует ПЕРЕ-создания — шлём client_ready сразу
+// и заново тикаем. Тот же хелпер зовём из connect и из onAgentJoined.
 function startReadySender(): void {
   readyResender?.stop();
   readyResender = createResender(() => room.publish({ type: 'client_ready' }), { intervalMs: 3000, maxAttempts: 20 });
   readyResender.start();
 }
 
+// Агент вошёл (в т.ч. позже нас). client_ready — на любой вход. resume_welcome
+// повторяет ТОЛЬКО отсюда и только в продолжении: фрейм, ушедший до появления
+// агента, теряется безвозвратно (LiveKit data-фреймы не буферизуются).
+function onAgentJoined(): void {
+  startReadySender();
+  if (phase.value !== 'voice' || !isContinuation.value) return;
+  welcomeResender?.stop();
+  welcomeResender = createResender(() => room.publish({ type: 'resume_welcome' }), { intervalMs: 3000, maxAttempts: 5 });
+  welcomeResender.start();
+}
+
+// UI аудио-only: гасим саму подписку на видео, иначе трек течёт и оплачивается
+// (за egress видео в аудио-интерфейсе платить незачем).
+function onVideoPublication(pub: CorePublication): void {
+  if (pub.kind === 'video') pub.setSubscribed(false);
+}
+
+// Подписка ≠ воспроизведение: без attach() голос молчит (урок монолита).
+function onAudioTrack(track: CoreTrack): void {
+  if (track.kind !== 'audio') return;
+  const element = track.attach();
+  element.autoplay = true;
+  document.body.appendChild(element);
+  voiceAudio.push(element);
+}
+
+function clearVoiceAudio(): void {
+  for (const element of voiceAudio.splice(0)) element.remove();
+}
+
 const room = new CoreRoom({
   onFrame: handleFrame,
-  onAgentJoined: () => startReadySender(), // агент вошёл (в т.ч. позже нас)
-  onDisconnected: () => { /* фазу считает FSM из T7 */ },
+  onAgentJoined,
+  onDisconnected: () => { phase.value = nextPhase(phase.value, { type: 'disconnected' }); },
+  onPublication: onVideoPublication,
+  onTrack: onAudioTrack,
 });
 
 const bridge = createBridge({
@@ -66,13 +108,14 @@ function push(role: 'user' | 'agent', text: string, source: 'client' | 'core'): 
 }
 
 function handleFrame(frame: WorkerFrame): void {
-  readyResender?.bump();
+  readyResender?.bump(); // ЛЮБОЙ кадр доказывает, что воркер в комнате
   if (frame.type === 'session_ended') {
-    // Ядро закрыло сессию (silence и т.п.): нить у клиента цела — предлагаем
-    // продолжить. Центральный сценарий §. Голос/эскалацию достроит T7.
+    // Ядро закрыло сессию: silence → ПАУЗА (нить цела, предлагаем продолжить),
+    // прочее → конец. Решает FSM.
     typing.value = false;
-    pausedReason.value = typeof frame.reason === 'string' ? frame.reason : '';
-    phase.value = 'paused';
+    const reason = typeof frame.reason === 'string' ? frame.reason : '';
+    pausedReason.value = reason;
+    phase.value = nextPhase(phase.value, { type: 'session_ended', reason });
     return;
   }
   if (frame.type !== 'transcript') return;
@@ -81,12 +124,14 @@ function handleFrame(frame: WorkerFrame): void {
   const t = frame as Extract<WorkerFrame, { type: 'transcript' }>;
   if (t.speaker === 'respondent') {
     // Своё эхо гасим; чужой respondent-transcript (STT в голосе) — рисуем.
-    // Он от ядра (data-channel), значит source=core.
     if (echo.isEcho(t.text)) return;
     push('user', t.text, 'core');
     return;
   }
   typing.value = false;
+  // Аватар ЗАГОВОРИЛ — welcome-back доехал; гасим resume_welcome. Служебные
+  // кадры (session_timer, pong) сюда не попадают и НЕ гасят (иначе вернём немоту).
+  welcomeResender?.bump();
   push('agent', t.text, 'core');
   if (userTextsSent.value > 0) agentReplies.value += 1; // greeting не в счёт
   void api.journal(dialogId.value!, visitorKey.value!, 'agent', t.text, seq.value++);
@@ -104,6 +149,7 @@ function applyStart(started: {
   dialog_id: string; participant_token: ParticipantToken;
   messages: { role: 'user' | 'agent'; text: string; source?: 'client' | 'core' }[]; next_seq: number;
 }): void {
+  clearVoiceAudio(); // прежний голосовой трек снимаем с DOM: новая сессия — чистый лист
   dialogId.value = started.dialog_id;
   // Нумерацию журнала продолжаем с серверной: свой счётчик после reload
   // обнулился бы, и новые реплики глотал бы дедуп по (dialog, source, seq).
@@ -138,17 +184,93 @@ async function send(text: string): Promise<void> {
   await api.journal(dialogId.value!, visitorKey.value!, 'user', clean, seq.value++);
 }
 
+// Эскалация в голос. Порядок шагов — часть контракта (менять нельзя):
+// блокируем инпут → САМИ уходим из чат-комнаты → /escalate → голос.
+async function escalate(): Promise<void> {
+  if (phase.value !== 'chat') return;
+  phase.value = nextPhase(phase.value, { type: 'escalate' });  // :disabled инпута
+  const count = coreMessageCount.value;
+  await room.disconnect();                                     // САМИ, до /escalate: иначе ловим свой обрыв
+  try {
+    const voice = await api.escalate(dialogId.value!, visitorKey.value!, count);
+    isContinuation.value = true;
+    await room.connect(voice.participant_token.livekit_url ?? '', voice.participant_token.token, { audio: true });
+    startReadySender();
+    // Микрофон публикуем САМИ: connect его не включает, и без этого разговор
+    // односторонний — аватар говорит, а нас не слышно.
+    await enableMic();
+    phase.value = nextPhase(phase.value, { type: 'voice_ready' });
+    // Первый resume_welcome — сразу после client_ready (порядок важен: welcome-back
+    // не должен звучать в ещё не подписанный трек). ПОВТОР — из onAgentJoined.
+    room.publish({ type: 'resume_welcome' });
+  } catch (err) {
+    const status = (err as ApiFailure).status;
+    lastErrorCode.value = (err as ApiFailure).code ?? null;
+    phase.value = nextPhase(phase.value, {
+      type: 'escalate_failed',
+      // Денег нет (402) — диалог мёртв; недоступно (503)/невалидно — откат в чат.
+      code: status === 402 ? 'insufficient_credits' : status === 503 ? 'unavailable' : 'invalid',
+    });
+  }
+}
+
+async function enableMic(): Promise<void> {
+  micState.value = 'requesting';
+  try {
+    await room.setMicrophoneEnabled(true);
+    micState.value = 'on';
+  } catch (err) {
+    // Разговор НЕ прерываем: аватара слышно, просто нас — нет. Пользователю
+    // нужен путь наружу (разрешить доступ), а не оверлей ошибки.
+    micState.value = (err as Error).name === 'NotAllowedError' ? 'denied' : 'failed';
+  }
+}
+
+async function toggleMic(): Promise<void> {
+  const next = micState.value !== 'on';
+  try {
+    await room.setMicrophoneEnabled(next);
+    micState.value = next ? 'on' : 'off';
+  } catch {
+    micState.value = 'failed';
+  }
+}
+
 async function resume(): Promise<void> {
-  // «Продолжить» после паузы: рвём прежнюю комнату и переоткрываем нить С
-  // dialog_id — на бэкенде это путь continue_from (лента предшественника
-  // засевается в новую сессию, история у клиента уже на экране).
+  // «Продолжить» после паузы (StateBanner из T6): рвём прежнюю комнату и
+  // переоткрываем нить С dialog_id — на бэкенде это путь continue_from.
   if (!visitorKey.value || !dialogId.value) return;
   await room.disconnect();
   const started = await api.startDialog(visitorKey.value, dialogId.value);
   applyStart(started);
 }
 
-const leave = (): void => { void room.disconnect(); };
+async function resumeThread(): Promise<void> {
+  // «Продолжить» из ResumeBanner (paused / chat_fallback): новая сессия той же
+  // нити (continue_from). Комнату рвём — chat_fallback уже без комнаты, пауза
+  // могла оставить живую.
+  if (!visitorKey.value || !dialogId.value) return;
+  await room.disconnect();
+  const started = await api.startDialog(visitorKey.value, dialogId.value);
+  isContinuation.value = true;
+  phase.value = nextPhase(phase.value, { type: 'resume' });
+  applyStart(started);
+}
+
+async function restart(): Promise<void> {
+  // Диалог устарел — заводим НОВЫЙ (без dialog_id) и сбрасываем сохранённую нить.
+  if (!visitorKey.value) return;
+  await room.disconnect();
+  const started = await api.startDialog(visitorKey.value);
+  bridge.sendState(visitorKey.value, null);
+  applyStart(started);
+}
+
+async function submitLead(payload: LeadFields): Promise<void> {
+  await api.lead(dialogId.value!, visitorKey.value!, payload);
+}
+
+const leave = (): void => { clearVoiceAudio(); void room.disconnect(); };
 
 onMounted(async () => {
   const config = await api.config();
@@ -160,17 +282,31 @@ onMounted(async () => {
 });
 onBeforeUnmount(() => {
   window.removeEventListener('pagehide', leave);
-  readyResender?.stop(); // гигиена таймера: не оставляем висящий interval после размонтирования
+  readyResender?.stop();   // гигиена таймеров: не оставляем висящие interval'ы
+  welcomeResender?.stop();
+  clearVoiceAudio();
 });
-
-// coreMessageCount уедет в escalate(...) из T7; держим вычисляемым уже сейчас.
-void coreMessageCount;
 </script>
 
 <template>
   <div class="widget">
     <ChatFeed :bubbles="bubbles" :typing="typing" />
+    <VoicePanel v-if="phase === 'voice'" :mic-state="micState" @toggle-mic="toggleMic" />
     <StateBanner v-if="phase === 'paused'" :reason="pausedReason" @continue="resume" />
+    <ResumeBanner
+      v-if="banner.text"
+      :text="banner.text"
+      :action="banner.action"
+      @resume="resumeThread"
+      @restart="restart"
+    />
+    <LeadForm v-if="leadOpen" :submit="submitLead" @close="leadOpen = false" />
+    <div v-if="phase === 'chat'" class="actions">
+      <button type="button" class="actions__btn" data-test="escalate" @click="escalate">Позвонить голосом</button>
+      <button type="button" class="actions__btn actions__btn--ghost" data-test="open-lead" @click="leadOpen = true">
+        Оставить контакты
+      </button>
+    </div>
     <Composer :disabled="phase !== 'chat'" @send="send" />
   </div>
 </template>
@@ -182,5 +318,25 @@ void coreMessageCount;
   height: 100%;
   min-height: 100vh;
   background: #fff;
+}
+.actions {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 8px;
+  padding: 8px 12px 0;
+}
+.actions__btn {
+  flex: 1 1 auto;
+  padding: 8px 12px;
+  border: 1px solid #2563eb;
+  border-radius: 10px;
+  background: #2563eb;
+  color: #fff;
+  font: 600 13px/1 system-ui, sans-serif;
+  cursor: pointer;
+}
+.actions__btn--ghost {
+  background: #fff;
+  color: #2563eb;
 }
 </style>

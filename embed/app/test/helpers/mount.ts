@@ -1,6 +1,37 @@
-import { afterEach, vi } from 'vitest';
+import { afterEach, expect, vi } from 'vitest';
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
 import type { ClientFrame, WorkerFrame } from '../../src/lib/frames.ts';
+
+// Порядковый матчер (см. test/vitest.d.ts): received вызван РАНЬШЕ other.
+// jest-extended в проект не тащим — крошечная реализация на invocationCallOrder.
+expect.extend({
+  toHaveBeenCalledBefore(received: unknown, other: unknown) {
+    const order = (spy: unknown): number | undefined =>
+      (spy as { mock?: { invocationCallOrder: number[] } }).mock?.invocationCallOrder[0];
+    const a = order(received);
+    const b = order(other);
+    const pass = typeof a === 'number' && typeof b === 'number' && a < b;
+    return {
+      pass,
+      message: () => `ожидалось, что первый спай вызван раньше второго (порядок ${String(a)} vs ${String(b)})`,
+    };
+  },
+});
+
+// Подставная публикация/трек аватара: их отдаёт КОМНАТА, а решают (гасить видео,
+// прикреплять аудио) обработчики onPublication/onTrack самого App — их и проверяем.
+type PublicationLike = { kind: string; setSubscribed: ReturnType<typeof vi.fn> };
+type TrackLike = { kind: string; attach: ReturnType<typeof vi.fn> };
+
+type Handlers = {
+  onFrame: (frame: WorkerFrame) => void;
+  onAgentJoined: () => void;
+  onDisconnected: () => void;
+  onPublication?: (pub: PublicationLike) => void;
+  onTrack?: (track: TrackLike) => void;
+};
+
+type EscalateCtl = { resolve: (value: unknown) => void; reject: (err: unknown) => void };
 
 // Общее состояние для фабрик vi.mock. vi.hoisted гарантирует, что оно
 // существует к моменту, когда хойстнутые vi.mock'и его читают.
@@ -10,8 +41,14 @@ const shared = vi.hoisted(() => ({
     onFrame: (frame: WorkerFrame) => void;
     onAgentJoined: () => void;
     onDisconnected: () => void;
+    onPublication?: (pub: { kind: string; setSubscribed: (v: boolean) => void }) => void;
+    onTrack?: (track: { kind: string; attach: () => HTMLMediaElement }) => void;
   },
-  roomInstance: null as null | { disconnect: ReturnType<typeof vi.fn> },
+  roomInstance: null as null | {
+    connect: ReturnType<typeof vi.fn>;
+    setMicrophoneEnabled: ReturnType<typeof vi.fn>;
+    disconnect: ReturnType<typeof vi.fn>;
+  },
   apiInstance: null as null | Record<string, ReturnType<typeof vi.fn>>,
   bridgeOpts: null as null | {
     onInit: (p: { visitorKey: string; dialogId: string | null }) => void;
@@ -19,25 +56,29 @@ const shared = vi.hoisted(() => ({
   },
   configResult: null as unknown,
   startResult: null as unknown,
+  escalateCtl: null as null | EscalateCtl,
 }));
 
 // Комнату мокаем целиком: живой LiveKit в юнит-тесте недоступен. publish
-// складываем в sent, handlers пробрасываем наружу как emit*.
+// складываем в sent, handlers пробрасываем наружу как emit*. disconnect
+// ОБНУЛЯЕТ sent: фреймы снесённой комнаты уже неактуальны — так `sent` в
+// голосовой фазе не тащит client_ready прежней чат-комнаты.
 vi.mock('../../src/lib/room.ts', () => ({
   CoreRoom: class {
     connect = vi.fn(async () => {});
     setMicrophoneEnabled = vi.fn(async () => {});
-    disconnect = vi.fn(async () => {});
+    disconnect = vi.fn(async () => { shared.sent.length = 0; });
     publish = (frame: ClientFrame): void => { shared.sent.push(frame); };
     constructor(handlers: NonNullable<typeof shared.handlers>) {
       shared.handlers = handlers;
-      shared.roomInstance = this;
+      shared.roomInstance = this as unknown as NonNullable<typeof shared.roomInstance>;
     }
   },
 }));
 
 // API мокаем: значения config/startDialog берём из shared (задаются ДО mount,
-// потому что onMounted дергает config() ещё во время монтирования).
+// потому что onMounted дергает config() ещё во время монтирования). escalate —
+// ОТЛОЖЕННЫЙ промис: тест сам решает исход через resolveEscalate/rejectEscalate.
 vi.mock('../../src/lib/api.ts', () => ({
   WidgetApi: class {
     config = vi.fn(async () => shared.configResult);
@@ -45,7 +86,13 @@ vi.mock('../../src/lib/api.ts', () => ({
     reenter = vi.fn(async () => shared.startResult);
     journal = vi.fn(async () => ({ stored: true }));
     end = vi.fn(async () => ({ dialog_id: 'd1', status: 'ended' }));
-    escalate = vi.fn(async () => shared.startResult);
+    escalate = vi.fn((..._args: unknown[]) => {
+      let resolve!: (value: unknown) => void;
+      let reject!: (err: unknown) => void;
+      const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+      shared.escalateCtl = { resolve, reject };
+      return promise;
+    });
     lead = vi.fn(async () => ({ lead_id: 'l1' }));
     constructor() { shared.apiInstance = this as unknown as Record<string, ReturnType<typeof vi.fn>>; }
   },
@@ -71,6 +118,16 @@ import App from '../../src/App.vue';
 
 const VISITOR_KEY = '11111111-1111-4111-8111-111111111111';
 
+/** Успешный ответ /escalate — один на все тесты голоса. */
+export const VOICE_OK = {
+  dialog_id: 'd1', channel: 'voice' as const, core_session_id: 'sess_bbbbbbbbbbbbbbbb',
+  participant_token: {
+    token: 'jwt-voice', identity: 'respondent-x',
+    livekit_url: 'wss://lk.example', expires_at: '2026-08-13T11:00:00Z',
+  },
+  continued_from: 'sess_aaaaaaaaaaaaaaaa', transcript_complete: true,
+};
+
 const defaultConfig = () => ({
   widget_id: 'w1', name: 'Демо', enabled: true,
   allowed_origins: ['https://shop.example'],
@@ -88,6 +145,7 @@ const defaultStart = () => ({
 const mounted: VueWrapper[] = [];
 afterEach(() => {
   for (const wrapper of mounted.splice(0)) wrapper.unmount();
+  shared.escalateCtl = null;
 });
 
 export type MountOptions = {
@@ -95,17 +153,35 @@ export type MountOptions = {
   dialogId?: string | null;
 };
 
+export type MountedRoom = {
+  emitFrame: (frame: WorkerFrame) => void;
+  emitAgentJoined: () => void;
+  emitDisconnected: () => void;
+  emitVideoPublication: () => PublicationLike;
+  emitAudioTrack: () => TrackLike;
+  connect: ReturnType<typeof vi.fn>;
+  setMicrophoneEnabled: ReturnType<typeof vi.fn>;
+  disconnect: ReturnType<typeof vi.fn>;
+};
+
+// Явные ключи (не через Record): noUncheckedIndexedAccess иначе делает
+// api.lead возможным undefined, и .mockRejectedValueOnce на нём не вызвать.
+type ApiSpy = ReturnType<typeof vi.fn>;
+export type MountedApi = {
+  config: ApiSpy; startDialog: ApiSpy; reenter: ApiSpy; journal: ApiSpy;
+  end: ApiSpy; escalate: ApiSpy; lead: ApiSpy;
+  resolveEscalate: (value: unknown) => Promise<void>;
+  rejectEscalate: (err: unknown) => Promise<void>;
+};
+
 export async function mountWidget(opts: MountOptions = {}): Promise<{
   wrapper: VueWrapper;
-  api: Record<string, ReturnType<typeof vi.fn>>;
+  api: MountedApi;
   sent: ClientFrame[];
-  room: {
-    emitFrame: (frame: WorkerFrame) => void;
-    emitAgentJoined: () => void;
-    disconnect: ReturnType<typeof vi.fn>;
-  };
+  room: MountedRoom;
 }> {
   shared.sent.length = 0;
+  shared.escalateCtl = null;
   shared.configResult = defaultConfig();
   shared.startResult = { ...defaultStart(), ...opts.startResult };
 
@@ -120,14 +196,30 @@ export async function mountWidget(opts: MountOptions = {}): Promise<{
   shared.bridgeOpts!.onInit({ visitorKey: VISITOR_KEY, dialogId: opts.dialogId ?? null });
   await flushPromises();                        // openThread → startDialog → applyStart → connect → client_ready
 
-  return {
-    wrapper,
-    api: shared.apiInstance!,
-    sent: shared.sent,
-    room: {
-      emitFrame: (frame) => shared.handlers!.onFrame(frame),
-      emitAgentJoined: () => shared.handlers!.onAgentJoined(),
-      disconnect: shared.roomInstance!.disconnect,
+  const handlers = (): NonNullable<typeof shared.handlers> => shared.handlers!;
+  const room: MountedRoom = {
+    emitFrame: (frame) => handlers().onFrame(frame),
+    emitAgentJoined: () => handlers().onAgentJoined(),
+    emitDisconnected: () => handlers().onDisconnected(),
+    emitVideoPublication: () => {
+      const pub: PublicationLike = { kind: 'video', setSubscribed: vi.fn() };
+      handlers().onPublication?.(pub);
+      return pub;
     },
+    emitAudioTrack: () => {
+      const track: TrackLike = { kind: 'audio', attach: vi.fn(() => document.createElement('audio')) };
+      handlers().onTrack?.(track);
+      return track;
+    },
+    connect: shared.roomInstance!.connect,
+    setMicrophoneEnabled: shared.roomInstance!.setMicrophoneEnabled,
+    disconnect: shared.roomInstance!.disconnect,
   };
+
+  const api = Object.assign(shared.apiInstance!, {
+    resolveEscalate: async (value: unknown) => { shared.escalateCtl!.resolve(value); await flushPromises(); },
+    rejectEscalate: async (err: unknown) => { shared.escalateCtl!.reject(err); await flushPromises(); },
+  }) as unknown as MountedApi;
+
+  return { wrapper, api, sent: shared.sent, room };
 }
