@@ -139,9 +139,17 @@ jobs:
           fi
           echo "full_sha=${full}" >> "$GITHUB_OUTPUT"
 
+          # Фильтруем и опознаём прогоны по `.path` (пути файла workflow), а НЕ
+          # по `.name`. `.name` — это DISPLAY-имя прогона: при заданном
+          # `run-name:` оно равно развёрнутому шаблону, а не имени workflow.
+          # Из-за этого `select(.name != "Deploy")` не исключал ТЕКУЩИЙ
+          # деплой-ран, тот попадал в список как `in_progress`, и гейт
+          # блокировал сам себя: «есть незавершённые прогоны — дождитесь их».
+          # Поймано первым же живым прогоном 2026-08-17 (кросс-ревью, наоборот,
+          # утверждало, что `.name` — имя workflow; это оказалось неверно).
           runs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${full}&per_page=100" \
-                  --jq '[.workflow_runs[] | select(.name != "Deploy")
-                         | "\(.name)=\(.status):\(.conclusion // "running")"] | join(" ")')" \
+                  --jq '[.workflow_runs[] | select(.path != ".github/workflows/deploy.yml")
+                         | "\(.path)=\(.status):\(.conclusion // "running")"] | join(" ")')" \
             || { echo "::error::не смог получить прогоны коммита (нужен scope actions: read)"; exit 1; }
           echo "прогоны коммита ${sha}: ${runs:-<нет>}"
 
@@ -153,11 +161,13 @@ jobs:
             *=completed:failure*|*=completed:cancelled*|*=completed:timed_out*)
               echo "::error::у коммита ${sha} есть красные прогоны — деплой запрещён"; exit 1 ;;
           esac
+          # Тот же принцип: опознаём обязательный workflow по пути файла, а не
+          # по display-имени — оно меняется вместе с `run-name:`.
           case "$runs" in
-            *"Release image=completed:success"*)
+            *".github/workflows/release.yml=completed:success"*)
               echo "✅ Release image для ${sha} зелёный" ;;
             *)
-              echo "::error::у коммита ${sha} нет успешного прогона «Release image» —"
+              echo "::error::у коммита ${sha} нет успешного прогона release.yml —"
               echo "::error::значит образ этим CI не публиковался. Деплой запрещён."
               exit 1 ;;
           esac
