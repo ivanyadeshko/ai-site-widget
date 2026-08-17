@@ -1,9 +1,17 @@
 name: site-widget
 services:
   backend:
-    image: ${WIDGET_IMAGE:-site-widget-backend:local}
-    # Контекст — каталог с исходниками, который кладёт rsync (infra/deploy.sh).
-    # Локально это `..`, на стенде — `./src`; переопределяется переменной.
+    # Образ из GHCR, публикуется release.yml парой тегов sha-XXXXXXX + latest.
+    # Раньше здесь стоял `site-widget-backend:local`, который собирался НА
+    # СЕРВЕРЕ из залитых rsync'ом исходников. Отказались по двум причинам:
+    # откатываться было не на что (артефакта сборка на месте не оставляет) и
+    # деплоился не тот образ, что проверял CI (другое дерево, другой кэш слоёв).
+    image: ${WIDGET_IMAGE:-ghcr.io/ivanyadeshko/site-widget-backend:${IMAGE_TAG:-latest}}
+    # `build:` оставлен для ЛОКАЛЬНОЙ разработки (`docker compose up --build`).
+    # На стенде он опасен: голый `up -d` с несуществующим тегом не падает, а
+    # молча собирает образ из рабочего дерева и вешает на него запрошенный тег —
+    # то есть катит чужой код под видом успешного деплоя. Поэтому release.sh
+    # ходит строго `pull` + `up -d --no-build`.
     build: { context: "${WIDGET_BUILD_CONTEXT:-..}", dockerfile: infra/Dockerfile }
     restart: unless-stopped
     env_file: [.env]

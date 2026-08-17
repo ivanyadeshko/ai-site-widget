@@ -1,0 +1,217 @@
+name: Deploy
+
+run-name: "Deploy → ${{ inputs.target }} (${{ inputs.image_tag }}) @${{ github.ref_name }}"
+
+# Деплой BFF виджета образом из GHCR. Механика — infra/deploy/release.sh
+# (тот же интерфейс подкоманд, что у монолита и ядра); здесь оркестрация,
+# гейты и откат.
+#
+# Цепочка: gate → preflight → backup → apply → health → smoke → commit
+#                                │        │       │        │
+#                                └────────┴───────┴────────┴──→ (failure) rollback
+#
+# ⚠️ РЕПОЗИТОРИЙ ПУБЛИЧНЫЙ. Отсюда два жёстких правила, которых нет у
+# приватных репозиториев программы:
+#
+#   1. runs-on ТОЛЬКО ubuntu-latest, и это НЕ вынесено в vars. У монолита
+#      и ядра лейбл раннера — переменная, здесь такой рычаг был бы дырой:
+#      self-hosted раннер исполнял бы код из чужого fork-PR на машине, где
+#      лежат ключи деплоя. Минуты для публичных репозиториев бесплатны, так
+#      что цена решения — ноль.
+#   2. Триггер — только workflow_dispatch. Автозапуск по push означал бы, что
+#      достаточно смержить в main, чтобы дотянуться до сервера.
+#
+# Предусловия (repo secrets / vars):
+#   secrets.DEPLOY_SSH_KEY      приватный ключ ed25519, pubkey у deploy@ на хосте
+#   secrets.DEPLOY_KNOWN_HOSTS  пиннинг host-ключей
+#   secrets.WIDGET_SMOKE_TOKEN  publish_token демо-виджета для смок-гейта
+#   vars.DEV_HOST / PROD_HOST   адреса стендов
+#   vars.DEV_PATH / PROD_PATH   каталоги стендов
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Куда катить'
+        type: choice
+        options: [dev, prod]
+        default: dev
+      image_tag:
+        description: 'Тег образа (sha-XXXXXXX). latest не принимается для prod.'
+        type: string
+        required: true
+      skip_smoke:
+        description: 'Пропустить приёмочный смок (только для разбора инцидента)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: deploy-widget-${{ inputs.target }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy widget → ${{ inputs.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: ${{ inputs.target == 'prod' && 'production' || 'dev' }}
+    env:
+      DEPLOY_HOST: ${{ inputs.target == 'prod' && vars.PROD_HOST || vars.DEV_HOST }}
+      DEPLOY_USER: deploy
+      DEPLOY_PATH: ${{ inputs.target == 'prod' && vars.PROD_PATH || vars.DEV_PATH }}
+      IMAGE_TAG: ${{ inputs.image_tag }}
+      TARGET: ${{ inputs.target }}
+
+    steps:
+      - name: Guard — prod только из main
+        if: inputs.target == 'prod' && github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Прод деплоится только из main (выбрана ${GITHUB_REF})."
+          exit 1
+
+      - name: Guard — prod только по неподвижному тегу
+        # `latest` перезаписывается каждым пушем в main: стенд на нём
+        # структурно не откатывается — «предыдущий образ» перестаёт
+        # существовать в реестре ровно тогда, когда он нужен.
+        if: inputs.target == 'prod' && inputs.image_tag == 'latest'
+        run: |
+          echo "::error::Прод катится только по sha-XXXXXXX. latest не даёт отката."
+          exit 1
+
+      - name: Guard — vars заполнены
+        run: |
+          [ -n "${DEPLOY_HOST}" ] || { echo "::error::vars.*_HOST не задан для ${TARGET}"; exit 1; }
+          [ -n "${DEPLOY_PATH}" ] || { echo "::error::vars.*_PATH не задан для ${TARGET}"; exit 1; }
+          echo "цель: ${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}"
+
+      - uses: actions/checkout@v4
+
+      - name: Гейт — образ собран зелёным CI
+        # Без него деплой примет ЛЮБОЙ существующий в реестре тег, включая
+        # собранный на красных тестах. Тег sha-XXXXXXX однозначно указывает
+        # на коммит — спрашиваем у GitHub, чем закончились его проверки.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${IMAGE_TAG}"
+          case "$tag" in
+            sha-*) sha="${tag#sha-}" ;;
+            *) echo "::warning::тег '$tag' не вида sha-XXXXXXX — гейт CI пропущен"; exit 0 ;;
+          esac
+
+          full=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${sha}" --jq '.sha' 2>/dev/null) \
+            || { echo "::error::коммит $sha не найден в репозитории"; exit 1; }
+
+          runs=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${full}&per_page=100" \
+                 --jq '[.workflow_runs[] | select(.name != "Deploy") | "\(.name)=\(.conclusion)"] | join(" ")')
+          echo "прогоны коммита ${sha}: ${runs:-<нет>}"
+
+          case "$runs" in
+            *=failure*|*=cancelled*|*=timed_out*)
+              echo "::error::у коммита ${sha} есть красные прогоны — деплой запрещён"; exit 1 ;;
+          esac
+          case "$runs" in
+            *=success*) echo "✅ CI коммита ${sha} зелёный" ;;
+            *) echo "::error::у коммита ${sha} нет ни одного успешного прогона"; exit 1 ;;
+          esac
+
+      - name: Setup SSH client
+        run: |
+          SSH_DIR="${RUNNER_TEMP}/ssh"
+          mkdir -p "$SSH_DIR"; chmod 700 "$SSH_DIR"
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > "$SSH_DIR/id_deploy"
+          chmod 600 "$SSH_DIR/id_deploy"
+          printf '%s\n' "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > "$SSH_DIR/known_hosts"
+
+          # keyscan ТОЛЬКО для dev: для прода безусловный keyscan сводит
+          # пиннинг на нет — StrictHostKeyChecking принял бы и подменённый ключ.
+          if [ "${TARGET}" != "prod" ]; then
+            ssh-keyscan -H "${DEPLOY_HOST}" >> "$SSH_DIR/known_hosts" 2>/dev/null
+          fi
+          if [ ! -s "$SSH_DIR/known_hosts" ]; then
+            echo "::error::known_hosts пуст — нужен secrets.DEPLOY_KNOWN_HOSTS"
+            exit 1
+          fi
+          chmod 644 "$SSH_DIR/known_hosts"
+
+          cat > "$SSH_DIR/config" <<EOF
+          Host target
+            HostName ${DEPLOY_HOST}
+            User ${DEPLOY_USER}
+            IdentityFile $SSH_DIR/id_deploy
+            IdentitiesOnly yes
+            UserKnownHostsFile $SSH_DIR/known_hosts
+            StrictHostKeyChecking yes
+            ServerAliveInterval 30
+          EOF
+          chmod 600 "$SSH_DIR/config"
+          echo "SSHF=$SSH_DIR/config" >> "$GITHUB_ENV"
+
+      - name: Sync deploy assets
+        # Исходники НЕ едут: код живёт в образе. Это и есть смысл перехода —
+        # раньше infra/deploy.sh лил всё дерево rsync'ом и собирал на месте.
+        run: |
+          ssh -F "$SSHF" target "mkdir -p ${DEPLOY_PATH}/infra/deploy ${DEPLOY_PATH}/scripts"
+          scp -F "$SSHF" infra/compose.yaml       "target:${DEPLOY_PATH}/compose.yaml"
+          scp -F "$SSHF" infra/deploy/release.sh  "target:${DEPLOY_PATH}/infra/deploy/release.sh"
+          scp -F "$SSHF" scripts/widget_smoke.py  "target:${DEPLOY_PATH}/scripts/widget_smoke.py"
+          ssh -F "$SSHF" target "chmod +x ${DEPLOY_PATH}/infra/deploy/release.sh"
+
+      - name: preflight
+        run: ssh -F "$SSHF" target "IMAGE_TAG=${IMAGE_TAG} bash ${DEPLOY_PATH}/infra/deploy/release.sh preflight"
+
+      - name: backup БД
+        run: ssh -F "$SSHF" target "IMAGE_TAG=${IMAGE_TAG} bash ${DEPLOY_PATH}/infra/deploy/release.sh backup"
+
+      - name: apply
+        id: apply
+        run: ssh -F "$SSHF" target "IMAGE_TAG=${IMAGE_TAG} bash ${DEPLOY_PATH}/infra/deploy/release.sh apply"
+
+      - name: health
+        run: ssh -F "$SSHF" target "bash ${DEPLOY_PATH}/infra/deploy/release.sh health"
+
+      - name: smoke — негативы (чужой Origin, суточный кап, фейк-подпись)
+        if: ${{ !inputs.skip_smoke }}
+        env:
+          SMOKE_TOKEN: ${{ secrets.WIDGET_SMOKE_TOKEN }}
+        # Сценарий 6 — единственный, который И самодостаточен (не нуждается в
+        # dialog_id из сценария 1), И не жжёт кредиты вендоров: все три отказа
+        # происходят ДО создания сессии ядра. Поэтому он гейт КАЖДОГО деплоя.
+        # Остальные пять — платные, им место в nightly и предпрод-прогоне.
+        # Гоняется НА СЕРВЕРЕ: сценарию нужен psql БД виджета.
+        run: |
+          if [ -z "$SMOKE_TOKEN" ]; then
+            echo "::warning::secrets.WIDGET_SMOKE_TOKEN не задан — смок-гейт пропущен"
+            exit 0
+          fi
+          ssh -F "$SSHF" target "cd ${DEPLOY_PATH} && python3 scripts/widget_smoke.py \
+            --only 6 \
+            --token '${SMOKE_TOKEN}' \
+            --base-url http://localhost:8200 \
+            --psql 'docker compose exec -T widget-db psql -U widget -d site_widget'"
+
+      - name: commit — зафиксировать успешный деплой
+        run: |
+          ssh -F "$SSHF" target \
+            "bash ${DEPLOY_PATH}/infra/deploy/release.sh commit --tag ${IMAGE_TAG} --run ${GITHUB_RUN_ID}"
+          ssh -F "$SSHF" target "bash ${DEPLOY_PATH}/infra/deploy/release.sh status"
+
+      - name: ОТКАТ (любой провал после apply)
+        # До apply откатывать нечего — стенд не тронут, а слепой rollback увёл
+        # бы живой стенд на предыдущий тег на ровном месте.
+        if: failure() && steps.apply.outcome != 'skipped'
+        run: |
+          echo "::error::деплой провалился после apply — откатываемся"
+          ssh -F "$SSHF" target "bash ${DEPLOY_PATH}/infra/deploy/release.sh rollback" || {
+            echo "::error::ОТКАТ ТОЖЕ ПРОВАЛИЛСЯ — стенд в неопределённом состоянии, нужен ручной разбор"
+            exit 1
+          }
+          ssh -F "$SSHF" target "bash ${DEPLOY_PATH}/infra/deploy/release.sh status"
+
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -rf "${RUNNER_TEMP}/ssh"

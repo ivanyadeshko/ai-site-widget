@@ -1,0 +1,106 @@
+name: Release image
+
+# Сборка образа BFF виджета и push в GHCR.
+#   push в main       → автоматический билд (тег sha-XXXXXXX + latest);
+#   workflow_dispatch → ручной прогон из Actions UI (пересборка того же кода).
+#
+# До этого workflow образ виджета не публиковался НИКУДА: ci.yml делал
+# `docker build` как гейт и выбрасывал результат, а раскатка (infra/deploy.sh)
+# лила исходники rsync'ом и собирала образ НА СЕРВЕРЕ. У той схемы два изъяна,
+# ради которых написан этот файл:
+#
+#   1. Откатываться не на что. Сборка на месте не оставляет артефакта —
+#      «предыдущая версия» существует только как предыдущий коммит, и вернуться
+#      к ней = собрать заново (минуты) из состояния, которое уже никто не
+#      проверял в этой комбинации.
+#   2. Деплоится не то, что тестировали. CI собирает образ у себя, сервер —
+#      у себя, из другого рабочего дерева и другого кэша слоёв. Совпадение
+#      результатов — предположение, а не гарантия.
+#
+# Гейт образа — ВЫЗОВ ci.yml (`uses: ./.github/workflows/ci.yml`), а не копия
+# его джоб: одна правда о том, что считается зелёным.
+#
+# Раннер — ubuntu-latest и только он. Репозиторий ПУБЛИЧНЫЙ: self-hosted
+# раннер исполнял бы код из чужих fork-PR на машине, где лежат ключи прода.
+# Минуты для публичных репозиториев бесплатны, так что цена решения — ноль.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Два близких пуша в main иначе гонят тег `latest` (порядок завершения не
+# гарантирован → latest может указать на более старый коммит).
+# cancel-in-progress=false — не обрываем идущую сборку, ставим в очередь.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/site-widget-backend
+
+jobs:
+  ci:
+    name: Гейт образа
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Publish image
+    needs: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      # packages: write — единственное место, где CI пишет наружу.
+      packages: write
+    outputs:
+      tag: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Формат тегов общий для трёх репозиториев программы: sha-XXXXXXX
+      # (7 символов — деплой ссылается именно на короткий sha) + latest на
+      # дефолтной ветке. priority=1000 у sha-тега: version-выход
+      # metadata-action (он же OCI-лейбл org.opencontainers.image.version)
+      # обязан быть sha-XXXXXXX, а не latest — иначе по лейблу нельзя сказать,
+      # из какого коммита собран образ.
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,prefix=sha-,priority=1000
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # context: . — корень репо: infra/Dockerfile ожидает именно его
+      # (в compose build.context тоже `..`).
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infra/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=widget-backend
+          cache-to: type=gha,mode=max,scope=widget-backend
+
+      - name: Итог
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          short="$(echo "${GITHUB_SHA}" | cut -c1-7)"
+          {
+            echo "### Образ опубликован"
+            echo '```'
+            echo "${TAGS}"
+            echo '```'
+            echo "Деплой: Actions → Deploy → image_tag=sha-${short}"
+          } >> "$GITHUB_STEP_SUMMARY"
