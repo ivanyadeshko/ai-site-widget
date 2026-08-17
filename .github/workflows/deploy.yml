@@ -51,12 +51,20 @@ concurrency:
 
 permissions:
   contents: read
+  # actions: read ОБЯЗАТЕЛЕН. Явный блок permissions обнуляет все не
+  # перечисленные скоупы, а гейт «образ собран зелёным CI» ходит в
+  # GET /repos/{r}/actions/runs — без этого скоупа он получает 403 и валит
+  # шаг под `set -e`, то есть деплой не работает ВООБЩЕ.
+  # Найдено кросс-ревью 2026-08-17 (независимо тремя рецензентами).
+  actions: read
 
 jobs:
   deploy:
     name: Deploy widget → ${{ inputs.target }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 45, а не 30: превышение timeout-minutes — это ОТМЕНА, а не провал, при
+    # ней `failure()` ложно и откат не выполнился бы (см. условие ниже).
+    timeout-minutes: 45
     environment:
       name: ${{ inputs.target == 'prod' && 'production' || 'dev' }}
     env:
@@ -73,13 +81,31 @@ jobs:
           echo "::error::Прод деплоится только из main (выбрана ${GITHUB_REF})."
           exit 1
 
-      - name: Guard — prod только по неподвижному тегу
-        # `latest` перезаписывается каждым пушем в main: стенд на нём
-        # структурно не откатывается — «предыдущий образ» перестаёт
-        # существовать в реестре ровно тогда, когда он нужен.
-        if: inputs.target == 'prod' && inputs.image_tag == 'latest'
+      - name: Guard — формат тега (fail-closed)
+        # Раньше проверялось только `image_tag == 'latest'` для прода. Мало:
+        # любой другой не-sha тег проходил, а гейт CI сам себя выключал
+        # (`exit 0` с warning). И главное — `image_tag` свободной строкой
+        # уезжает в удалённый shell, где парсится заново: значение вида
+        # `sha-abc1234; rm -rf /opt/site-widget` исполнилось бы на стенде,
+        # обойдя и required_reviewers (ревьюер смотрит на форму, а не на
+        # шелл-безопасность поля). Найдено кросс-ревью 2026-08-17.
+        env:
+          TAG: ${{ inputs.image_tag }}
         run: |
-          echo "::error::Прод катится только по sha-XXXXXXX. latest не даёт отката."
+          if ! printf '%s' "$TAG" | grep -qE '^(sha-[0-9a-f]{7,40}|latest)$'; then
+            echo "::error::Тег '$TAG' недопустим. Разрешено: sha-XXXXXXX (7-40 hex) или latest."
+            exit 1
+          fi
+          if [ "${TARGET}" = "prod" ] && [ "$TAG" = "latest" ]; then
+            echo "::error::Прод катится только по sha-XXXXXXX: latest перезаписывается и не даёт отката."
+            exit 1
+          fi
+          echo "формат тега принят: $TAG"
+
+      - name: Guard — смок на проде не пропускается
+        if: inputs.target == 'prod' && inputs.skip_smoke
+        run: |
+          echo "::error::skip_smoke на проде запрещён: смок — один из немногих оставшихся гейтов."
           exit 1
 
       - name: Guard — vars заполнены
@@ -88,55 +114,112 @@ jobs:
           [ -n "${DEPLOY_PATH}" ] || { echo "::error::vars.*_PATH не задан для ${TARGET}"; exit 1; }
           echo "цель: ${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}"
 
-      - uses: actions/checkout@v4
-
       - name: Гейт — образ собран зелёным CI
-        # Без него деплой примет ЛЮБОЙ существующий в реестре тег, включая
-        # собранный на красных тестах. Тег sha-XXXXXXX однозначно указывает
-        # на коммит — спрашиваем у GitHub, чем закончились его проверки.
+        id: cigate
+        # Первая редакция проверяла «есть ли хоть один зелёный прогон». Это НЕ
+        # эквивалентно «образ собран зелёным CI»: посторонний зелёный прогон
+        # (появится CodeQL/labeler — и гейт зазеленеет без ci), а незавершённый
+        # прогон не считался ни успехом, ни провалом. Теперь требуем успех
+        # ИМЕННО у «Release image» — того workflow, который публикует образ.
+        # Найдено кросс-ревью 2026-08-17.
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="${IMAGE_TAG}"
-          case "$tag" in
-            sha-*) sha="${tag#sha-}" ;;
-            *) echo "::warning::тег '$tag' не вида sha-XXXXXXX — гейт CI пропущен"; exit 0 ;;
-          esac
+          sha="${IMAGE_TAG#sha-}"
+          if [ "$IMAGE_TAG" = "latest" ]; then
+            sha="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.default_branch' \
+                   | xargs -I{} gh api "repos/${GITHUB_REPOSITORY}/commits/{}" --jq '.sha')"
+          fi
 
-          full=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${sha}" --jq '.sha' 2>/dev/null) \
+          full="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${sha}" --jq '.sha')" \
             || { echo "::error::коммит $sha не найден в репозитории"; exit 1; }
+          if [ "${#full}" -ne 40 ]; then
+            echo "::error::не смог развернуть ${sha} в полный sha (получено '${full}')"
+            exit 1
+          fi
+          echo "full_sha=${full}" >> "$GITHUB_OUTPUT"
 
-          runs=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${full}&per_page=100" \
-                 --jq '[.workflow_runs[] | select(.name != "Deploy") | "\(.name)=\(.conclusion)"] | join(" ")')
+          runs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${full}&per_page=100" \
+                  --jq '[.workflow_runs[] | select(.name != "Deploy")
+                         | "\(.name)=\(.status):\(.conclusion // "running")"] | join(" ")')" \
+            || { echo "::error::не смог получить прогоны коммита (нужен scope actions: read)"; exit 1; }
           echo "прогоны коммита ${sha}: ${runs:-<нет>}"
 
           case "$runs" in
-            *=failure*|*=cancelled*|*=timed_out*)
+            *:running*|*in_progress*|*queued*)
+              echo "::error::у коммита ${sha} есть незавершённые прогоны — дождитесь их"; exit 1 ;;
+          esac
+          case "$runs" in
+            *=completed:failure*|*=completed:cancelled*|*=completed:timed_out*)
               echo "::error::у коммита ${sha} есть красные прогоны — деплой запрещён"; exit 1 ;;
           esac
           case "$runs" in
-            *=success*) echo "✅ CI коммита ${sha} зелёный" ;;
-            *) echo "::error::у коммита ${sha} нет ни одного успешного прогона"; exit 1 ;;
+            *"Release image=completed:success"*)
+              echo "✅ Release image для ${sha} зелёный" ;;
+            *)
+              echo "::error::у коммита ${sha} нет успешного прогона «Release image» —"
+              echo "::error::значит образ этим CI не публиковался. Деплой запрещён."
+              exit 1 ;;
           esac
 
+      - name: Гейт — на прод только код, влитый в main
+        # Отдельная дыра от предыдущей: образ мог быть собран зелёным CI, но из
+        # ветки, не прошедшей ревью. `release.yml` принимает workflow_dispatch
+        # с любой ветки, а `type=sha` в metadata-action веткой не ограничен —
+        # то есть sha-тег немерженого кода публикуется штатно. Guard «прод
+        # только из main» это не ловит: он смотрит ветку WORKFLOW-ФАЙЛА.
+        if: inputs.target == 'prod'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FULL_SHA: ${{ steps.cigate.outputs.full_sha }}
+        run: |
+          status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/main...${FULL_SHA}" --jq '.status')" \
+            || { echo "::error::не смог сравнить ${FULL_SHA} с main"; exit 1; }
+          case "$status" in
+            identical|behind) echo "✅ коммит ${FULL_SHA} влит в main (${status})" ;;
+            *)
+              echo "::error::коммит ${FULL_SHA} НЕ влит в main (${status}) — на прод такой код не катится"
+              exit 1 ;;
+          esac
+
+      - name: Checkout КОММИТА ОБРАЗА, а не ветки запуска
+        # Ассеты деплоя (compose.yaml, release.sh, смок) обязаны быть из того
+        # же коммита, из которого собран образ: иначе выкат старого sha кладёт
+        # на сервер новый compose поверх старого образа, а откат возвращает
+        # образ, но не обвязку. Найдено кросс-ревью 2026-08-17.
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.cigate.outputs.full_sha }}
+
       - name: Setup SSH client
+        # Секреты через `env:`, а НЕ подстановкой `${{ }}` в тело `run:`:
+        # подстановка происходит до того, как строку увидит shell, и
+        # многострочный PEM с необычным символом способен сломать разбор
+        # скрипта. Остальные значения здесь уже шли через env.
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
         run: |
           SSH_DIR="${RUNNER_TEMP}/ssh"
           mkdir -p "$SSH_DIR"; chmod 700 "$SSH_DIR"
-          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > "$SSH_DIR/id_deploy"
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$SSH_DIR/id_deploy"
           chmod 600 "$SSH_DIR/id_deploy"
-          printf '%s\n' "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > "$SSH_DIR/known_hosts"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$SSH_DIR/known_hosts"
 
           # keyscan ТОЛЬКО для dev: для прода безусловный keyscan сводит
           # пиннинг на нет — StrictHostKeyChecking принял бы и подменённый ключ.
           if [ "${TARGET}" != "prod" ]; then
             ssh-keyscan -H "${DEPLOY_HOST}" >> "$SSH_DIR/known_hosts" 2>/dev/null
           fi
-          if [ ! -s "$SSH_DIR/known_hosts" ]; then
-            echo "::error::known_hosts пуст — нужен secrets.DEPLOY_KNOWN_HOSTS"
+          chmod 644 "$SSH_DIR/known_hosts"
+
+          # Проверяем НАЛИЧИЕ КЛЮЧА ИМЕННО ЭТОГО ХОСТА, а не размер файла:
+          # при незаданном секрете `printf '%s\n' ""` пишет один байт, файл
+          # непустой, и страж `[ ! -s ]` молчал.
+          if ! ssh-keygen -F "${DEPLOY_HOST}" -f "$SSH_DIR/known_hosts" >/dev/null 2>&1; then
+            echo "::error::в known_hosts нет ключа ${DEPLOY_HOST} — заполните secrets.DEPLOY_KNOWN_HOSTS"
             exit 1
           fi
-          chmod 644 "$SSH_DIR/known_hosts"
 
           cat > "$SSH_DIR/config" <<EOF
           Host target
@@ -185,14 +268,26 @@ jobs:
         # Гоняется НА СЕРВЕРЕ: сценарию нужен psql БД виджета.
         run: |
           if [ -z "$SMOKE_TOKEN" ]; then
-            echo "::warning::secrets.WIDGET_SMOKE_TOKEN не задан — смок-гейт пропущен"
+            # На проде отсутствие токена — ОШИБКА, а не пропуск. Иначе
+            # незаведённый секрет молча выключает единственный приёмочный
+            # гейт, и каждый прод-деплой зелёный, проверив только /healthz.
+            # Warning в логе Actions никто не читает.
+            if [ "${TARGET}" = "prod" ]; then
+              echo "::error::secrets.WIDGET_SMOKE_TOKEN не задан — на проде смок обязателен"
+              exit 1
+            fi
+            echo "::warning::secrets.WIDGET_SMOKE_TOKEN не задан — смок-гейт пропущен (dev)"
             exit 0
           fi
-          ssh -F "$SSHF" target "cd ${DEPLOY_PATH} && python3 scripts/widget_smoke.py \
-            --only 6 \
-            --token '${SMOKE_TOKEN}' \
-            --base-url http://localhost:8200 \
-            --psql 'docker compose exec -T widget-db psql -U widget -d site_widget'"
+          # Токен идёт по STDIN, а не подстановкой в командную строку: иначе
+          # он виден в `ps` на стенде весь прогон (общая дев-ВМ, любой
+          # пользователь), и ломается на апострофе в значении. Смок читает
+          # WIDGET_PUBLISH_TOKEN из окружения — этот путь уже поддержан.
+          printf '%s' "$SMOKE_TOKEN" | ssh -F "$SSHF" target \
+            "cd ${DEPLOY_PATH} && WIDGET_PUBLISH_TOKEN=\$(cat) python3 scripts/widget_smoke.py \
+              --only 6 \
+              --base-url http://localhost:8200 \
+              --psql 'docker compose exec -T widget-db psql -U widget -d site_widget'"
 
       - name: commit — зафиксировать успешный деплой
         run: |
@@ -201,13 +296,28 @@ jobs:
           ssh -F "$SSHF" target "bash ${DEPLOY_PATH}/infra/deploy/release.sh status"
 
       - name: ОТКАТ (любой провал после apply)
-        # До apply откатывать нечего — стенд не тронут, а слепой rollback увёл
-        # бы живой стенд на предыдущий тег на ровном месте.
-        if: failure() && steps.apply.outcome != 'skipped'
+        # `cancelled()` наравне с `failure()`: превышение timeout-minutes и
+        # ручная отмена — это ОТМЕНА, при ней `failure()` ложно, а ssh-сессию
+        # прибивают, и release.sh может умереть между `up` и миграциями —
+        # ровно тогда, когда откат нужнее всего.
+        #
+        # Решение «откатывать или нет» принимает СЕРВЕР: `--if-current`
+        # откатывает, только если стенд реально на новом теге. Прежний гард
+        # не отличал «apply не стартовал» от «apply упал ДО подмены .env»
+        # (не взялся flock, не прошёл pull) и уводил живой стенд на версию
+        # назад. Найдено кросс-ревью 2026-08-17.
+        if: (failure() || cancelled()) && steps.apply.conclusion != 'skipped'
         run: |
-          echo "::error::деплой провалился после apply — откатываемся"
-          ssh -F "$SSHF" target "bash ${DEPLOY_PATH}/infra/deploy/release.sh rollback" || {
-            echo "::error::ОТКАТ ТОЖЕ ПРОВАЛИЛСЯ — стенд в неопределённом состоянии, нужен ручной разбор"
+          echo "::warning::деплой не завершился штатно — проверяем, нужен ли откат"
+          ssh -F "$SSHF" target \
+            "bash ${DEPLOY_PATH}/infra/deploy/release.sh rollback --if-current ${IMAGE_TAG}" || {
+            echo "::error::ОТКАТ ПРОВАЛИЛСЯ — стенд в неопределённом состоянии, нужен ручной разбор"
+            exit 1
+          }
+          # Откат обязан проходить тот же гейт здоровья, что и деплой: сам
+          # rollback доводит стек только до «контейнеры Up».
+          ssh -F "$SSHF" target "bash ${DEPLOY_PATH}/infra/deploy/release.sh health" || {
+            echo "::error::после отката стенд НЕ здоров — нужен ручной разбор"
             exit 1
           }
           ssh -F "$SSHF" target "bash ${DEPLOY_PATH}/infra/deploy/release.sh status"

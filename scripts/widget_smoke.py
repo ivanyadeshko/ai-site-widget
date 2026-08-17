@@ -57,7 +57,7 @@ ai-site-widget такой зависимости нет и не должно б�
 
     /opt/conversation-core/worker/.venv/bin/python scripts/widget_smoke.py \\
         --base-url http://localhost:8200 --token <PUBLISH_TOKEN> \\
-        --psql 'docker compose -f /opt/site-widget/compose.yaml exec -T postgres psql -U widget -d site_widget'
+        --psql 'docker compose -f /opt/site-widget/compose.yaml exec -T widget-db psql -U widget -d site_widget'
 
 `--origin` не обязателен: смок сам возьмёт первый `allowed_origins` из ответа
 `/config`, если флаг не передан.
@@ -946,6 +946,19 @@ SCENARIOS: list[tuple[str, Any]] = [
 LIVEKIT_FREE: frozenset = frozenset({"6-negatives"})
 
 
+class OnlyError(Exception):
+    """Некорректный --only. Отдельный тип, чтобы main() отработал его как
+    SetupError (смок НЕ НАЧАЛСЯ), а не как вердикт о BFF.
+
+    Раньше здесь был голый `raise SystemExit(...)`: он вылетал мимо всех
+    except-веток main(), поэтому обязательная машиночитаемая строка
+    `SMOKE-RESULT:` НЕ печаталась, а код возврата 1 численно совпадал с
+    EXIT_ASSERT — то есть опечатка во флаге была НЕОТЛИЧИМА от красной
+    приёмки и утягивала исправный стенд в автооткат. Найдено кросс-ревью
+    2026-08-17.
+    """
+
+
 def select_scenarios(only: str) -> list:
     """Отбор по --only: номер («6»), имя («6-negatives») или список через запятую.
 
@@ -955,19 +968,39 @@ def select_scenarios(only: str) -> list:
     """
     if not only.strip():
         return list(SCENARIOS)
+
     picked: list = []
     for w in (p.strip() for p in only.split(",")):
         if not w:
             continue
         match = [s for s in SCENARIOS if s[0] == w or s[0].split("-", 1)[0] == w]
         if not match:
-            raise SystemExit(
+            raise OnlyError(
                 f"--only: неизвестный сценарий {w!r}. Доступны: "
                 + ", ".join(n for n, _ in SCENARIOS)
             )
         for m in match:
             if m not in picked:
                 picked.append(m)
+
+    # Пустой результат при НЕПУСТОМ --only — это `--only ","` или `--only " , "`:
+    # все токены отсеялись как пустые, ни один не дошёл до проверки на
+    # неизвестность, и функция возвращала []. Дальше цикл сценариев не
+    # выполнялся ни разу и смок выходил с кодом 0 — ровно «молча пустой
+    # прогон выглядит как зелёный гейт», от чего этот докстринг и предостерегает.
+    # Воспроизведено 2026-08-17.
+    if not picked:
+        raise OnlyError(
+            f"--only={only!r} не отобрал ни одного сценария (пустые токены). "
+            "Пустой прогон не может считаться успешным."
+        )
+
+    # Порядок — КАНОНИЧЕСКИЙ, а не порядок перечисления в --only. Сценарии
+    # связаны по контексту (4 читает dialog_id, который создаёт 1), и
+    # `--only 3,1` прогнал бы третий раньше первого и упал бы на пустом
+    # dialog_id — отказ инструмента, выглядящий как вердикт о продукте.
+    order = {name: i for i, (name, _) in enumerate(SCENARIOS)}
+    picked.sort(key=lambda s: order[s[0]])
     return picked
 
 
@@ -988,7 +1021,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="прогнать только указанные сценарии: номер ('6'), имя ('6-negatives') "
                         "или список через запятую. Пусто — все шесть. Гейт деплоя гоняет '6': "
                         "он единственный самодостаточный И не жгущий кредиты вендоров")
-    p.add_argument("--psql", default=env("WIDGET_PSQL", "docker compose exec -T postgres psql -U widget -d site_widget"),
+    p.add_argument("--psql", default=env("WIDGET_PSQL", "docker compose exec -T widget-db psql -U widget -d site_widget"),
                    help="как звать psql BFF-Postgres (money-ассерты + прямая запись капа/фейка)")
     p.add_argument("--core-console", default=env("WIDGET_CORE_CONSOLE", ""),
                    help="необязательно: как звать консоль control-plane ядра — только для "
@@ -1039,7 +1072,15 @@ def main(argv: list[str]) -> int:
 
     verdicts: list[str] = []
 
-    selected = select_scenarios(args.only)
+    try:
+        selected = select_scenarios(args.only)
+    except OnlyError as exc:
+        # Через тот же путь, что и прочие «смок не смог начать»: с эпилогом и
+        # обязательной строкой SMOKE-RESULT, кодом EXIT_SETUP (а не EXIT_ASSERT).
+        fail(str(exc))
+        _epilogue(EXIT_SETUP, [], 0)
+        return EXIT_SETUP
+
     if args.only.strip():
         info(f"отобрано сценариев: {len(selected)} из {len(SCENARIOS)} "
              f"({', '.join(n for n, _ in selected)})")
@@ -1057,7 +1098,7 @@ def main(argv: list[str]) -> int:
                 "нет livekit-rtc. Запускай интерпретатором ВОРКЕРА ЯДРА: "
                 f"/opt/conversation-core/worker/.venv/bin/python {sys.argv[0]} ... ({exc})"
             )
-            _epilogue(EXIT_SETUP, [])
+            _epilogue(EXIT_SETUP, [], len(selected))
             return EXIT_SETUP
     else:
         info("livekit-rtc не требуется: отобранные сценарии комнату не поднимают")
@@ -1089,13 +1130,13 @@ def main(argv: list[str]) -> int:
         ok(f"виджет '{cfg_body.get('name')}' включён, origin для легитимных запросов: {ctx.origin}")
     except SetupError as exc:
         fail(f"смок не смог начать: {exc}")
-        _epilogue(EXIT_SETUP, [])
+        _epilogue(EXIT_SETUP, [], len(selected))
         return EXIT_SETUP
     except CoreLostError as exc:
         # На предполётной проверке это тоже фактически «не смогли начать» —
         # BFF не успел даже толком отдать /healthz.
         fail(str(exc))
-        _epilogue(EXIT_SETUP, [])
+        _epilogue(EXIT_SETUP, [], len(selected))
         return EXIT_SETUP
 
     # ── 6 сценариев: вердикты СОБИРАЮТСЯ, прогон не обрывается на первом ────

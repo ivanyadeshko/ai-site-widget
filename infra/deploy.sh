@@ -1,22 +1,39 @@
 #!/usr/bin/env bash
-# Раскатка дев-стенда site-widget: исходники → сервер → сборка на месте.
-set -euo pipefail
+# ──────────────────────────────────────────────────────────────────────
+# УСТАРЕЛ И НАМЕРЕННО ОБЕЗВРЕЖЕН.
+#
+# Раньше здесь была раскатка «rsync исходников → сборка на месте». После
+# перевода стенда на образы из GHCR этот скрипт стал не просто ненужным, а
+# ОПАСНЫМ, и это проверено экспериментом (кросс-ревью 2026-08-17):
+#
+#   он делал `docker compose up -d --build`, а в новом compose у backend
+#   рядом с `image: ghcr.io/…:${IMAGE_TAG}` осталась секция `build:` (она
+#   нужна для локальной разработки). Плоский `up -d` при отсутствующем
+#   локально образе НЕ ПАДАЕТ — он молча собирает образ из
+#   /opt/site-widget/src и вешает на результат ЗАПРОШЕННЫЙ РЕЕСТРОВЫЙ ТЕГ.
+#
+# Последствие тихое и потому дорогое: на стенде оказывается образ, собранный
+# из случайного состояния рабочего дерева, но помеченный как проверенный CI
+# sha-XXXXXXX. Отличить его нельзя ни глазами, ни проверкой тега в
+# release.sh — тег-то совпал. И откат на этот тег вернёт непроверенный код.
+#
+# Правильный путь раскатки: GitHub Actions → «Deploy» (см.
+# .github/workflows/deploy.yml). Механика — infra/deploy/release.sh, который
+# ходит строго `docker compose pull` + `up -d --no-build`.
+#
+# Для локальной разработки сборка из исходников по-прежнему доступна и
+# безопасна: `docker compose -f infra/compose.yaml up -d --build`.
+# ──────────────────────────────────────────────────────────────────────
 
-HOST="${HOST:-root@185.125.102.133}"
-DIR="${DIR:-/opt/site-widget}"
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cat >&2 <<'EOF'
+❌ infra/deploy.sh больше не используется и намеренно ничего не делает.
 
-ssh "$HOST" "mkdir -p $DIR"
+   Он собирал образ НА СЕРВЕРЕ из залитых исходников. С текущим compose
+   такая сборка молча подменяет проверенный CI образ самосборным, вешая
+   на него тот же реестровый тег, — отличить их потом невозможно.
 
-# MTU 1400 на этом сервере: большие передачи подвисают, поэтому rsync, а не
-# один толстый scp. node_modules и dist не везём — собираются в образе.
-rsync -az --delete \
-  --exclude '.git' --exclude 'node_modules' --exclude 'dist' --exclude '.env' \
-  "$ROOT/" "$HOST:$DIR/src/"
-
-scp "$ROOT/infra/compose.yaml" "$HOST:$DIR/compose.yaml"
-ssh "$HOST" "test -f $DIR/.env || { echo 'НЕТ $DIR/.env — заполни из infra/.env.example и chmod 600'; exit 1; }"
-
-ssh "$HOST" "cd $DIR && docker compose config --quiet && docker compose up -d --build"
-ssh "$HOST" "cd $DIR && docker compose exec -T backend npx --no-install node-pg-migrate -m backend/migrations up"
-ssh "$HOST" "curl -fsS -w ' HTTP %{http_code}\n' http://localhost:8200/healthz"
+   Раскатка:  GitHub → Actions → «Deploy» → target + image_tag
+   Механика:  infra/deploy/release.sh (pull + up --no-build)
+   Локально:  docker compose -f infra/compose.yaml up -d --build
+EOF
+exit 1

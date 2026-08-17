@@ -52,10 +52,39 @@ cd "$REPO_DIR"
 
 # ── общие хелперы ─────────────────────────────────────────────────────
 
-die() { echo "❌ $*" >&2; exit 1; }
-info() { echo "→ $*"; }
+# printf '%b', а не echo: в сообщения подставляются многострочные списки, и
+# `echo` печатал в них `\n` буквально — каша ровно в момент инцидента.
+die() { printf '❌ %b\n' "$*" >&2; exit 1; }
+info() { printf '→ %b\n' "$*"; }
 
-env_get() { sed -n "s|^$1=||p" .env 2>/dev/null | tail -1; }
+# Значение ключа из .env. Кавычки снимаются, `|| true` обязателен: иначе
+# отсутствие .env роняет скрипт молча через pipefail.
+env_get() {
+    { sed -n "s|^$1=||p" .env 2>/dev/null | tail -1 \
+        | sed -e 's|^"\(.*\)"$|\1|' -e "s|^'\(.*\)'$|\1|"; } || true
+}
+
+# Сервисы, обязанные присутствовать в выдаче `docker compose ps`. Нужны
+# отдельным списком, потому что проверки построены по принципу «нет плохих
+# строк = хорошо», а он не отличает «проверили, всё чисто» от «данных не
+# получили вовсе». Найдено кросс-ревью 2026-08-17.
+WIDGET_SERVICES="backend widget-db"
+
+# Формат тега — единственный вход снаружи (input workflow). Валидируем
+# fail-closed: дальше тег идёт в sed по .env и уезжает в удалённый shell,
+# где строка парсится заново. Символы `;`, `&`, `|`, `$(` означают
+# исполнение произвольного кода на стенде. Найдено кросс-ревью 2026-08-17.
+validate_tag() {
+    local t="${1:-}"
+    [ -n "$t" ] || die "тег пуст"
+    case "$t" in
+        latest) return 0 ;;
+        sha-*)
+            printf '%s' "$t" | grep -qE '^sha-[0-9a-f]{7,40}$' \
+                || die "тег '$t' не соответствует формату sha-XXXXXXX" ;;
+        *) die "тег '$t' недопустим: ожидается sha-XXXXXXX или latest" ;;
+    esac
+}
 
 state_set() {
     local key="$1" val="$2" tmp
@@ -86,11 +115,18 @@ current_tag_from_env() { env_get IMAGE_TAG; }
 
 pin_tag() {
     local tag="$1"
+    validate_tag "$tag"
+
     if grep -q '^IMAGE_TAG=' .env 2>/dev/null; then
         sed -i "s|^IMAGE_TAG=.*|IMAGE_TAG=${tag}|" .env
     else
         printf '\nIMAGE_TAG=%s\n' "$tag" >> .env
     fi
+
+    # Убеждаемся, что записалось именно то, что просили: sed молчит, если
+    # шаблон не совпал, и «успешный» pin оставил бы старый тег.
+    local got; got="$(env_get IMAGE_TAG)"
+    [ "$got" = "$tag" ] || die "IMAGE_TAG в .env не встал: '$got', ожидался '$tag'"
     # WIDGET_IMAGE переопределяет всю ссылку целиком и делает IMAGE_TAG
     # безмолвно бесполезным (compose: ${WIDGET_IMAGE:-ghcr.io/…:${IMAGE_TAG}}).
     # Наследие локальной сборки — вычищаем, иначе деплой «проходит», а образ
@@ -108,8 +144,25 @@ pin_tag() {
 }
 
 wait_healthy() {
-    local budget="${1:-300}" waited=0 name state health bad
+    local budget="${1:-300}" waited=0 name state health bad snapshot svc last_bad=""
     while [ "$waited" -lt "$budget" ]; do
+        # Снимок берём ОТДЕЛЬНОЙ командой и НЕ глушим stderr. Раньше вывод
+        # читался прямо из process substitution с `2>/dev/null`, и упавший
+        # `docker compose ps` (занятый демон, отвалившийся `:?`-гард в .env,
+        # смена формата --format) давал пустой список — то есть «нет плохих
+        # контейнеров», то есть УСПЕХ. Особенно дорого это в откате, где
+        # wait_healthy — единственная проверка: получалось «ОТКАТ ВЫПОЛНЕН»
+        # при лежащем стенде. Найдено кросс-ревью 2026-08-17.
+        if ! snapshot="$(docker compose ps --all --format '{{.Name}}\t{{.State}}\t{{.Health}}')"; then
+            die "docker compose ps не отработал — состояние стека неизвестно (fail-closed)"
+        fi
+        [ -n "$snapshot" ] || die "docker compose ps вернул пустой список — стек не поднят?"
+
+        for svc in $WIDGET_SERVICES; do
+            printf '%s\n' "$snapshot" | grep -q -- "-${svc}-" \
+                || die "сервиса '$svc' нет в выдаче docker compose ps — compose не тот или сервис не создан"
+        done
+
         bad=""
         while IFS=$'\t' read -r name state health; do
             [ -n "$name" ] || continue
@@ -119,20 +172,25 @@ wait_healthy() {
                         bad="${bad}${name}(${health}) "
                     fi ;;
                 exited)
+                    # Не мгновенная смерть: даём restart-политике отработать,
+                    # фатально только по исчерпании бюджета.
                     if ! docker inspect "$name" --format '{{.State.ExitCode}}' 2>/dev/null | grep -qx 0; then
-                        die "контейнер $name завершился с ненулевым кодом (см. docker logs $name)"
+                        bad="${bad}${name}(exited≠0) "
                     fi ;;
                 *) bad="${bad}${name}(${state}) " ;;
             esac
-        done < <(docker compose ps --all --format '{{.Name}}\t{{.State}}\t{{.Health}}' 2>/dev/null)
+        done <<EOF
+$snapshot
+EOF
 
         if [ -z "$bad" ]; then
             info "стек сошёлся за ${waited}с"
             return 0
         fi
+        last_bad="$bad"
         sleep 5; waited=$((waited + 5))
     done
-    die "стек не сошёлся за ${budget}с, не готовы: $bad"
+    die "стек не сошёлся за ${budget}с, не готовы: $last_bad"
 }
 
 acquire_lock() {
@@ -235,16 +293,33 @@ cmd_backup() {
 # ── apply ─────────────────────────────────────────────────────────────
 
 cmd_apply() {
-    acquire_lock
     echo "═══ apply${IMAGE_TAG:+ → $IMAGE_TAG} ═══"
 
+    # Валидация — ДО acquire_lock: всё, что может отказать до касания стенда,
+    # обязано отказывать как можно раньше.
     [ -n "${IMAGE_TAG:-}" ] || die "IMAGE_TAG обязателен"
+    validate_tag "$IMAGE_TAG"
+
+    acquire_lock
 
     local prev
     prev="$(current_tag_from_env)"
     if [ -n "$prev" ] && [ "$prev" != "$IMAGE_TAG" ]; then
         state_set PREVIOUS_TAG "$prev"
         info "предыдущий тег зафиксирован: $prev"
+    elif [ -z "$prev" ]; then
+        # ПЕРВЫЙ деплой на стенде, который жил на локально собранном образе:
+        # в .env не было IMAGE_TAG вовсе, поэтому «предыдущего тега» в новой
+        # схеме не существует и записать его неоткуда. Молчать об этом нельзя:
+        # любой сбой после up (миграции, health, смок) вызовет откат, который
+        # честно упадёт «нет предыдущего тега», и стенд останется на новом
+        # образе без автоматического возврата. Найдено кросс-ревью 2026-08-17
+        # (обоими рецензентами виджета).
+        echo "⚠️  ВНИМАНИЕ: в .env не было IMAGE_TAG — это первый деплой из реестра."
+        echo "    ОТКАТА НА ЭТОМ ПРОГОНЕ НЕ БУДЕТ: предыдущего реестрового тега не"
+        echo "    существует. Если релиз окажется плохим, возврат только вручную."
+        echo "    Со следующего деплоя откат появится автоматически."
+        state_set ROLLBACK_UNAVAILABLE "первый деплой из реестра $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     fi
 
     pin_tag "$IMAGE_TAG"
@@ -281,10 +356,19 @@ cmd_apply() {
 
     # `up -d` без --force-recreate умеет оставить старый контейнер живым —
     # тогда деплой «прошёл», а код старый.
-    local wrong
-    wrong=$(docker compose ps --format '{{.Image}}' 2>/dev/null \
-            | grep 'site-widget-backend' | grep -v ":${IMAGE_TAG}$" || true)
-    [ -z "$wrong" ] || die "на стенде остались контейнеры не на ${IMAGE_TAG}:\n$wrong"
+    #
+    # `--all` и положительное подтверждение: прежняя проверка ловила только
+    # «есть контейнер с ЧУЖИМ тегом», но не «контейнера нет вовсе» — при
+    # пустой выдаче она печатала «backend на sha-X» и считала apply успешным.
+    # Найдено кросс-ревью 2026-08-17.
+    local pairs wrong right
+    pairs="$(docker compose ps --all --format '{{.Service}} {{.Image}}')" \
+        || die "docker compose ps не отработал — не могу подтвердить раскатанный образ"
+    wrong="$(printf '%s\n' "$pairs" | awk '$1=="backend"' | grep -v ":${IMAGE_TAG}$" || true)"
+    [ -z "$wrong" ] || die "backend не на ${IMAGE_TAG}:\n$wrong"
+    right="$(printf '%s\n' "$pairs" | awk '$1=="backend"' | grep -c ":${IMAGE_TAG}$" || true)"
+    [ "${right:-0}" -ge 1 ] \
+        || die "контейнера backend на ${IMAGE_TAG} не найдено — проверка не подтверждена"
     info "backend на ${IMAGE_TAG}"
 
     state_set CURRENT_TAG "$IMAGE_TAG"
@@ -312,10 +396,29 @@ cmd_health() {
 # ── rollback ──────────────────────────────────────────────────────────
 
 cmd_rollback() {
+    local to="${1:-}" if_current="${2:-}"
+
+    # Гард «откатывать только если стенд действительно на этом теге».
+    # Без него автооткат срабатывал на ЛЮБОМ провале деплоя, включая те, где
+    # apply даже не дошёл до подмены .env: не взялся flock (три стенда делят
+    # дев-ВМ), не прошёл pull, упал preflight или backup. Тогда живой здоровый
+    # стенд уводился на версию НАЗАД от работающей, на ровном месте.
+    # Найдено кросс-ревью 2026-08-17.
+    if [ -n "$if_current" ]; then
+        local now; now="$(current_tag_from_env)"
+        if [ "$now" != "$if_current" ]; then
+            info "стенд на '${now:-?}', а не на '${if_current}' — apply его не тронул, откат не требуется"
+            return 0
+        fi
+    fi
+
     acquire_lock
-    local to="${1:-}"
     [ -n "$to" ] || to="$(state_get PREVIOUS_TAG)"
-    [ -n "$to" ] || die "нет предыдущего тега — откат невозможен, нужен ручной разбор"
+    if [ -z "$to" ]; then
+        local why; why="$(state_get ROLLBACK_UNAVAILABLE)"
+        [ -z "$why" ] || echo "   причина: $why" >&2
+        die "нет предыдущего тега — откат невозможен, нужен ручной разбор"
+    fi
 
     echo "═══ ОТКАТ на $to ═══"
     # Откуда откатываемся — фиксируем ДО подмены .env, иначе после pin_tag
@@ -327,16 +430,24 @@ cmd_rollback() {
     docker compose pull || info "pull не прошёл, надеемся на локальный кэш"
     docker compose up -d --no-build \
         || die "откат не поднялся — стенд в неопределённом состоянии, нужен ручной разбор"
-    wait_healthy 300
 
+    # Бухгалтерию пишем СРАЗУ после успешного up, ДО wait_healthy: провал
+    # ожидания по таймауту иначе оставлял .env и контейнеры на новом теге, а
+    # .deploy-state — со старыми значениями, то есть состояние расходилось с
+    # реальностью. Найдено кросс-ревью 2026-08-17.
     state_set CURRENT_TAG "$to"
     state_set ROLLED_BACK_AT "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     [ -n "$from" ] && state_set ROLLED_BACK_FROM "$from"
-    # PREVIOUS_TAG СНИМАЕМ, а не оставляем. Иначе после отката он указывает на
-    # тег, на котором стенд уже стоит, и ВТОРОЙ откат стал бы молчаливым no-op
-    # («откатились» туда же). Снятый — второй откат честно падает «нет
-    # предыдущего тега, нужен ручной разбор», и это правильный ответ: куда
-    # откатываться после неудачного отката, скрипт знать не может.
+
+    wait_healthy 300
+
+    # PREVIOUS_TAG СНИМАЕМ — но ТОЛЬКО после того, как откат реально сошёлся.
+    # Иначе он указывает на тег, на котором стенд уже стоит, и ВТОРОЙ откат
+    # стал бы молчаливым no-op («откатились» туда же). А если wait_healthy
+    # выше не прошёл, снимать нельзя: неудавшийся откат имеет право на повтор,
+    # и стирать единственную цель возврата в этот момент — худшее, что можно
+    # сделать. Поэтому строка стоит именно здесь, а не рядом с остальной
+    # бухгалтерией.
     state_unset PREVIOUS_TAG
     printf '%s rollback %s → %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${from:-?}" "$to" >> "$HISTORY_FILE"
 
@@ -367,7 +478,11 @@ cmd_status() {
 }
 
 cmd_commit() {
-    local tag="${1:-$IMAGE_TAG}" run="${2:-manual}"
+    # `${IMAGE_TAG:-}`, а не `$IMAGE_TAG`: под `set -u` ручной вызов
+    # `release.sh commit` без --tag и без IMAGE_TAG в окружении падал сырым
+    # «unbound variable» вместо человекочитаемого отказа.
+    local tag="${1:-${IMAGE_TAG:-}}" run="${2:-manual}"
+    [ -n "$tag" ] || die "commit: не задан ни --tag, ни IMAGE_TAG"
     state_set CURRENT_TAG "$tag"
     state_set DEPLOYED_BY "$run"
     printf '%s deploy → %s (%s)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$tag" "$run" >> "$HISTORY_FILE"
@@ -382,18 +497,33 @@ case "${1:-}" in
     apply)     cmd_apply ;;
     health)    cmd_health ;;
     rollback)  shift
-               # Явный if, а не `[ ... ] && shift`: под set -e ложное условие
-               # в && -списке роняет весь скрипт с кодом 1 ещё до вызова функции
-               # (поймано на деве 2026-08-17 — откат «падал» молча).
-               if [ "${1:-}" = "--to" ]; then shift; fi
-               cmd_rollback "${1:-}" ;;
+               # Явный разбор флагов, а не `[ ... ] && shift`. Уточнение к
+               # прежнему комментарию (он был неточен, проверено экспериментом
+               # 2026-08-17): как отдельный стейтмент и в СЕРЕДИНЕ функции
+               # `[ ложь ] && cmd` под `set -e` скрипт НЕ роняет. Ловушка — когда
+               # такой список ПОСЛЕДНИЙ стейтмент функции: тогда её код возврата
+               # равен 1 и уходит наверх.
+               to=""; if_current=""
+               while [ $# -gt 0 ]; do
+                   # `shift $(( $# > 1 ? 2 : 1 ))`, а не `shift 2`: флаг
+                   # последним аргументом дал бы `shift 2` при одном аргументе —
+                   # ненулевой код, и под `set -e` скрипт падал бы сырым
+                   # сообщением вместо die.
+                   case "$1" in
+                       --to)         to="${2:-}";         shift $(( $# > 1 ? 2 : 1 )) ;;
+                       --if-current) if_current="${2:-}"; shift $(( $# > 1 ? 2 : 1 )) ;;
+                       -*)           shift ;;
+                       *)            [ -n "$to" ] || to="$1"; shift ;;
+                   esac
+               done
+               cmd_rollback "$to" "$if_current" ;;
     status)    shift; cmd_status "${1:-}" ;;
     commit)    shift
                tag=""; run=""
                while [ $# -gt 0 ]; do
                    case "$1" in
-                       --tag) tag="$2"; shift 2 ;;
-                       --run) run="$2"; shift 2 ;;
+                       --tag) tag="${2:-}"; shift $(( $# > 1 ? 2 : 1 )) ;;
+                       --run) run="${2:-}"; shift $(( $# > 1 ? 2 : 1 )) ;;
                        *) shift ;;
                    esac
                done
