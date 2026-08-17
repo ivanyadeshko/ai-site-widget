@@ -71,6 +71,15 @@ state_get() {
     sed -n "s|^$1=||p" "$STATE_FILE" | tail -1
 }
 
+state_unset() {
+    [ -f "$STATE_FILE" ] || return 0
+    local tmp
+    tmp="$(mktemp "${STATE_FILE}.XXXXXX")"
+    grep -v "^$1=" "$STATE_FILE" > "$tmp" || true
+    chmod 600 "$tmp"
+    mv "$tmp" "$STATE_FILE"
+}
+
 # Источник истины — .env, а не .deploy-state: руками сделанный `up -d`
 # состояние не обновляет.
 current_tag_from_env() { env_get IMAGE_TAG; }
@@ -131,7 +140,13 @@ acquire_lock() {
     # в /dev/null (exec без команды меняет дескрипторы самой оболочки), после
     # чего все die-сообщения исчезают — скрипт падает молча. Поймано на деве
     # 2026-08-17. Поэтому доступность проверяем заранее и отдельно.
-    if ! : >>"$LOCK_FILE" 2>/dev/null; then
+    #
+    # Порядок перенаправлений ЗНАЧИМ: `2>/dev/null` стоит ПЕРВЫМ. Bash
+    # применяет их слева направо, и при `: >>файл 2>/dev/null` неудача
+    # открытия файла происходит РАНЬШЕ, чем stderr будет заглушён, — текст
+    # «Permission denied» утекал на терминал и читался как авария, хотя
+    # ветка отрабатывала штатно (тоже поймано на деве 2026-08-17).
+    if ! : 2>/dev/null >>"$LOCK_FILE"; then
         info "нет доступа к $LOCK_FILE — продолжаем без межсервисной блокировки"
         return 0
     fi
@@ -204,6 +219,10 @@ cmd_backup() {
     docker compose cp "widget-db:$tmp_in" "$file" || die "не смог забрать дамп из контейнера"
     docker compose exec -T widget-db rm -f "$tmp_in" || true
     [ -s "$file" ] || die "дамп пустой: $file"
+    # `docker compose cp` кладёт файл по umask — на деве вышло 644. Каталог
+    # закрыт (700), но дамп несёт переписку посетителей и лиды с телефонами:
+    # закрываем и его, чтобы права не зависели от umask запускающего.
+    chmod 600 "$file"
 
     size=$(du -h "$file" | cut -f1)
     info "бэкап готов: $(basename "$file") ($size), проверен pg_restore"
@@ -299,6 +318,10 @@ cmd_rollback() {
     [ -n "$to" ] || die "нет предыдущего тега — откат невозможен, нужен ручной разбор"
 
     echo "═══ ОТКАТ на $to ═══"
+    # Откуда откатываемся — фиксируем ДО подмены .env, иначе после pin_tag
+    # это уже не восстановить.
+    local from
+    from="$(current_tag_from_env)"
     pin_tag "$to"
 
     docker compose pull || info "pull не прошёл, надеемся на локальный кэш"
@@ -308,7 +331,14 @@ cmd_rollback() {
 
     state_set CURRENT_TAG "$to"
     state_set ROLLED_BACK_AT "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    printf '%s rollback → %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$to" >> "$HISTORY_FILE"
+    [ -n "$from" ] && state_set ROLLED_BACK_FROM "$from"
+    # PREVIOUS_TAG СНИМАЕМ, а не оставляем. Иначе после отката он указывает на
+    # тег, на котором стенд уже стоит, и ВТОРОЙ откат стал бы молчаливым no-op
+    # («откатились» туда же). Снятый — второй откат честно падает «нет
+    # предыдущего тега, нужен ручной разбор», и это правильный ответ: куда
+    # откатываться после неудачного отката, скрипт знать не может.
+    state_unset PREVIOUS_TAG
+    printf '%s rollback %s → %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${from:-?}" "$to" >> "$HISTORY_FILE"
 
     echo "⚠️  ОТКАТ ВЫПОЛНЕН на $to."
     echo "    ВНИМАНИЕ: схема БД НЕ откатывалась. Инвариант программы —"
@@ -328,9 +358,11 @@ cmd_status() {
             "$cur" "$prev" "$(state_get DEPLOYED_AT)" "$(state_get BACKUP_FILE)"
     else
         echo "current:  ${cur:-?}"
-        echo "previous: ${prev:-—}"
+        echo "previous: ${prev:-— (откат недоступен)}"
         echo "deployed: $(state_get DEPLOYED_AT)"
         echo "backup:   $(state_get BACKUP_FILE)"
+        local rb; rb="$(state_get ROLLED_BACK_AT)"
+        [ -z "$rb" ] || echo "откат:    $rb, с $(state_get ROLLED_BACK_FROM)"
     fi
 }
 
