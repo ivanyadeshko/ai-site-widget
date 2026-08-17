@@ -57,7 +57,7 @@ ai-site-widget такой зависимости нет и не должно б�
 
     /opt/conversation-core/worker/.venv/bin/python scripts/widget_smoke.py \\
         --base-url http://localhost:8200 --token <PUBLISH_TOKEN> \\
-        --psql 'docker compose -f /opt/site-widget/compose.yaml exec -T postgres psql -U widget -d site_widget'
+        --psql 'docker compose -f /opt/site-widget/compose.yaml exec -T widget-db psql -U widget -d site_widget'
 
 `--origin` не обязателен: смок сам возьмёт первый `allowed_origins` из ответа
 `/config`, если флаг не передан.
@@ -935,6 +935,74 @@ SCENARIOS: list[tuple[str, Any]] = [
     ("6-negatives", scenario_6_negatives),
 ]
 
+# Сценарии, которым НЕ нужен livekit-rtc: целиком HTTP + psql, комнату не
+# поднимают. Нужны отдельным списком, потому что предполётная проверка иначе
+# требует интерпретатор ВОРКЕРА ЯДРА — а гейт деплоя гоняется на раннере, где
+# venv ядра нет и быть не должно.
+#
+# 4-lead сюда НЕ входит, хотя сам по себе тоже обходится без LiveKit: он читает
+# ctx.dialog_id, который создаёт сценарий 1, и в одиночку падает
+# «сценарий 1 не подготовил dialog_id». Отвязка — отдельная работа.
+LIVEKIT_FREE: frozenset = frozenset({"6-negatives"})
+
+
+class OnlyError(Exception):
+    """Некорректный --only. Отдельный тип, чтобы main() отработал его как
+    SetupError (смок НЕ НАЧАЛСЯ), а не как вердикт о BFF.
+
+    Раньше здесь был голый `raise SystemExit(...)`: он вылетал мимо всех
+    except-веток main(), поэтому обязательная машиночитаемая строка
+    `SMOKE-RESULT:` НЕ печаталась, а код возврата 1 численно совпадал с
+    EXIT_ASSERT — то есть опечатка во флаге была НЕОТЛИЧИМА от красной
+    приёмки и утягивала исправный стенд в автооткат. Найдено кросс-ревью
+    2026-08-17.
+    """
+
+
+def select_scenarios(only: str) -> list:
+    """Отбор по --only: номер («6»), имя («6-negatives») или список через запятую.
+
+    Пустой --only = все шесть (поведение по умолчанию, обратно совместимо).
+    Неизвестное имя — ошибка, а НЕ тихий пропуск: молча пустой прогон выглядел
+    бы как зелёный гейт, то есть худший из возможных отказов.
+    """
+    if not only.strip():
+        return list(SCENARIOS)
+
+    picked: list = []
+    for w in (p.strip() for p in only.split(",")):
+        if not w:
+            continue
+        match = [s for s in SCENARIOS if s[0] == w or s[0].split("-", 1)[0] == w]
+        if not match:
+            raise OnlyError(
+                f"--only: неизвестный сценарий {w!r}. Доступны: "
+                + ", ".join(n for n, _ in SCENARIOS)
+            )
+        for m in match:
+            if m not in picked:
+                picked.append(m)
+
+    # Пустой результат при НЕПУСТОМ --only — это `--only ","` или `--only " , "`:
+    # все токены отсеялись как пустые, ни один не дошёл до проверки на
+    # неизвестность, и функция возвращала []. Дальше цикл сценариев не
+    # выполнялся ни разу и смок выходил с кодом 0 — ровно «молча пустой
+    # прогон выглядит как зелёный гейт», от чего этот докстринг и предостерегает.
+    # Воспроизведено 2026-08-17.
+    if not picked:
+        raise OnlyError(
+            f"--only={only!r} не отобрал ни одного сценария (пустые токены). "
+            "Пустой прогон не может считаться успешным."
+        )
+
+    # Порядок — КАНОНИЧЕСКИЙ, а не порядок перечисления в --only. Сценарии
+    # связаны по контексту (4 читает dialog_id, который создаёт 1), и
+    # `--only 3,1` прогнал бы третий раньше первого и упал бы на пустом
+    # dialog_id — отказ инструмента, выглядящий как вердикт о продукте.
+    order = {name: i for i, (name, _) in enumerate(SCENARIOS)}
+    picked.sort(key=lambda s: order[s[0]])
+    return picked
+
 
 # ── main ──────────────────────────────────────────────────────────────────
 
@@ -949,7 +1017,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="базовый URL BFF виджета (без хвостового /)")
     p.add_argument("--token", default=env("WIDGET_PUBLISH_TOKEN", ""),
                    help="publish_token демо-виджета (обязателен)")
-    p.add_argument("--psql", default=env("WIDGET_PSQL", "docker compose exec -T postgres psql -U widget -d site_widget"),
+    p.add_argument("--only", default=env("WIDGET_ONLY", ""),
+                   help="прогнать только указанные сценарии: номер ('6'), имя ('6-negatives') "
+                        "или список через запятую. Пусто — все шесть. Гейт деплоя гоняет '6': "
+                        "он единственный самодостаточный И не жгущий кредиты вендоров")
+    p.add_argument("--psql", default=env("WIDGET_PSQL", "docker compose exec -T widget-db psql -U widget -d site_widget"),
                    help="как звать psql BFF-Postgres (money-ассерты + прямая запись капа/фейка)")
     p.add_argument("--core-console", default=env("WIDGET_CORE_CONSOLE", ""),
                    help="необязательно: как звать консоль control-plane ядра — только для "
@@ -1000,17 +1072,36 @@ def main(argv: list[str]) -> int:
 
     verdicts: list[str] = []
 
+    try:
+        selected = select_scenarios(args.only)
+    except OnlyError as exc:
+        # Через тот же путь, что и прочие «смок не смог начать»: с эпилогом и
+        # обязательной строкой SMOKE-RESULT, кодом EXIT_SETUP (а не EXIT_ASSERT).
+        fail(str(exc))
+        _epilogue(EXIT_SETUP, [], 0)
+        return EXIT_SETUP
+
+    if args.only.strip():
+        info(f"отобрано сценариев: {len(selected)} из {len(SCENARIOS)} "
+             f"({', '.join(n for n, _ in selected)})")
+
     # ── Предполётная проверка: НЕ вердикт о BFF, а "смок вообще может начать" ──
     step("Предполётная проверка: SDK, BFF, конфиг виджета")
-    try:
-        import livekit.rtc  # noqa: F401
-    except ImportError as exc:
-        fail(
-            "нет livekit-rtc. Запускай интерпретатором ВОРКЕРА ЯДРА: "
-            f"/opt/conversation-core/worker/.venv/bin/python {sys.argv[0]} ... ({exc})"
-        )
-        _epilogue(EXIT_SETUP, [])
-        return EXIT_SETUP
+    # livekit-rtc спрашиваем, только если он кому-то из ОТОБРАННЫХ нужен.
+    # Безусловная проверка делала гейт деплоя невозможным вне сервера с venv
+    # воркера ядра — притом что сценарий 6 к LiveKit не прикасается.
+    if any(name not in LIVEKIT_FREE for name, _ in selected):
+        try:
+            import livekit.rtc  # noqa: F401
+        except ImportError as exc:
+            fail(
+                "нет livekit-rtc. Запускай интерпретатором ВОРКЕРА ЯДРА: "
+                f"/opt/conversation-core/worker/.venv/bin/python {sys.argv[0]} ... ({exc})"
+            )
+            _epilogue(EXIT_SETUP, [], len(selected))
+            return EXIT_SETUP
+    else:
+        info("livekit-rtc не требуется: отобранные сценарии комнату не поднимают")
 
     try:
         health = ctx.http("GET", "/healthz", timeout=10)
@@ -1039,13 +1130,13 @@ def main(argv: list[str]) -> int:
         ok(f"виджет '{cfg_body.get('name')}' включён, origin для легитимных запросов: {ctx.origin}")
     except SetupError as exc:
         fail(f"смок не смог начать: {exc}")
-        _epilogue(EXIT_SETUP, [])
+        _epilogue(EXIT_SETUP, [], len(selected))
         return EXIT_SETUP
     except CoreLostError as exc:
         # На предполётной проверке это тоже фактически «не смогли начать» —
         # BFF не успел даже толком отдать /healthz.
         fail(str(exc))
-        _epilogue(EXIT_SETUP, [])
+        _epilogue(EXIT_SETUP, [], len(selected))
         return EXIT_SETUP
 
     # ── 6 сценариев: вердикты СОБИРАЮТСЯ, прогон не обрывается на первом ────
@@ -1057,8 +1148,8 @@ def main(argv: list[str]) -> int:
     async def run_all() -> Optional[BaseException]:
         core_lost: Optional[BaseException] = None
         try:
-            for i, (name, fn) in enumerate(SCENARIOS, start=1):
-                step(f"Сценарий {i}/{len(SCENARIOS)}: {name}")
+            for i, (name, fn) in enumerate(selected, start=1):
+                step(f"Сценарий {i}/{len(selected)}: {name}")
                 try:
                     if asyncio.iscoroutinefunction(fn):
                         await fn(ctx)
@@ -1079,31 +1170,41 @@ def main(argv: list[str]) -> int:
     core_lost = asyncio.run(run_all())
 
     if core_lost is not None:
-        _epilogue(EXIT_CORE_LOST, verdicts)
+        _epilogue(EXIT_CORE_LOST, verdicts, len(selected))
         return EXIT_CORE_LOST
     if verdicts:
-        _epilogue(EXIT_ASSERT, verdicts)
+        _epilogue(EXIT_ASSERT, verdicts, len(selected))
         return EXIT_ASSERT
-    _epilogue(EXIT_OK, verdicts)
+    _epilogue(EXIT_OK, verdicts, len(selected))
     return EXIT_OK
 
 
-def _epilogue(code: int, verdicts: list[str]) -> None:
-    """Итог человеку + машиночитаемая последняя строка. (из chat_smoke.py ядра)"""
+def _epilogue(code: int, verdicts: list[str], total: int = len(SCENARIOS)) -> None:
+    """Итог человеку + машиночитаемая последняя строка. (из chat_smoke.py ядра)
+
+    `total` — сколько сценариев ОТОБРАНО этим прогоном (--only). Раньше здесь
+    было жёстко «все 6»: под --only такой итог врал бы ровно в ту сторону,
+    в которую врать нельзя — объявлял бы гейт фазы взятым по одному сценарию.
+    """
+    partial = total != len(SCENARIOS)
     print("", flush=True)
-    if code == EXIT_OK:
+    if code == EXIT_OK and not partial:
         print(f"ИТОГ ({_stamp()}): все 6 сценариев §8 прошли — чат+дедуп эха, re-enter, "
               "эскалация в голос, лид, вебхук→usage, три негатива. ЭТО ГЕЙТ ФАЗЫ.", flush=True)
+    elif code == EXIT_OK:
+        print(f"ИТОГ ({_stamp()}): прошли отобранные сценарии ({total} из {len(SCENARIOS)}). "
+              "ЭТО НЕ ГЕЙТ ФАЗЫ — гейтом считается только полный прогон без --only.", flush=True)
     elif code == EXIT_SETUP:
         print(f"ИТОГ ({_stamp()}): смок НЕ НАЧАЛСЯ (это не вердикт о BFF). "
-              "Диагностика — в строке FAIL выше. Ни один из 6 сценариев не запускался.", flush=True)
+              f"Диагностика — в строке FAIL выше. Ни один из {total} сценариев не запускался.",
+              flush=True)
     elif code == EXIT_CORE_LOST:
         print(f"ИТОГ ({_stamp()}): BFF/ядро ПРОПАЛИ посреди прогона — это инцидент, "
               "а не сбой инструмента. Остаток сценариев не гонялся.", flush=True)
         print("         Смотреть: docker compose ps на стенде, логи backend/worker за этот момент, "
               "канал до стенда (ssh-туннель).", flush=True)
     else:
-        print(f"ИТОГ ({_stamp()}): смок КРАСНЫЙ ({len(verdicts)} сценарий(ев) из {len(SCENARIOS)}: "
+        print(f"ИТОГ ({_stamp()}): смок КРАСНЫЙ ({len(verdicts)} сценарий(ев) из {total}: "
               f"{', '.join(verdicts) or '—'}). Диагностика — в строках FAIL выше. Красный смок — "
               "чинить код, а НЕ ослаблять ассерт.", flush=True)
         print("         Логи: docker compose logs --tail 200 backend | grep -Ei "
