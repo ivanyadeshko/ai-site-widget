@@ -1,0 +1,124 @@
+# Внешний аптайм-чек инфраструктуры Aski с раннеров GitHub.
+#
+# 2026-08-18: ПЕРЕНЕСЁН СЮДА ИЗ МОНОЛИТА (ivanyadeshko/ai-aski, задача A3
+# программы распила). Три причины, почему мониторинг живёт именно в репозитории
+# виджета, а не рядом с наблюдаемым кодом:
+#
+#  1. Публичный репозиторий → минуты Actions бесплатны и не расходуют квоту
+#     Free-плана. В монолите квота выгорала, и чек пришлось перевести на
+#     self-hosted раннер, который крутился на дев-ВМ — то есть «внешняя точка
+#     наблюдения» перестала быть внешней и умирала вместе с наблюдаемым
+#     хозяйством. Здесь снова ubuntu-latest: раннер вне нашего периметра.
+#  2. Независимость от наблюдаемых ВМ. uptime-kuma живёт на ops-ВМ и умрёт
+#     вместе с ней; этот cron заметит в том числе и это.
+#  3. Cron-прогоны каждые 15 минут забивали /actions/runs монолита, из-за чего
+#     гейт деплоя (он ищет прогоны CI по последним ранам) промахивался мимо
+#     нужного прогона. Здесь лента прогонов монолита остаётся чистой.
+#
+# Секреты (Settings → Secrets and variables → Actions этого репозитория):
+#   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID — те же имена, что были в монолите.
+# Без них шаг алерта деградирует в предупреждение в логе, а не падает.
+#
+# Алерт шлём только при недоступности; «всё ок» не спамим.
+name: Uptime check
+
+on:
+  schedule:
+    # Раз в 15 минут. Внимание: GitHub запускает schedule ТОЛЬКО с дефолтной
+    # ветки (main) и усыпляет расписание после 60 дней без активности в репо.
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+# Наблюдение за чужой инфраструктурой — репозиторий читать не нужно вовсе.
+permissions:
+  contents: read
+
+# Долгий прогон не должен наложиться на следующий тик cron.
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Внешний аптайм-чек
+    # Публичный репозиторий: только облачные раннеры GitHub, никаких
+    # self-hosted (чужой форк не должен получить исполнение на нашем железе).
+    runs-on: ubuntu-latest
+    # Cron во всех форках, кроме нашего, — бессмысленный шум и чужие алерты.
+    if: github.repository == 'ivanyadeshko/ai-site-widget'
+    timeout-minutes: 5
+
+    steps:
+      - name: Проверка эндпоинтов Aski
+        id: check
+        run: |
+          set +e
+          FAILED=""
+          check() {
+            local name="$1" url="$2" expected="$3"
+            local code
+            code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 15 "$url" 2>/dev/null)
+            echo "→ ${name}: HTTP ${code} (${url})"
+            if ! echo "$expected" | grep -qw "$code"; then
+              FAILED="${FAILED}\n• ${name}: HTTP ${code} (${url})"
+            fi
+          }
+          check "Лендинг"        "https://aski.pro"                              "200 301 302"
+          check "Прод SPA"       "https://app.aski.pro/healthz"                  "200"
+          check "Дев-стенд"      "https://app.dev.aski.pro/healthz"              "200"
+          check "GlitchTip"      "https://monitoring.dev.aski.pro/_health/"      "200"
+          # Grafana за basic auth → 401 без кредов = nginx/ops-ВМ живы.
+          check "Grafana (ops)"  "https://monitoring.dev.aski.pro/grafana/login" "200 401"
+
+          if [ -n "$FAILED" ]; then
+            {
+              echo "failed<<UPTIME_EOF"
+              echo -e "$FAILED"
+              echo "UPTIME_EOF"
+            } >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      # До G3-переезда vell.pro отдаёт чужой сертификат — мониторинг
+      # информационный. Фактически на 2026-08-18 хост отвечает сертификатом
+      # CN=aski.pro (SAN: aski.pro, www.aski.pro), поэтому curl без -k рвёт
+      # TLS-хендшейк и возвращает код 000. Падение этого шага НЕ должно валить
+      # прогон и НЕ должно поднимать дежурного: continue-on-error + отдельный
+      # шаг вместо строки в общем check-скрипте. После G3 (свой сертификат на
+      # vell.pro) — убрать continue-on-error и перенести URL в блок выше.
+      - name: 'vell.pro (информационно, до G3-переезда)'
+        id: vell
+        if: always()
+        continue-on-error: true
+        run: |
+          set +e
+          err=$(mktemp)
+          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 15 "https://vell.pro/" 2>"$err")
+          echo "→ vell.pro: HTTP ${code} (https://vell.pro/)"
+          [ -s "$err" ] && echo "  curl: $(cat "$err")"
+          if ! echo "200 301 302" | grep -qw "$code"; then
+            echo "::warning title=vell.pro::Ожидаемо до G3-переезда: HTTP ${code} — хост отдаёт сертификат CN=aski.pro, TLS-хендшейк не проходит."
+            exit 1
+          fi
+
+      - name: Алерт в Telegram
+        if: failure() && steps.check.outputs.failed != ''
+        env:
+          # Секреты и текст ошибки — через env, а не через прямую подстановку
+          # ${{ }} в тело скрипта: публичный репозиторий, и подставляемый текст
+          # не должен иметь шанса стать кодом shell.
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FAILED: ${{ steps.check.outputs.failed }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "::warning title=Telegram::Секреты TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID не заведены в этом репозитории — алерт не отправлен."
+            exit 0
+          fi
+          TEXT=$(printf '🚨 Uptime (GitHub Actions): недоступны:%s\n\n%s' "$FAILED" "$RUN_URL")
+          curl -sS --max-time 20 --retry 3 --retry-delay 5 -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -H 'Content-Type: application/json' \
+            -d "$(jq -n --arg text "$TEXT" --arg chat "$TELEGRAM_CHAT_ID" \
+                  '{chat_id: $chat, text: $text, disable_web_page_preview: true}')"
