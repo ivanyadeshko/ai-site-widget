@@ -33,7 +33,12 @@
 #     preflight проверяет сеть до того, как тронуть стенд.
 #   • Миграции — node-pg-migrate через exec в backend, после `up`.
 #
-# Env: REPO_DIR (авто), IMAGE_TAG, WIDGET_HEALTH_URL, BACKUP_RETAIN, IMAGE_OWNER.
+#   • Лендинг (профиль `site`, образ vell-site) — второй сервис того же
+#     релиза: preflight сверяет и его тег в реестре, health опрашивает и его.
+#     Включённость профиля берётся из COMPOSE_PROFILES в .env.
+#
+# Env: REPO_DIR (авто), IMAGE_TAG, WIDGET_HEALTH_URL, SITE_HEALTH_URL,
+#      BACKUP_RETAIN, IMAGE_OWNER.
 # ──────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
@@ -214,6 +219,25 @@ acquire_lock() {
 
 health_url() { printf '%s' "${WIDGET_HEALTH_URL:-http://localhost:8200/healthz}"; }
 
+# Лендинг на этом стенде включён? Правда одна — COMPOSE_PROFILES в .env
+# (по нему compose и решает, существуют ли сервисы site*). Разбираем как
+# список через запятую, а не `grep site`: подстрока совпала бы и с чужим
+# профилем вроде `site-preview`, и стенд без лендинга получил бы лишние
+# проверки и лишние die.
+site_profile_enabled() {
+    local profiles item
+    profiles="$(env_get COMPOSE_PROFILES)"
+    [ -n "$profiles" ] || return 1
+    local IFS=','
+    for item in $profiles; do
+        item="$(printf '%s' "$item" | tr -d '[:space:]')"
+        [ "$item" = "site" ] && return 0
+    done
+    return 1
+}
+
+site_health_url() { printf '%s' "${SITE_HEALTH_URL:-http://127.0.0.1:3000/api/health}"; }
+
 # ── preflight ─────────────────────────────────────────────────────────
 
 cmd_preflight() {
@@ -248,6 +272,18 @@ cmd_preflight() {
         docker manifest inspect "ghcr.io/${owner}/site-widget-backend:${IMAGE_TAG}" >/dev/null 2>&1 \
             || die "образ site-widget-backend:${IMAGE_TAG} недоступен в ghcr (нет тега или docker login протух)"
         info "образ ${IMAGE_TAG} найден в реестре"
+
+        # Лендинг едет ОТДЕЛЬНЫМ образом (vell-site), публикуемым той же
+        # джобой релиза. На стенде с профилем `site` его отсутствие всплыло бы
+        # только на `pull` внутри apply — то есть уже ПОСЛЕ подмены тега в
+        # .env, в состоянии «наполовину задеплоено», ровно от которого этот
+        # preflight и защищает backend. Стенд без профиля проверку не делает:
+        # образ ему не нужен, и требовать его там — ложный отказ деплоя.
+        if site_profile_enabled; then
+            docker manifest inspect "ghcr.io/${owner}/vell-site:${IMAGE_TAG}" >/dev/null 2>&1 \
+                || die "образ vell-site:${IMAGE_TAG} недоступен в ghcr, а профиль site включён (нет тега или docker login протух)"
+            info "образ лендинга vell-site:${IMAGE_TAG} найден в реестре"
+        fi
     fi
 
     echo "✅ preflight пройден"
@@ -286,8 +322,43 @@ cmd_backup() {
     info "бэкап готов: $(basename "$file") ($size), проверен pg_restore"
     state_set BACKUP_FILE "backups/$(basename "$file")"
 
-    ls -1t "$BACKUP_DIR"/*.dump 2>/dev/null | tail -n "+$((BACKUP_RETAIN + 1))" | xargs -r rm -f
-    info "в каталоге $(ls -1 "$BACKUP_DIR"/*.dump 2>/dev/null | wc -l) дампов (лимит $BACKUP_RETAIN)"
+    ls -1t "$BACKUP_DIR"/pre-*.dump 2>/dev/null | tail -n "+$((BACKUP_RETAIN + 1))" | xargs -r rm -f
+    info "в каталоге $(ls -1 "$BACKUP_DIR"/pre-*.dump 2>/dev/null | wc -l) дампов (лимит $BACKUP_RETAIN)"
+
+    # ── БД лендинга (compose-профиль `site`) ──────────────────────────
+    # Контент CMS — тоже данные, и терять их деплоем нельзя. Условно: на
+    # стенде без профиля `site` сервиса site-db просто нет, и это не ошибка.
+    # `ps --services --all` перечисляет сервисы всех профилей, поэтому
+    # проверяем не «объявлен ли сервис», а «есть ли у него контейнер».
+    if ! docker compose ps --services --all 2>/dev/null | grep -qx 'site-db'; then
+        info "site-db не поднят (профиль site выключен) — бэкап лендинга пропущен"
+        return 0
+    fi
+
+    local site_file site_tmp site_size
+    site_file="$BACKUP_DIR/site-pre-${IMAGE_TAG:-manual}-$(date -u +%Y%m%dT%H%M%SZ).dump"
+    site_tmp="/tmp/release-backup-site-$$.dump"
+
+    # Пользователь и БД зашиты в compose (site/vell_site) — та же логика
+    # единственной точки правды, что и у widget-db выше.
+    docker compose exec -T site-db sh -c \
+        "pg_dump -U site -d vell_site -Fc -f '$site_tmp'" \
+        || die "pg_dump site-db не отработал"
+
+    docker compose exec -T site-db pg_restore --list "$site_tmp" >/dev/null \
+        || { docker compose exec -T site-db rm -f "$site_tmp" || true; die "дамп site-db не читается pg_restore"; }
+
+    docker compose cp "site-db:$site_tmp" "$site_file" || die "не смог забрать дамп site-db из контейнера"
+    docker compose exec -T site-db rm -f "$site_tmp" || true
+    [ -s "$site_file" ] || die "дамп site-db пустой: $site_file"
+    chmod 600 "$site_file"
+
+    site_size=$(du -h "$site_file" | cut -f1)
+    info "бэкап лендинга готов: $(basename "$site_file") ($site_size), проверен pg_restore"
+
+    # Ретенция считается ОТДЕЛЬНО по маске: общий счётчик вымывал бы дампы
+    # виджета вдвое быстрее, стоило появиться второй базе.
+    ls -1t "$BACKUP_DIR"/site-pre-*.dump 2>/dev/null | tail -n "+$((BACKUP_RETAIN + 1))" | xargs -r rm -f
 }
 
 # ── apply ─────────────────────────────────────────────────────────────
@@ -381,16 +452,35 @@ cmd_apply() {
 cmd_health() {
     local url; url="$(health_url)"
     echo "═══ health $url ═══"
-    local code i
+    local code i healthy=0
     for i in $(seq 1 30); do
         code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$url" 2>/dev/null || echo 000)
         if [ "$code" = "200" ]; then
             echo "✅ healthy (попытка $i)"
+            healthy=1
+            break
+        fi
+        sleep 5
+    done
+    [ "$healthy" = "1" ] || die "$url не отдал 200 за 150с (последний код: $code)"
+
+    # Лендинг — второй сервис того же релиза, и без этой проверки деплой
+    # считался бы успешным при мёртвом апексе: BFF отвечает, а vell.pro
+    # отдаёт 502, и узнаёт об этом первый посетитель. Порог короче, чем у
+    # BFF: `site` стартует после one-shot `site-migrate`, то есть к моменту
+    # этой проверки миграции уже отработали.
+    site_profile_enabled || return 0
+    local site_url; site_url="$(site_health_url)"
+    echo "═══ health лендинга $site_url ═══"
+    for i in $(seq 1 24); do
+        code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$site_url" 2>/dev/null || echo 000)
+        if [ "$code" = "200" ]; then
+            echo "✅ лендинг healthy (попытка $i)"
             return 0
         fi
         sleep 5
     done
-    die "$url не отдал 200 за 150с (последний код: $code)"
+    die "$site_url не отдал 200 за 120с (последний код: $code)"
 }
 
 # ── rollback ──────────────────────────────────────────────────────────

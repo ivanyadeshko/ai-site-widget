@@ -57,6 +57,81 @@ services:
       timeout: 3s
       retries: 20
 
+  # ── лендинг vell.pro (профиль `site`) ────────────────────────────────
+  # Три сервиса под профилем: без COMPOSE_PROFILES=site в .env их для
+  # `docker compose up` не существует — стенд, которому лендинг не нужен,
+  # не платит за него ни контейнером, ни томом (решение D-12 плана).
+  site-db:
+    profiles: [site]
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: site
+      POSTGRES_PASSWORD: ${SITE_DB_PASSWORD}
+      POSTGRES_DB: vell_site
+    # Порт на хост НЕ публикуем: в БД лендинга снаружи ходить незачем,
+    # а открытый 5432 на стенде — лишняя поверхность.
+    volumes: ["site-pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U site -d vell_site"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # One-shot: катает миграции Payload и завершается. Сервис `site` стартует
+  # только после его успешного выхода (service_completed_successfully) —
+  # иначе Next поднялся бы на пустой схеме и отдавал 500 на каждой странице.
+  site-migrate:
+    profiles: [site]
+    image: ${SITE_IMAGE:-ghcr.io/${IMAGE_OWNER:-ivanyadeshko}/vell-site:${IMAGE_TAG:-latest}}
+    restart: "no"
+    command: ["npm", "run", "migrate"]
+    environment:
+      DATABASE_URI: postgres://site:${SITE_DB_PASSWORD}@site-db:5432/vell_site
+      PAYLOAD_SECRET: ${PAYLOAD_SECRET}
+    depends_on:
+      site-db: { condition: service_healthy }
+
+  site:
+    profiles: [site]
+    image: ${SITE_IMAGE:-ghcr.io/${IMAGE_OWNER:-ivanyadeshko}/vell-site:${IMAGE_TAG:-latest}}
+    # `build:` — для локальной проверки (`docker compose --profile site build`).
+    # На стенде release.sh ходит строго pull + up -d --no-build, как и с BFF.
+    build:
+      context: "${SITE_BUILD_CONTEXT:-../site}"
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_SERVER_URL: ${NEXT_PUBLIC_SERVER_URL}
+        NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL}
+    restart: unless-stopped
+    environment:
+      DATABASE_URI: postgres://site:${SITE_DB_PASSWORD}@site-db:5432/vell_site
+      PAYLOAD_SECRET: ${PAYLOAD_SECRET}
+      NEXT_PUBLIC_SERVER_URL: ${NEXT_PUBLIC_SERVER_URL}
+      NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL}
+      # Сид-роут деструктивен, по умолчанию выключен (404). См. site/README.
+      ENABLE_SEED_ROUTES: ${ENABLE_SEED_ROUTES:-}
+    ports: ["3000:3000"]
+    # Загруженные в CMS картинки лежат в томе, а не в образе: пересборка
+    # образа не должна стирать медиатеку.
+    volumes: ["site-media:/app/public/media"]
+    depends_on:
+      site-migrate: { condition: service_completed_successfully }
+    healthcheck:
+      # /api/health не ходит в Payload/БД: здоровье контейнера не зависит от
+      # того, засеян ли контент.
+      #
+      # 127.0.0.1, а НЕ localhost: standalone-сервер Next слушает только
+      # IPv4 0.0.0.0:3000, а `localhost` внутри контейнера резолвится сначала
+      # в ::1 — busybox-wget получает connection refused и контейнер вечно
+      # висит unhealthy при полностью живом сервисе (проверено: 22 подряд
+      # неудачных пробы, при этом curl снаружи отдаёт 200).
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
 networks:
   default:
   # Внешняя сеть ядра (conversation-core). BFF ходит в control-plane по ней.
@@ -68,3 +143,6 @@ networks:
 
 volumes:
   widget-pgdata:
+  # Тома лендинга. Создаются только когда профиль `site` активен.
+  site-pgdata:
+  site-media:

@@ -123,3 +123,29 @@ jobs:
       # раскатка = rsync исходников + сборка на месте до появления реестра).
       - name: docker build
         run: docker build -f infra/Dockerfile -t site-widget-backend:ci .
+
+  site-build:
+    name: site/Dockerfile builds (лендинг)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # Гейт лендинга. Отдельная джоба, а не шаг в `test`: site/ — ОТДЕЛЬНЫЙ
+      # npm-проект вне корневого workspace (решение D-10), у него свой
+      # package-lock.json и свой `npm ci --legacy-peer-deps`; смешивать его
+      # с корневым `npm ci` нельзя — peer-конфликты Payload/Next/React 19
+      # сломали бы установку backend/embed/panel.
+      #
+      # Тестов у Payload-слоя нет (их нет и в apps/cms монолита; заводить
+      # фреймворк ради лендинга — не наш скоуп), поэтому исполняемый гейт
+      # здесь — факт сборки образа. Build-args обязательны: site/Dockerfile
+      # валится fail-fast'ом, если домены не переданы (иначе кнопки лендинга
+      # запеклись бы пустыми).
+      - name: docker build (site)
+        run: |
+          docker build -f site/Dockerfile site/ -t vell-site:ci \
+            --build-arg NEXT_PUBLIC_SERVER_URL=https://vell.pro \
+            --build-arg NEXT_PUBLIC_APP_URL=https://app.vell.pro
