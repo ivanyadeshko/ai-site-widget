@@ -16,6 +16,11 @@ export type AppConfig = {
    */
   maxDialogsPerVisitorPerDay: number;
   maxDialogsPerIpPerDay: number;
+  /**
+   * Суточный кап сессий на АККАУНТ ВИТРИНЫ — третий ключ поверх visitor/IP.
+   * Действует, пока у аккаунта нет своей строки в `account_limits`.
+   */
+  maxSessionsPerAccountPerDay: number;
   maxDurationS: number;
   /** Только за реальным обратным прокси: иначе X-Forwarded-For ломает IP-кап. */
   trustProxy: boolean;
@@ -77,6 +82,10 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
     // фрагментация одного разговора на несколько сессий душит легитимных.
     maxDialogsPerVisitorPerDay: int(env.MAX_DIALOGS_PER_VISITOR_PER_DAY, 20),
     maxDialogsPerIpPerDay: int(env.MAX_DIALOGS_PER_IP_PER_DAY, 60),
+    // Дефолт на аккаунт заметно выше визиторного: у владельца сайта посетителей
+    // много, и кап здесь — предохранитель от выжигания баланса общего тенанта
+    // ядра, а не инструмент тарификации (тариф — строка в account_limits).
+    maxSessionsPerAccountPerDay: int(env.MAX_SESSIONS_PER_ACCOUNT_PER_DAY, 300),
     maxDurationS: int(env.CORE_MAX_DURATION_S, 600),
     // Небезопасное значение требует ЯВНОГО согласия: дефолт закрыт.
     trustProxy: env.TRUST_PROXY === '1',

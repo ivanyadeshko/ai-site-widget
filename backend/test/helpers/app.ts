@@ -30,6 +30,7 @@ export async function buildTestApp(overrides: Partial<AppConfig> = {}): Promise<
     ipHashSalt: 'соль',
     maxDialogsPerVisitorPerDay: 20,
     maxDialogsPerIpPerDay: 60,
+    maxSessionsPerAccountPerDay: 300,
     maxDurationS: 600,
     trustProxy: false,
     logLevel: 'silent',

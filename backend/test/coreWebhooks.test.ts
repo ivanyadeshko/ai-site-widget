@@ -33,6 +33,7 @@ beforeAll(async () => {
       coreTenantKey: 'sk_test_x', coreWebhookSecret: SECRET, publicOrigin: 'http://localhost:8200',
       cspConnectSrc: "'self'", ipHashSalt: 'соль', maxDialogsPerVisitorPerDay: 10,
       maxDialogsPerIpPerDay: 30, maxDurationS: 600, trustProxy: false, logLevel: 'silent',
+      maxSessionsPerAccountPerDay: 300,
       sessionTtlDays: 30, panelOrigin: 'http://localhost:8200', cookieSecure: false,
       loginMaxFailures: 10, loginLockMinutes: 15,
     },
