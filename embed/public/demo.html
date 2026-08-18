@@ -10,8 +10,33 @@
   <p>Страница существует ради одного: проверить виджет на «чужом» сайте.</p>
   <p><strong>Голос требует secure context.</strong> На деве открывать строго так:</p>
   <pre>ssh -L 8200:localhost:8200 root@185.125.102.133
-# затем http://localhost:8200/demo.html — localhost считается secure context</pre>
-  <!-- Сниппет ровно в том виде, в каком его получит владелец сайта. -->
-  <script src="/w.js" data-widget="ПОДСТАВИТЬ_PUBLISH_TOKEN" async></script>
+# затем http://localhost:8200/demo.html?token=&lt;publish_token&gt; — localhost считается secure context</pre>
+  <p id="hint"></p>
+  <!--
+    Токен приезжает параметром ?token=, а не зашит в разметку: прежний
+    плейсхолдер требовал ПЕРЕСБОРКИ ОБРАЗА под каждый виджет и делал
+    демо-страницу непригодной для e2e (Task 25).
+
+    Ставится он через setAttribute, а НЕ склейкой разметки строками: иначе
+    страница сама стала бы XSS-полигоном для любого, кому прислали ссылку
+    с ?token=.
+    Итоговый тег — ровно тот сниппет, который владелец копирует в панели.
+  -->
+  <script>
+    (function () {
+      var token = new URLSearchParams(location.search).get('token');
+      var hint = document.getElementById('hint');
+      if (!token) {
+        hint.textContent = 'Добавьте ?token=<publish_token> в адрес — без него виджету нечего загружать.';
+        return;
+      }
+      hint.textContent = 'Виджет загружается с токеном: ' + token;
+      var s = document.createElement('script');
+      s.src = '/w.js';
+      s.async = true;
+      s.setAttribute('data-widget', token);
+      document.body.appendChild(s);
+    })();
+  </script>
 </body>
 </html>

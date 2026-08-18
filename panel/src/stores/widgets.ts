@@ -9,6 +9,26 @@ export type AgentConfig = {
   avatar_id?: string;
 };
 
+/**
+ * Оформление виджета — ЗЕРКАЛО `backend/src/widgets/theme.ts`.
+ *
+ * Общего .d.ts у бэкенда и панели нет, и рассинхрон типов компилятор не ловит
+ * (вводная кросс-ревью потоков II+III). Страхуют два теста: сквозной
+ * `backend/test/widgetTheme.test.ts` («поле theme доехало ВЕЗДЕ») и тест формы
+ * в `panel/test/widgetEditView.test.ts`.
+ *
+ * Все поля необязательные: здесь лежит ТОЛЬКО заданное владельцем. Дефолты
+ * добивает бэкенд на публичном пути `/w/v1/:token/config` — панель их не знает
+ * и знать не должна, иначе они разъедутся.
+ */
+export type WidgetTheme = {
+  color?: string;
+  position?: 'right' | 'left';
+  button_label?: string;
+  title?: string;
+  launcher_title?: string;
+};
+
 export type Widget = {
   id: string;
   name: string;
@@ -17,7 +37,13 @@ export type Widget = {
   allowed_origins: string[];
   agent_config: AgentConfig;
   created_at: string;
-  /** Наполняется в Task 13; сейчас бэкенд отдаёт пустую строку. */
+  theme: WidgetTheme;
+  /**
+   * Готовый `<script>` для вставки на сайт. Собран БЭКЕНДОМ
+   * (`backend/src/widgets/snippet.ts`) и показывается как есть: панель его не
+   * досочиняет — на мультидоменной раскладке в нём есть `data-host`, знать про
+   * который фронту незачем.
+   */
   embed_snippet: string;
   app_url: string;
 };
@@ -27,6 +53,9 @@ export type WidgetDraft = {
   agent_config: AgentConfig;
   allowed_origins: string[];
 };
+
+/** Тело PATCH: любое подмножество черновика плюс переключатели и тема. */
+export type WidgetPatch = Partial<WidgetDraft> & { enabled?: boolean; theme?: WidgetTheme };
 
 export const useWidgetsStore = defineStore('widgets', () => {
   const items = ref<Widget[]>([]);
@@ -60,7 +89,7 @@ export const useWidgetsStore = defineStore('widgets', () => {
       : [...items.value.slice(0, index), widget, ...items.value.slice(index + 1)];
   }
 
-  async function update(id: string, patch: Partial<WidgetDraft> & { enabled?: boolean }): Promise<Widget> {
+  async function update(id: string, patch: WidgetPatch): Promise<Widget> {
     const { widget } = await PanelApi.patch<{ widget: Widget }>(`/widgets/${id}`, patch);
     replace(widget);
     return widget;

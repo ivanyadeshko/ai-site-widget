@@ -4,6 +4,7 @@ import PanelLayout from '../layouts/PanelLayout.vue';
 import LoginView from '../views/LoginView.vue';
 import RegisterView from '../views/RegisterView.vue';
 import WidgetEditView from '../views/WidgetEditView.vue';
+import WidgetInstallView from '../views/WidgetInstallView.vue';
 import WidgetsView from '../views/WidgetsView.vue';
 import { useSessionStore } from '../stores/session.ts';
 
@@ -26,7 +27,7 @@ export const routes: RouteRecordRaw[] = [
     children: [
       { path: '', name: 'widgets', component: WidgetsView },
       { path: 'widgets/:id', name: 'widget', component: WidgetEditView },
-      { path: 'widgets/:id/install', name: 'widget-install', component: stub('Установка на сайт') },
+      { path: 'widgets/:id/install', name: 'widget-install', component: WidgetInstallView },
       { path: 'leads', name: 'leads', component: stub('Лиды') },
       { path: 'dialogs', name: 'dialogs', component: stub('Диалоги') },
       { path: 'usage', name: 'usage', component: stub('Использование') },

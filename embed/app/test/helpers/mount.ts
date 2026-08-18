@@ -163,6 +163,8 @@ export type MountOptions = {
   dialogId?: string | null;
   agentJoinsOnConnect?: boolean;
   startError?: { status: number; code: string; message: string };
+  /** Тема из init-сообщения хоста. Не задана — панель ведёт себя как до темизации. */
+  theme?: Record<string, string>;
 };
 
 export type MountedRoom = {
@@ -207,7 +209,11 @@ export async function mountWidget(opts: MountOptions = {}): Promise<{
   mounted.push(wrapper);
   await flushPromises();                        // onMounted: config → setAllowedOrigins/listen/ready
 
-  shared.bridgeOpts!.onInit({ visitorKey: VISITOR_KEY, dialogId: opts.dialogId ?? null });
+  shared.bridgeOpts!.onInit({
+    visitorKey: VISITOR_KEY,
+    dialogId: opts.dialogId ?? null,
+    ...(opts.theme === undefined ? {} : { theme: opts.theme }),
+  });
   await flushPromises();                        // openThread → startDialog → applyStart → connect → client_ready
 
   const handlers = (): NonNullable<typeof shared.handlers> => shared.handlers!;

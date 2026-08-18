@@ -1,3 +1,4 @@
+import type { WidgetTheme } from '../../widgets/theme.ts';
 import type { Queryable } from '../pool.ts';
 
 export type AgentConfig = { instructions: string; greeting?: string; voice_id?: string; avatar_id?: string };
@@ -13,6 +14,8 @@ export type WidgetRow = {
   created_at: Date;
   /** NULL — наследие релиза 1: виджеты, заведённые до появления аккаунтов. */
   account_id: string | null;
+  /** Только то, что владелец реально задал; `{}` = «всё по умолчанию». */
+  theme: WidgetTheme;
 };
 
 /** Виджет вместе с ответом на вопрос «владелец не заблокирован?» — одним запросом. */
@@ -24,9 +27,10 @@ export type WidgetPatch = {
   agentConfig?: AgentConfig;
   allowedOrigins?: string[];
   enabled?: boolean;
+  theme?: WidgetTheme;
 };
 
-const COLS = 'id, publish_token, name, agent_config, kb_ids, allowed_origins, enabled, created_at, account_id';
+const COLS = 'id, publish_token, name, agent_config, kb_ids, allowed_origins, enabled, created_at, account_id, theme';
 
 export async function findWidgetByToken(db: Queryable, token: string): Promise<WidgetWithOwner | null> {
   // LEFT JOIN, а НЕ INNER: строки с account_id IS NULL обязаны продолжать
@@ -34,7 +38,7 @@ export async function findWidgetByToken(db: Queryable, token: string): Promise<W
   // существующий прод разом. У таких строк owner_blocked = false.
   const { rows } = await db.query<WidgetWithOwner>(
     `SELECT w.id, w.publish_token, w.name, w.agent_config, w.kb_ids, w.allowed_origins,
-            w.enabled, w.created_at, w.account_id,
+            w.enabled, w.created_at, w.account_id, w.theme,
             (a.blocked_at IS NOT NULL) AS owner_blocked
        FROM widgets w
        LEFT JOIN accounts a ON a.id = w.account_id
@@ -72,17 +76,30 @@ export async function findWidgetByIdForAccount(
   return rows[0] ?? null;
 }
 
+/*
+ * ИНВАРИАНТ ТЕМЫ (держит безопасность лоадера на чужом сайте).
+ *
+ * `widgets.theme` уезжает в `/w/v1/:token/config`, а оттуда — прямо в
+ * шаблонную строку `<style>` внутри Shadow DOM на ЧУЖОЙ странице
+ * (`embed/loader/src/loader.ts`). Лоадер валидации не содержит вовсе — это
+ * осознанное решение ради бюджета 8 КБ gzip (D-9). Значит, единственная
+ * линия защиты — вот эти две функции: любая запись в колонку `theme` обязана
+ * идти через `parseTheme` (`backend/src/widgets/theme.ts`). Появится третий
+ * путь записи (админка, импорт, сид) без него — получим CSS-инъекцию у
+ * каждого посетителя сайта владельца.
+ */
 export async function insertWidget(db: Queryable, input: {
   accountId: string; name: string; publishToken: string;
-  agentConfig: AgentConfig; allowedOrigins: string[];
+  agentConfig: AgentConfig; allowedOrigins: string[]; theme?: WidgetTheme;
 }): Promise<WidgetRow> {
   const { rows } = await db.query<WidgetRow>(
-    `INSERT INTO widgets (account_id, name, publish_token, agent_config, allowed_origins)
-     VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)
+    `INSERT INTO widgets (account_id, name, publish_token, agent_config, allowed_origins, theme)
+     VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb)
      RETURNING ${COLS}`,
     [
       input.accountId, input.name, input.publishToken,
       JSON.stringify(input.agentConfig), JSON.stringify(input.allowedOrigins),
+      JSON.stringify(input.theme ?? {}),
     ],
   );
   return rows[0]!;
@@ -103,6 +120,7 @@ export async function updateWidget(
   if (patch.enabled !== undefined) push('enabled', patch.enabled);
   if (patch.agentConfig !== undefined) push('agent_config', JSON.stringify(patch.agentConfig));
   if (patch.allowedOrigins !== undefined) push('allowed_origins', JSON.stringify(patch.allowedOrigins));
+  if (patch.theme !== undefined) push('theme', JSON.stringify(patch.theme));
 
   if (sets.length === 0) return findWidgetByIdForAccount(db, id, accountId);
 

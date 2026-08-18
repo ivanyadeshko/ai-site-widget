@@ -6,7 +6,7 @@ import ResumeBanner from './components/ResumeBanner.vue';
 import VoicePanel from './components/VoicePanel.vue';
 import LeadForm from './components/LeadForm.vue';
 import { WidgetApi, type ApiFailure, type ParticipantToken, type ReenterResult, type StartDialogResult } from './lib/api.ts';
-import { createBridge } from './lib/bridge.ts';
+import { createBridge, type BridgeTheme } from './lib/bridge.ts';
 import { createEchoGuard } from './lib/echoGuard.ts';
 import { createResender } from './lib/resender.ts';
 import { CoreRoom, type CorePublication, type CoreTrack } from './lib/room.ts';
@@ -106,9 +106,23 @@ const room = new CoreRoom({
   onTrack: onAudioTrack,
 });
 
+// Оформление приезжает от хоста в init (D-8): своим запросом за ним панель не
+// ходит. `null` — старый бэкенд без темы: панель тогда выглядит как до
+// темизации, без заголовка и без акцента.
+const theme = ref<BridgeTheme | null>(null);
+const panelTitle = computed(() => theme.value?.title ?? '');
+// Акцент — переменной на корне, а не инлайновым цветом на каждой кнопке: так
+// его подхватывают все элементы панели разом, включая будущие.
+const themeStyle = computed(() => (
+  theme.value?.color ? { '--vell-accent': theme.value.color } : {}
+));
+
 const bridge = createBridge({
   allowedOrigins: [],                     // заполнится из /config в onMounted
-  onInit: ({ visitorKey: key, dialogId: saved }) => void openThread(key, saved),
+  onInit: ({ visitorKey: key, dialogId: saved, theme: hostTheme }) => {
+    if (hostTheme) theme.value = hostTheme;
+    void openThread(key, saved);
+  },
   onVisibility: () => undefined,
 });
 
@@ -328,7 +342,8 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="widget">
+  <div class="widget" :style="themeStyle">
+    <header v-if="panelTitle" class="widget__title" data-test="panel-title">{{ panelTitle }}</header>
     <ChatFeed :bubbles="bubbles" :typing="typing" />
     <VoicePanel v-if="phase === 'voice'" :mic-state="micState" @toggle-mic="toggleMic" />
     <ResumeBanner
@@ -364,18 +379,35 @@ onBeforeUnmount(() => {
   gap: 8px;
   padding: 8px 12px 0;
 }
+/*
+ * Акцент — через --vell-accent с фолбэком на прежний цвет: тема приезжает
+ * ПОЗЖЕ первой отрисовки (сообщением init), и без фолбэка панель успевала бы
+ * мигнуть бесцветными кнопками. Старый бэкенд без темы остаётся на фолбэке
+ * навсегда — ровно то, как панель выглядела до темизации.
+ */
 .actions__btn {
   flex: 1 1 auto;
   padding: 8px 12px;
-  border: 1px solid #2563eb;
+  border: 1px solid var(--vell-accent, #2563eb);
   border-radius: 10px;
-  background: #2563eb;
+  background: var(--vell-accent, #2563eb);
   color: #fff;
   font: 600 13px/1 system-ui, sans-serif;
   cursor: pointer;
 }
 .actions__btn--ghost {
   background: #fff;
-  color: #2563eb;
+  color: var(--vell-accent, #2563eb);
+}
+.widget__title {
+  flex: 0 0 auto;
+  padding: 12px;
+  border-bottom: 1px solid #e5e7eb;
+  color: var(--vell-accent, #2563eb);
+  font: 600 15px/1.3 system-ui, sans-serif;
+  /* Заголовок длиной с экран не должен ломать шапку: одна строка с многоточием. */
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 </style>

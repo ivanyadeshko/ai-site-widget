@@ -1,15 +1,37 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue';
-import { useRoute, useRouter } from 'vue-router';
+import { RouterLink, useRoute, useRouter } from 'vue-router';
 import {
-  NAlert, NButton, NCard, NForm, NFormItem, NInput, NPopconfirm, NSpace, NSpin, NSwitch, NText,
+  NAlert, NButton, NCard, NColorPicker, NDivider, NForm, NFormItem, NInput, NPopconfirm, NRadio,
+  NRadioGroup, NSpace, NSpin, NSwitch, NText,
 } from 'naive-ui';
 import OriginsEditor from '../components/OriginsEditor.vue';
-import { useWidgetsStore, type Widget } from '../stores/widgets.ts';
+import { useWidgetsStore, type Widget, type WidgetTheme } from '../stores/widgets.ts';
 import { PanelApiError } from '../lib/api.ts';
 
 const INSTRUCTIONS_MAX = 8000;
 const GREETING_MAX = 500;
+// Пределы — копия backend/src/widgets/theme.ts. Форма режет ДО запроса: иначе
+// про лимит владелец узнаёт из 422 уже после нажатия «Сохранить».
+const TITLE_MAX = 40;
+const LAUNCHER_TITLE_MAX = 60;
+const BUTTON_LABEL_MAX = 2;
+const DEFAULT_POSITION = 'right';
+
+/**
+ * Счётчик длины полей ТЕМЫ — обязан совпадать с бэкендом code-point в
+ * code-point (`parseText` в backend/src/widgets/theme.ts считает
+ * `Array.from(value).length`).
+ *
+ * Без этого пропа `n-input` вешает НАТИВНЫЙ атрибут `maxlength`, а тот считает
+ * UTF-16 code units: почти любое эмодзи — суррогатная пара, то есть одно «🤖»
+ * съедает сразу 2 из 2 разрешённых, и второй символ ввести уже нельзя, хотя
+ * бэкенд его принял бы. Передача `count-graphemes` заставляет naive-ui снять
+ * нативный атрибут и считать самому (naive-ui/lib/input/src/Input.js:395-407,
+ * 817). Поля агента (инструкции, приветствие) сюда НЕ входят: их бэкенд
+ * меряет обычной `.length`, и там нативный счёт как раз совпадает.
+ */
+const countCodePoints = (value: string): number => Array.from(value).length;
 
 const store = useWidgetsStore();
 const route = useRoute();
@@ -20,7 +42,17 @@ const widget = ref<Widget | null>(null);
 const form = ref({
   name: '', instructions: '', greeting: '', voiceId: '', avatarId: '',
   origins: [] as string[], enabled: true,
+  // Оформление. Пустая строка/null = «не задано»: такие поля в PATCH не уезжают
+  // вовсе, иначе бэкенд отверг бы пустую строку (invalid_theme), а сохранение
+  // формы вморозило бы сегодняшние дефолты в БД.
+  themeColor: null as string | null,
+  themePosition: DEFAULT_POSITION as 'right' | 'left',
+  themeButtonLabel: '',
+  themeTitle: '',
+  themeLauncherTitle: '',
 });
+/** Была ли позиция задана явно — чтобы не записать дефолт в БД первым же сохранением. */
+const positionStored = ref(false);
 const error = ref('');
 const notice = ref('');
 const busy = ref(false);
@@ -36,7 +68,37 @@ const apply = (source: Widget): void => {
     avatarId: source.agent_config.avatar_id ?? '',
     origins: [...source.allowed_origins],
     enabled: source.enabled,
+    themeColor: source.theme.color ?? null,
+    themePosition: source.theme.position ?? DEFAULT_POSITION,
+    themeButtonLabel: source.theme.button_label ?? '',
+    themeTitle: source.theme.title ?? '',
+    themeLauncherTitle: source.theme.launcher_title ?? '',
   };
+  positionStored.value = source.theme.position !== undefined;
+};
+
+/**
+ * Тема для PATCH: только реально заполненные поля.
+ *
+ * Позиция — единственное поле с всегда-непустым контролом (радиогруппа), и без
+ * оглядки на `positionStored` она уезжала бы в БД при первом же сохранении
+ * даже у владельца, который её не трогал. Дефолты обязаны оставаться на нашей
+ * стороне (`backend/src/widgets/theme.ts`), иначе мы теряем право их менять.
+ */
+const themePayload = (): WidgetTheme => {
+  const theme: WidgetTheme = {};
+  const color = (form.value.themeColor ?? '').trim();
+  if (color !== '') theme.color = color;
+  if (positionStored.value || form.value.themePosition !== DEFAULT_POSITION) {
+    theme.position = form.value.themePosition;
+  }
+  const buttonLabel = form.value.themeButtonLabel.trim();
+  if (buttonLabel !== '') theme.button_label = buttonLabel;
+  const title = form.value.themeTitle.trim();
+  if (title !== '') theme.title = title;
+  const launcherTitle = form.value.themeLauncherTitle.trim();
+  if (launcherTitle !== '') theme.launcher_title = launcherTitle;
+  return theme;
 };
 
 const fail = (err: unknown, fallback: string): void => {
@@ -74,6 +136,7 @@ async function save(): Promise<void> {
       },
       allowed_origins: form.value.origins,
       enabled: form.value.enabled,
+      theme: themePayload(),
     }));
     notice.value = 'Сохранено.';
   } catch (err) {
@@ -153,6 +216,64 @@ async function destroy(): Promise<void> {
             <n-switch v-model:value="form.enabled" />
           </n-form-item>
 
+          <n-divider title-placement="left">Оформление</n-divider>
+          <n-text depth="3">
+            Пустое поле означает «по умолчанию» — подставим сами.
+          </n-text>
+
+          <n-form-item label="Цвет кнопки">
+            <div data-test="theme-color">
+              <!-- modes=['hex'] + show-alpha=false: бэкенд принимает строго
+                   #RRGGBB, а с альфой пикер отдал бы #RRGGBBAA и получил 422. -->
+              <n-color-picker
+                v-model:value="form.themeColor"
+                :modes="['hex']"
+                :show-alpha="false"
+                :swatches="['#2563eb', '#0f766e', '#b91c1c', '#7c3aed', '#111827']"
+              />
+            </div>
+          </n-form-item>
+
+          <n-form-item label="Сторона экрана">
+            <n-radio-group v-model:value="form.themePosition" data-test="theme-position">
+              <n-radio value="right">Справа</n-radio>
+              <n-radio value="left">Слева</n-radio>
+            </n-radio-group>
+          </n-form-item>
+
+          <n-form-item label="Значок на кнопке">
+            <div data-test="theme-button-label">
+              <n-input
+                v-model:value="form.themeButtonLabel"
+                :maxlength="BUTTON_LABEL_MAX"
+                :count-graphemes="countCodePoints"
+                placeholder="💬"
+              />
+            </div>
+          </n-form-item>
+
+          <n-form-item label="Заголовок панели">
+            <div data-test="theme-title">
+              <n-input
+                v-model:value="form.themeTitle"
+                :maxlength="TITLE_MAX"
+                :count-graphemes="countCodePoints"
+                placeholder="по умолчанию — название виджета"
+              />
+            </div>
+          </n-form-item>
+
+          <n-form-item label="Подпись кнопки (её читает скринридер)">
+            <div data-test="theme-launcher-title">
+              <n-input
+                v-model:value="form.themeLauncherTitle"
+                :maxlength="LAUNCHER_TITLE_MAX"
+                :count-graphemes="countCodePoints"
+                placeholder="по умолчанию — «Открыть чат: заголовок»"
+              />
+            </div>
+          </n-form-item>
+
           <n-button type="primary" data-test="save-widget" :disabled="!canSave" :loading="busy" @click="save">
             Сохранить
           </n-button>
@@ -162,6 +283,9 @@ async function destroy(): Promise<void> {
       <n-card v-if="widget" title="Публичный токен">
         <n-space vertical size="small">
           <n-text code>{{ widget.publish_token }}</n-text>
+          <router-link data-test="install-link" :to="`/widgets/${widget.id}/install`">
+            Как установить виджет на сайт
+          </router-link>
           <!-- Токен НЕ секрет: он лежит в HTML сайта открытым текстом. Владелец
                обязан это знать, иначе перевыпуск будет восприниматься как
                «смена пароля» и делаться зря. -->

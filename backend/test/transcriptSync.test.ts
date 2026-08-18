@@ -24,6 +24,7 @@ beforeAll(async () => {
       maxSessionsPerAccountPerDay: 300,
       trustProxy: false, logLevel: 'silent',
       sessionTtlDays: 30, panelOrigin: 'http://localhost:8200', cookieSecure: false,
+      cdnOrigin: 'http://localhost:8200',
       loginMaxFailures: 10, loginLockMinutes: 15,
     },
     pool,

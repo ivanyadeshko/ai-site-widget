@@ -10,6 +10,7 @@ import { originVerdict } from '../http/originGuard.ts';
 import { escalateDialog } from '../dialogs/escalate.ts';
 import { reenterDialog } from '../dialogs/reenter.ts';
 import { MESSAGES_PAGE, startDialog, toPublicMessage } from '../dialogs/startDialog.ts';
+import { themeForConfig } from '../widgets/theme.ts';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const TEXT_MAX = 2000; // воркер режет ровно тут — режем сами, чтобы журнал совпал с лентой
@@ -120,6 +121,11 @@ export const publicApiRoutes: FastifyPluginAsync = async (app) => {
         allowed_origins: widget.allowed_origins,
         app_url: `${app.deps.config.publicOrigin}/app/${widget.publish_token}`,
         text_max_length: TEXT_MAX,
+        // Тема — ВСЕГДА полная, с добитыми дефолтами: лоадер на чужой странице
+        // живёт под бюджетом 8 КБ gzip и не должен носить в себе ни одного
+        // дефолта и ни одной проверки (D-9). Кэш 60с выше распространяется и на
+        // неё — оформление меняется редко, минута задержки допустима.
+        theme: themeForConfig(widget.theme, widget.name),
       });
     },
   );

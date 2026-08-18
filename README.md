@@ -194,9 +194,9 @@ IP не secure context, голос там не заработает, а лишн
 осознанно вторым элементом массива и обязательно пометить здесь, что голос
 по этому адресу не работает.
 
-Полученный `publish_token` вписать в `embed/public/demo.html`
-(`data-widget="..."`) и пересобрать образ (в MVP — правкой файла и повторным
-`bash infra/deploy.sh`; `?token=` через query — не реализовано).
+Полученный `publish_token` подставляется в демо-страницу параметром запроса:
+`http://localhost:8200/demo.html?token=<publish_token>`. Пересобирать образ
+ради смены токена больше не нужно (Task 13 потока V).
 
 Проверки живости:
 
@@ -225,13 +225,14 @@ ssh-туннель на `localhost`; `WIDGET_PUBLIC_ORIGIN` на стенде о
 ```bash
 ssh -L 8200:localhost:8200 root@185.125.102.133
 # в новой вкладке браузера (ИМЕННО localhost, не IP):
-open http://localhost:8200/demo.html
+open 'http://localhost:8200/demo.html?token=<publish_token>'
 ```
 
 Чек-лист (каждый пункт отмечается по факту прогона):
 
 - [ ] 1. `ssh -L 8200:localhost:8200 root@185.125.102.133`.
-- [ ] 2. Открыть `http://localhost:8200/demo.html`. ⚠️ ИМЕННО `localhost`:
+- [ ] 2. Открыть `http://localhost:8200/demo.html?token=<publish_token>`.
+      ⚠️ ИМЕННО `localhost`:
       страница по `http://<IP>` не secure context, и микрофон там не
       запросится вовсе. `WIDGET_PUBLIC_ORIGIN` на стенде обязан быть
       `http://localhost:8200`, иначе iframe уедет на IP-origin и голос умрёт.
@@ -381,9 +382,10 @@ npm run contracts:check -w @aski/site-widget-backend   # только сверк
 
 - Публикация образа в GHCR — после MVP; `compose.yaml` уже готов принять тег
   через `WIDGET_IMAGE`, когда реестр появится.
-- Кабинета для управления виджетами нет — первый (и единственный на MVP)
-  виджет заводится прямым SQL (см. выше).
-- `?token=` вместо правки `demo.html` — не реализовано.
+- ~~Кабинета для управления виджетами нет~~ — **уже не так**: кабинет появился
+  (потоки I–III и V этапа E) — регистрация, `/panel`, CRUD виджетов,
+  оформление и готовый embed-сниппет. SQL-рецепт выше остаётся аварийным
+  путём и способом завести виджет вообще без аккаунта.
 - **Секреты кросс-репо-пина не заведены** (их создаёт человек, не CI):
   - `CORE_CONTRACTS_TOKEN` — здесь, в `ai-site-widget`. Fine-grained PAT,
     **только** `Contents: Read-only` на `ivanyadeshko/ai-conversation-core`.
