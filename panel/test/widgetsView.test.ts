@@ -39,6 +39,7 @@ const WIDGET = {
   allowed_origins: ['https://shop.example'],
   agent_config: { instructions: 'Ты консультант магазина.' },
   created_at: '2026-08-18T10:00:00.000Z',
+  theme: {},
   embed_snippet: '',
   app_url: 'https://app.vell.pro/app/wgt_00000000000000000000000000000001',
 };

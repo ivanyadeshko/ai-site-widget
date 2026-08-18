@@ -70,8 +70,11 @@ describe('панельный CRUD виджетов', () => {
     // Поля объявлены здесь, чтобы SPA не переписывалась дважды (Task 13 наполнит сниппет).
     expect(widget).toHaveProperty('embed_snippet');
     expect(widget.app_url).toContain(`/app/${widget.publish_token}`);
-    // theme появится только в Task 11 — сейчас колонки нет, поля быть не должно.
-    expect(widget).not.toHaveProperty('theme');
+    // Оформление приехало в Task 11. У свежего виджета оно ПУСТОЕ (`{}` =
+    // «всё по умолчанию»), дефолты добиваются только на публичном /config.
+    // До Task 11 здесь стояло обратное утверждение (`not.toHaveProperty`):
+    // колонки `widgets.theme` ещё не существовало.
+    expect(widget.theme).toEqual({});
 
     const list = await app.inject({ method: 'GET', url: '/api/v1/widgets', headers: { cookie } });
     expect(list.statusCode).toBe(200);

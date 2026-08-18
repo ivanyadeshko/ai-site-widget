@@ -6,6 +6,7 @@ import {
   type WidgetPatch, type WidgetRow,
 } from '../../db/repositories/widgets.ts';
 import { ApiError } from '../../http/errors.ts';
+import { parseTheme, type WidgetTheme } from '../../widgets/theme.ts';
 import { generatePublishToken } from '../../widgets/tokens.ts';
 import {
   WIDGETS_PER_ACCOUNT_MAX, parseAgentConfig, parseAllowedOrigins, parseWidgetName,
@@ -17,9 +18,13 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-
  * Наружу уезжает РОВНО это.
  *
  * `publish_token` отдаётся владельцу намеренно: он не секрет, он лежит в HTML
- * его собственного сайта. `theme` здесь НЕТ — колонка `widgets.theme`
- * появляется только в Task 11, и объявить поле заранее значило бы отдавать
- * `undefined` из несуществующей колонки.
+ * его собственного сайта.
+ *
+ * `theme` отдаётся СЫРОЙ, как лежит в БД: владелец правит то, что задал сам, и
+ * незаполненное поле в панели обязано выглядеть незаполненным. Дефолты
+ * добиваются только на публичном пути (`/w/v1/:token/config`, `themeForConfig`)
+ * — иначе первое же сохранение формы вморозило бы сегодняшние дефолты в БД и
+ * отняло бы у нас право их менять.
  */
 export type WidgetPublic = {
   id: string;
@@ -29,6 +34,7 @@ export type WidgetPublic = {
   allowed_origins: string[];
   agent_config: WidgetRow['agent_config'];
   created_at: Date;
+  theme: WidgetTheme;
   /** Готовый <script> для вставки на сайт. Наполняется в Task 13. */
   embed_snippet: string;
   app_url: string;
@@ -42,6 +48,7 @@ const toPublic = (widget: WidgetRow, publicOrigin: string): WidgetPublic => ({
   allowed_origins: widget.allowed_origins,
   agent_config: widget.agent_config,
   created_at: widget.created_at,
+  theme: widget.theme,
   embed_snippet: '',
   app_url: `${publicOrigin}/app/${widget.publish_token}`,
 });
@@ -113,7 +120,10 @@ export const widgetRoutes: FastifyPluginAsync = async (app) => {
 
   app.patch<{
     Params: { id: string };
-    Body: { name?: unknown; agent_config?: unknown; allowed_origins?: unknown; enabled?: unknown };
+    Body: {
+      name?: unknown; agent_config?: unknown; allowed_origins?: unknown;
+      enabled?: unknown; theme?: unknown;
+    };
   }>('/widgets/:id', async (req, reply) => {
     const accountId = req.account!.id;
     await load(req.params.id, accountId);
@@ -129,6 +139,9 @@ export const widgetRoutes: FastifyPluginAsync = async (app) => {
       }
       patch.enabled = body.enabled;
     }
+    // Тема — целиком, а не по полям: `{}` в теле = «сбросить оформление к
+    // дефолтам». Отсутствие ключа `theme` тему НЕ трогает (частичность PATCH).
+    if (body.theme !== undefined) patch.theme = parseTheme(body.theme);
 
     const updated = await updateWidget(app.deps.pool, req.params.id, accountId, patch);
     if (!updated) throw notFound();

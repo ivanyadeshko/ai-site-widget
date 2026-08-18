@@ -15,6 +15,7 @@ const WIDGET = {
   allowed_origins: ['https://shop.example'],
   agent_config: { instructions: 'Ты консультант магазина.' },
   created_at: '2026-08-18T10:00:00.000Z',
+  theme: {} as Record<string, unknown>,
   embed_snippet: '',
   app_url: 'https://app.vell.pro/app/wgt_00000000000000000000000000000001',
 };
@@ -102,5 +103,49 @@ describe('экран настройки виджета', () => {
     await flushPromises();
 
     expect(wrapper.text()).toContain('Инструкции длиннее 8000 символов — сократите текст.');
+  });
+
+  it('блок «Оформление» показывает сохранённую тему и возвращает её в PATCH', async () => {
+    const themed = {
+      ...WIDGET,
+      theme: { color: '#ff0000', position: 'left', button_label: '🤖', title: 'Магазин на связи' },
+    };
+    const fetchStub = routeFetch({
+      'GET /api/v1/widgets/w-1': [{ status: 200, body: { widget: themed } }],
+      'PATCH /api/v1/widgets/w-1': [{ status: 200, body: { widget: themed } }],
+    });
+    const wrapper = await mountEdit();
+
+    expect((wrapper.find('[data-test="theme-title"] input').element as HTMLInputElement).value)
+      .toBe('Магазин на связи');
+    expect((wrapper.find('[data-test="theme-button-label"] input').element as HTMLInputElement).value)
+      .toBe('🤖');
+
+    await wrapper.find('[data-test="theme-launcher-title"] input').setValue('Спросить консультанта');
+    await wrapper.find('[data-test="save-widget"]').trigger('click');
+    await flushPromises();
+
+    const patch = fetchStub.mock.calls.find(([, init]) => (init as RequestInit)?.method === 'PATCH');
+    const sent = JSON.parse((patch![1] as RequestInit).body as string);
+    expect(sent.theme).toEqual({
+      color: '#ff0000', position: 'left', button_label: '🤖',
+      title: 'Магазин на связи', launcher_title: 'Спросить консультанта',
+    });
+  });
+
+  it('незаполненные поля оформления в запрос НЕ уезжают — бэкенд отверг бы пустую строку', async () => {
+    const fetchStub = routeFetch({
+      'GET /api/v1/widgets/w-1': [{ status: 200, body: { widget: WIDGET } }],
+      'PATCH /api/v1/widgets/w-1': [{ status: 200, body: { widget: WIDGET } }],
+    });
+    const wrapper = await mountEdit();
+    await wrapper.find('[data-test="save-widget"]').trigger('click');
+    await flushPromises();
+
+    const patch = fetchStub.mock.calls.find(([, init]) => (init as RequestInit)?.method === 'PATCH');
+    const sent = JSON.parse((patch![1] as RequestInit).body as string);
+    // Виджет без темы обязан оставаться без темы: пустой объект, а не пять
+    // пустых строк и не вмороженные в БД сегодняшние дефолты.
+    expect(sent.theme).toEqual({});
   });
 });
