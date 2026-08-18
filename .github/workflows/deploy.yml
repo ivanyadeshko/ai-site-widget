@@ -68,7 +68,12 @@ jobs:
     environment:
       name: ${{ inputs.target == 'prod' && 'production' || 'dev' }}
     env:
+      # Гоча семантики `cond && a || b`: при target=prod и ПУСТОМ vars.PROD_HOST
+      # левая часть ложна и прод-деплой молча уехал бы на DEV_HOST. Сырые vars
+      # прокинуты отдельно, и Guard ниже ловит ровно этот случай (fail-closed).
       DEPLOY_HOST: ${{ inputs.target == 'prod' && vars.PROD_HOST || vars.DEV_HOST }}
+      PROD_HOST_VAR: ${{ vars.PROD_HOST }}
+      PROD_PATH_VAR: ${{ vars.PROD_PATH }}
       DEPLOY_USER: deploy
       DEPLOY_PATH: ${{ inputs.target == 'prod' && vars.PROD_PATH || vars.DEV_PATH }}
       IMAGE_TAG: ${{ inputs.image_tag }}
@@ -110,6 +115,12 @@ jobs:
 
       - name: Guard — vars заполнены
         run: |
+          if [ "${TARGET}" = "prod" ]; then
+            # Из-за `cond && a || b` пустой PROD_HOST подставил бы DEV_HOST —
+            # проверяем СЫРУЮ переменную, а не уже вычисленный DEPLOY_HOST.
+            [ -n "${PROD_HOST_VAR}" ] || { echo "::error::vars.PROD_HOST не задан — иначе прод-деплой молча уехал бы на дев-хост"; exit 1; }
+            [ -n "${PROD_PATH_VAR}" ] || { echo "::error::vars.PROD_PATH не задан"; exit 1; }
+          fi
           [ -n "${DEPLOY_HOST}" ] || { echo "::error::vars.*_HOST не задан для ${TARGET}"; exit 1; }
           [ -n "${DEPLOY_PATH}" ] || { echo "::error::vars.*_PATH не задан для ${TARGET}"; exit 1; }
           echo "цель: ${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}"
@@ -316,7 +327,7 @@ jobs:
         # не отличал «apply не стартовал» от «apply упал ДО подмены .env»
         # (не взялся flock, не прошёл pull) и уводил живой стенд на версию
         # назад. Найдено кросс-ревью 2026-08-17.
-        if: (failure() || cancelled()) && steps.apply.conclusion != 'skipped'
+        if: (failure() || cancelled()) && steps.apply.conclusion != '' && steps.apply.conclusion != 'skipped'
         run: |
           echo "::warning::деплой не завершился штатно — проверяем, нужен ли откат"
           ssh -F "$SSHF" target \
