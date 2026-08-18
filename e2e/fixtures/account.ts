@@ -26,3 +26,12 @@ export async function registerFreshAccount(page: Page, baseURL: string): Promise
   await expect(page).toHaveURL(/\/panel\/?(#.*)?$/, { timeout: 15_000 });
   return account;
 }
+
+/** Вход существующим аккаунтом (например, админ, поднятый grant-admin.mjs). */
+export async function loginAccount(page: Page, baseURL: string, creds: FreshAccount): Promise<void> {
+  await page.goto(`${baseURL.replace(/\/+$/, '')}/panel/login`);
+  await page.getByPlaceholder('owner@example.com').fill(creds.email);
+  await page.getByPlaceholder('Пароль', { exact: true }).fill(creds.password);
+  await page.getByRole('button', { name: 'Войти' }).click();
+  await expect(page).toHaveURL(/\/panel\/?(#.*)?$/, { timeout: 15_000 });
+}

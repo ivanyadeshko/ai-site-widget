@@ -7,6 +7,8 @@ import { defineConfig, devices } from '@playwright/test';
  * и в CI-гейт НЕ входят (D-14) — их поднимает человек локально/на деве.
  */
 const PANEL_BASE = process.env.E2E_PANEL_BASE_URL ?? 'http://localhost:8200';
+// acceptance/voice ходят в ЖИВОЕ ядро — стенд задаётся снаружи через E2E_BASE_URL.
+const ACCEPTANCE_BASE = process.env.E2E_BASE_URL ?? 'http://localhost:8200';
 
 export default defineConfig({
   testDir: './tests',
@@ -27,6 +29,31 @@ export default defineConfig({
       name: 'panel',
       testMatch: /panel\.spec\.ts/,
       use: { ...devices['Desktop Chrome'], baseURL: PANEL_BASE },
+    },
+    // ↓↓↓ ЖИВОЕ ЯДРО, НЕ в CI-гейте (D-14). Запускать явно:
+    //   E2E_BASE_URL=http://localhost:8200 npx playwright test --project=acceptance
+    {
+      name: 'acceptance',
+      testMatch: /acceptance\.spec\.ts/,
+      use: { ...devices['Desktop Chrome'], baseURL: ACCEPTANCE_BASE },
+    },
+    {
+      name: 'voice',
+      testMatch: /voice\.spec\.ts/,
+      use: {
+        ...devices['Desktop Chrome'],
+        baseURL: ACCEPTANCE_BASE,
+        // Микрофон — из fake-устройства Chromium: реального звука нет, но
+        // getUserMedia отдаёт трек, и голосовая панель поднимается.
+        permissions: ['microphone'],
+        launchOptions: {
+          args: [
+            '--use-fake-ui-for-media-stream',
+            '--use-fake-device-for-media-stream',
+            '--autoplay-policy=no-user-gesture-required',
+          ],
+        },
+      },
     },
   ],
 });

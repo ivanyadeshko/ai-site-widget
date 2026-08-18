@@ -469,6 +469,33 @@ verdicts=6`; коды выхода 0/1/2/3 и полный разбор сцен
 выше) — гонять пачкой не стоит. Красный смок — чинить код, а НЕ ослаблять
 ассерт.
 
+## e2e Playwright (`e2e/`, отдельный npm-проект)
+
+Браузерный сквозной путь. `e2e/` — **отдельный** npm-проект (не воркспейс,
+D-11): `@playwright/test` тянет браузеры postinstall'ом. Три проекта:
+
+| Проект | Ядро | В CI? | Кредиты | Что проверяет |
+|---|---|---|---|---|
+| `panel` | fake-core (герметично) | **да**, обязателен (в т.ч. форк-PR) | нет | весь путь панели: регистрация → виджет → сниппет → кнопка на «чужом» сайте → тема → лид → CSV → цифры (деньги сводит подписанный вебхук `session.finalized`) |
+| `acceptance` | **живое** дев-ядро | нет (D-14) | **да** | тот же путь + живой ответ агента; деньги приходят асинхронно (`expect.poll`) |
+| `voice` | **живое** дев-ядро | нет (D-14) | **да** | структурные ассерты голоса (панель, микрофон, реплика `source='core'`) |
+
+```bash
+# герметичный гейт (как в CI): fake-core вместо ядра, секретов не нужно
+docker compose -f e2e/compose.e2e.yaml up -d --build --wait
+cd e2e && npm ci && npx playwright install --with-deps chromium
+npx playwright test --project=panel
+docker compose -f compose.e2e.yaml down -v
+
+# приёмка на живом дев-ядре (ЖЖЁТ кредиты — следить за балансом):
+E2E_BASE_URL=http://localhost:8200 npx playwright test --project=acceptance
+E2E_BASE_URL=http://localhost:8200 npx playwright test --project=voice
+```
+
+Проверку админки в `acceptance` включают переменные `E2E_ADMIN_EMAIL` /
+`E2E_ADMIN_PASSWORD` (админ поднимается `backend/scripts/grant-admin.mjs`, см.
+«Провижининг оператора»); без них шаг помечается пропуском. Детали — `e2e/README.md`.
+
 ## Контракт ядра: пин, а не `origin/main`
 
 Виджет держит вендорённую копию OpenAPI ядра. Источник правды — **пин**
