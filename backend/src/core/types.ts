@@ -8,3 +8,9 @@ export type TranscriptPage = components['schemas']['TranscriptPage'];
 export type CoreSession = components['schemas']['Session'];
 export type SessionFinalizedData = components['schemas']['SessionFinalizedData'];
 export type WebhookEnvelope = components['schemas']['WebhookEnvelope'];
+/**
+ * Баланс кредитов ТЕНАНТА, а не аккаунта витрины: для ядра весь виджет-продукт
+ * — один тенант (D-1). Админка обязана подписывать эту цифру именно так, иначе
+ * оператор прочитает её как баланс конкретного клиента.
+ */
+export type CreditsBalance = components['schemas']['CreditsBalance'];

@@ -17,10 +17,20 @@ const menuOptions = computed<MenuOption[]>(() => {
     { label: link('/dialogs', 'Диалоги'), key: 'dialogs' },
     { label: link('/usage', 'Использование'), key: 'usage' },
   ];
-  // Пункт админки виден только админу — ровно как и сам API (requireAdmin
+  // Раздел админки виден только админу — ровно как и сам API (requireAdmin
   // отвечает 404, а не 403: существование поверхности не подтверждаем).
+  // Скрытие пункта — УДОБСТВО, а не защита: барьер стоит на сервере, и
+  // подмена `is_admin` в DevTools даст пустой экран с отказом, а не данные.
   if (session.account?.is_admin === true) {
-    options.push({ label: link('/admin/accounts', 'Админка'), key: 'admin-accounts' });
+    options.push({
+      label: 'Администрирование',
+      key: 'admin',
+      children: [
+        { label: link('/admin/accounts', 'Аккаунты'), key: 'admin-accounts' },
+        { label: link('/admin/widgets', 'Виджеты витрины'), key: 'admin-widgets' },
+        { label: link('/admin/usage', 'Расход витрины'), key: 'admin-usage' },
+      ],
+    });
   }
   return options;
 });

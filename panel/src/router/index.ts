@@ -10,6 +10,9 @@ import UsageView from '../views/UsageView.vue';
 import WidgetEditView from '../views/WidgetEditView.vue';
 import WidgetInstallView from '../views/WidgetInstallView.vue';
 import WidgetsView from '../views/WidgetsView.vue';
+import AccountsView from '../views/admin/AccountsView.vue';
+import AdminUsageView from '../views/admin/AdminUsageView.vue';
+import AdminWidgetsView from '../views/admin/AdminWidgetsView.vue';
 import { useSessionStore } from '../stores/session.ts';
 
 /**
@@ -36,8 +39,11 @@ export const routes: RouteRecordRaw[] = [
       { path: 'dialogs', name: 'dialogs', component: DialogsView },
       { path: 'dialogs/:id', name: 'dialog', component: DialogView },
       { path: 'usage', name: 'usage', component: UsageView },
-      { path: 'admin/accounts', name: 'admin-accounts', component: stub('Аккаунты'), meta: { admin: true } },
-      { path: 'admin/usage', name: 'admin-usage', component: stub('Расход витрины'), meta: { admin: true } },
+      // Админка оператора витрины. `meta.admin` — только UX-гард (см. beforeEach
+      // ниже); настоящий барьер — requireAdmin на сервере, отвечающий 404.
+      { path: 'admin/accounts', name: 'admin-accounts', component: AccountsView, meta: { admin: true } },
+      { path: 'admin/widgets', name: 'admin-widgets', component: AdminWidgetsView, meta: { admin: true } },
+      { path: 'admin/usage', name: 'admin-usage', component: AdminUsageView, meta: { admin: true } },
     ],
   },
   { path: '/:pathMatch(.*)*', name: 'not-found', component: stub('Страница не найдена'), meta: { public: true } },

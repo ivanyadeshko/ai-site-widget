@@ -8,6 +8,8 @@
     "typecheck": "tsc -p tsconfig.typecheck.json",
     "start": "node dist/server.js",
     "migrate": "node-pg-migrate -m migrations --envPath ../.env up",
+    "grant-admin": "node scripts/grant-admin.mjs",
+    "unblock-account": "node scripts/unblock-account.mjs",
     "test": "vitest run",
     "db:test:up": "docker compose -f ../infra/compose.test.yaml up -d --wait",
     "contracts:sync": "node ../contracts/sync.mjs && npx openapi-typescript ../contracts/openapi.core.yaml -o ../contracts/core-api.d.ts",
