@@ -4,7 +4,7 @@ import { findDialogById, setDialogStatus, touchDialog, type DialogRow } from '..
 import { insertLead } from '../db/repositories/leads.ts';
 import { insertMessage, listThreadTail, maxClientSeq } from '../db/repositories/messages.ts';
 import { hashIp } from '../db/repositories/quotas.ts';
-import { findWidgetByToken, type WidgetRow } from '../db/repositories/widgets.ts';
+import { findWidgetByToken, type WidgetRow, type WidgetWithOwner } from '../db/repositories/widgets.ts';
 import { ApiError, mapCoreError, sendApiError } from '../http/errors.ts';
 import { originVerdict } from '../http/originGuard.ts';
 import { escalateDialog } from '../dialogs/escalate.ts';
@@ -15,7 +15,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-
 const TEXT_MAX = 2000; // воркер режет ровно тут — режем сами, чтобы журнал совпал с лентой
 const SEQ_MAX = 2147483647; // Postgres INTEGER (dialog_messages.seq) — больше не влезет, упало бы 500
 
-const requireWidget = async (req: FastifyRequest, token: string, checkOrigin: boolean): Promise<WidgetRow> => {
+const requireWidget = async (req: FastifyRequest, token: string, checkOrigin: boolean): Promise<WidgetWithOwner> => {
   const widget = await findWidgetByToken(req.server.deps.pool, token);
   if (!widget) throw new ApiError(404, 'widget_not_found', 'Виджет не найден.');
   if (checkOrigin) {
@@ -26,6 +26,12 @@ const requireWidget = async (req: FastifyRequest, token: string, checkOrigin: bo
     });
     if (verdict === 'deny') throw new ApiError(403, 'origin_not_allowed', 'Этот сайт не разрешён для виджета.');
     if (!widget.enabled) throw new ApiError(403, 'widget_disabled', 'Виджет выключен.');
+    // Блокировка владельца обязана гасить ПЛАТНЫЙ путь: иначе заблокированный
+    // аккаунт продолжает жечь кредиты общего тенанта ядра (D-1), а сама
+    // блокировка остаётся косметикой в админке. Причину наружу не
+    // расшифровываем — посетитель чужого сайта не должен читать чужую
+    // бухгалтерию по коду ошибки.
+    if (widget.owner_blocked) throw new ApiError(403, 'account_blocked', 'Виджет временно недоступен.');
   }
   return widget;
 };
@@ -107,7 +113,10 @@ export const publicApiRoutes: FastifyPluginAsync = async (app) => {
       return reply.send({
         widget_id: widget.id,
         name: widget.name,
-        enabled: widget.enabled,
+        // Заблокированный владелец = виджет для лоадера выключен: кнопка
+        // просто не рисуется (loader.ts), без 404/500 и без объяснений
+        // посетителю чужого сайта.
+        enabled: widget.enabled && !widget.owner_blocked,
         allowed_origins: widget.allowed_origins,
         app_url: `${app.deps.config.publicOrigin}/app/${widget.publish_token}`,
         text_max_length: TEXT_MAX,

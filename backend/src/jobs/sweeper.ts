@@ -4,6 +4,9 @@ import {
   applyFinalizedUsage, listStaleActiveDialogs, setDialogStatus, touchDialog,
 } from '../db/repositories/dialogs.ts';
 import { purgeOldIpCounters, purgeOldVisitorCounters } from '../db/repositories/quotas.ts';
+import { purgeStaleAuthFailures } from '../db/repositories/authFailures.ts';
+import { purgeOldAccountCounters } from '../db/repositories/accountLimits.ts';
+import { sweepExpiredSessions } from '../auth/sessions.ts';
 
 /** Сколько суток держим суточные счётчики капов, прежде чем подмести. */
 const COUNTER_RETENTION_DAYS = 7;
@@ -145,9 +148,21 @@ export function startSweeper(
       sweepOnce(deps, { staleMinutes, batch }),
       purgeOldIpCounters(deps.pool, COUNTER_RETENTION_DAYS),
       purgeOldVisitorCounters(deps.pool, COUNTER_RETENTION_DAYS),
+      // Третий счётчик капов — по аккаунту витрины: растёт по той же механике
+      // (строка на ключ в сутки) и так же нуждается в уборщике.
+      purgeOldAccountCounters(deps.pool, COUNTER_RETENTION_DAYS),
+      // Сессии панели: строка на каждый вход, срок жизни — недели. Без уборки
+      // таблица растёт вечно, а протухшие строки всё равно никого не пускают.
+      sweepExpiredSessions(deps),
+      // Ключ auth_failures задаёт атакующий (произвольный email из тела) —
+      // таблица иначе растёт настолько, насколько ему хватит терпения.
+      purgeStaleAuthFailures(deps.pool, COUNTER_RETENTION_DAYS),
     ])
       .then((results) => {
-        const names = ['проход свипера', 'уборка ip_day_counters', 'уборка visitor_day_counters'];
+        const names = [
+          'проход свипера', 'уборка ip_day_counters', 'уборка visitor_day_counters',
+          'уборка account_day_counters', 'уборка account_sessions', 'уборка auth_failures',
+        ];
         results.forEach((result, i) => {
           if (result.status === 'rejected') deps.log.error({ err: result.reason }, `${names[i]} сорвался`);
         });

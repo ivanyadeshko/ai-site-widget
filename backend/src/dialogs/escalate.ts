@@ -89,7 +89,9 @@ export async function escalateDialog(deps: AppDeps, input: EscalateInput): Promi
   // ДОПУСК до всего: голосовая сессия стоит денег ровно как стартовая (§6.3).
   // Проверяем ПЕРЕД CAS, чтобы отказ не оставил диалог в 'escalating'. Само
   // СПИСАНИЕ — в openCoreSession по факту новой сессии (M3).
-  await checkSessionBudget(deps, { visitorKey: input.visitorKey, ipHash: input.ipHash });
+  await checkSessionBudget(deps, {
+    visitorKey: input.visitorKey, ipHash: input.ipHash, accountId: input.widget.account_id,
+  });
 
   // CAS: вторая параллельная эскалация НЕ создаст вторую платную сессию.
   if (!(await casDialogStatus(deps.pool, input.dialog.id, 'active', 'escalating'))) {

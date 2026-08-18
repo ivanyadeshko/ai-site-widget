@@ -34,7 +34,9 @@ export async function startDialog(deps: AppDeps, input: StartDialogInput): Promi
   // ДОПУСК до денег: сессия ядра — единственное, что жжёт кредиты. Само
   // СПИСАНИЕ квоты живёт в openCoreSession и происходит по факту НОВОЙ сессии
   // (M3): бамп-перед-попыткой списывал дважды за одну сессию на ретраях.
-  await checkSessionBudget(deps, { visitorKey: input.visitorKey, ipHash: input.ipHash });
+  await checkSessionBudget(deps, {
+    visitorKey: input.visitorKey, ipHash: input.ipHash, accountId: input.widget.account_id,
+  });
 
   let dialog: DialogRow;
   let continueFrom: string | undefined;

@@ -30,9 +30,16 @@ export async function buildTestApp(overrides: Partial<AppConfig> = {}): Promise<
     ipHashSalt: 'соль',
     maxDialogsPerVisitorPerDay: 20,
     maxDialogsPerIpPerDay: 60,
+    maxSessionsPerAccountPerDay: 300,
     maxDurationS: 600,
     trustProxy: false,
     logLevel: 'silent',
+    sessionTtlDays: 30,
+    panelOrigin: 'https://widget.aski.pro',
+    // На http-инжектах Secure-кука не вернулась бы обратно — в тестах выключен.
+    cookieSecure: false,
+    loginMaxFailures: 10,
+    loginLockMinutes: 15,
     ...overrides,
   };
   const app = await buildApp({

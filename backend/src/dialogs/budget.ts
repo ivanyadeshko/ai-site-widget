@@ -2,7 +2,20 @@ import type { AppDeps } from '../app.ts';
 import {
   bumpIpDayCounter, bumpVisitorDayCounter, peekIpDayCounter, peekVisitorDayCounter,
 } from '../db/repositories/quotas.ts';
+import {
+  bumpAccountDayCounter, findAccountLimits, peekAccountDayCounter,
+} from '../db/repositories/accountLimits.ts';
 import { ApiError } from '../http/errors.ts';
+
+/**
+ * Кап владельца сайта: своя строка `account_limits` или дефолт стенда.
+ * Виджет без владельца (`accountId === null`, наследие релиза 1) сюда не
+ * доходит вовсе — он капом аккаунта не ограничен.
+ */
+async function accountCap(deps: AppDeps, accountId: string): Promise<number> {
+  const limits = await findAccountLimits(deps.pool, accountId);
+  return limits?.max_sessions_per_day ?? deps.config.maxSessionsPerAccountPerDay;
+}
 
 /**
  * Суточные капы бюджет-предохранителя (спека §6.3) разнесены на ДВА шага:
@@ -33,7 +46,7 @@ import { ApiError } from '../http/errors.ts';
  */
 export async function chargeSessionBudget(
   deps: AppDeps,
-  input: { visitorKey: string; ipHash: string },
+  input: { visitorKey: string; ipHash: string; accountId: string | null },
 ): Promise<void> {
   const byVisitor = await bumpVisitorDayCounter(deps.pool, input.visitorKey);
   const byIp = await bumpIpDayCounter(deps.pool, input.ipHash);
@@ -46,6 +59,14 @@ export async function chargeSessionBudget(
       'БЮДЖЕТ-ПРЕДОХРАНИТЕЛЬ: сессия создана сверх суточного капа — допуск пропустил гонку',
     );
   }
+  if (input.accountId === null) return;
+  const byAccount = await bumpAccountDayCounter(deps.pool, input.accountId);
+  if (byAccount > (await accountCap(deps, input.accountId))) {
+    deps.log.warn(
+      { accountId: input.accountId, byAccount },
+      'БЮДЖЕТ-ПРЕДОХРАНИТЕЛЬ: сессия создана сверх суточного капа АККАУНТА — допуск пропустил гонку',
+    );
+  }
 }
 
 /**
@@ -55,7 +76,7 @@ export async function chargeSessionBudget(
  */
 export async function checkSessionBudget(
   deps: AppDeps,
-  input: { visitorKey: string; ipHash: string },
+  input: { visitorKey: string; ipHash: string; accountId: string | null },
 ): Promise<void> {
   const byVisitor = await peekVisitorDayCounter(deps.pool, input.visitorKey);
   if (byVisitor >= deps.config.maxDialogsPerVisitorPerDay) {
@@ -64,5 +85,13 @@ export async function checkSessionBudget(
   const byIp = await peekIpDayCounter(deps.pool, input.ipHash);
   if (byIp >= deps.config.maxDialogsPerIpPerDay) {
     throw new ApiError(429, 'ip_daily_cap', 'Слишком много обращений за сутки. Попробуйте завтра.');
+  }
+  // Третий ключ — ВЛАДЕЛЕЦ САЙТА. Поле обязательное (`string | null`, а не
+  // `?`): пропущенный проброс на новом call-site иначе не упал бы компиляцией
+  // и тихо снял бы кап.
+  if (input.accountId === null) return;
+  const byAccount = await peekAccountDayCounter(deps.pool, input.accountId);
+  if (byAccount >= (await accountCap(deps, input.accountId))) {
+    throw new ApiError(429, 'account_daily_cap', 'Лимит виджета на сегодня исчерпан. Владелец сайта уведомлён.');
   }
 }

@@ -108,7 +108,9 @@ export async function openCoreSession(deps: AppDeps, input: OpenSessionInput): P
     channel: input.channel,
   });
   if (isNewSession) {
-    await chargeSessionBudget(deps, { visitorKey: input.visitorKey, ipHash: input.ipHash });
+    await chargeSessionBudget(deps, {
+      visitorKey: input.visitorKey, ipHash: input.ipHash, accountId: input.widget.account_id,
+    });
   } else {
     deps.log.info(
       { dialogId: input.dialog.id, sessionId: created.session_id, idempotencyKey },
