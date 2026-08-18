@@ -28,10 +28,16 @@ describe('роутер панели', () => {
     expect(resolved.name).toBe('not-found');
   });
 
-  it('публичные экраны помечены meta.public — гард Task 9 опирается на эту метку', () => {
+  it('публичны ровно вход, регистрация и 404 — остальное под гардом', () => {
     const publicNames = routes.filter((r) => r.meta?.public === true).map((r) => r.name);
-    expect(publicNames).toContain('login');
-    expect(publicNames).toContain('register');
-    expect(routes.find((r) => r.name === 'widgets')?.meta?.public).toBeUndefined();
+    expect(publicNames).toEqual(['login', 'register', 'not-found']);
+    for (const path of ['/', '/leads', '/dialogs', '/usage', '/admin/accounts']) {
+      expect(router.resolve(path).meta.public, `${path} не должен быть публичным`).toBeUndefined();
+    }
+  });
+
+  it('экраны кабинета живут внутри общего лэйаута, экраны входа — нет', () => {
+    expect(router.resolve('/leads').matched).toHaveLength(2);
+    expect(router.resolve('/login').matched).toHaveLength(1);
   });
 });
