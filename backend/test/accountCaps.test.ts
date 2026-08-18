@@ -81,9 +81,13 @@ describe('суточный кап сессий на аккаунт витрин�
     expect(await peekAccountDayCounter(pool, owner.id)).toBe(0);
   });
 
-  it('виджет с account_id IS NULL капом аккаунта не ограничен и не падает', async () => {
+  it('виджет с владельцем: одиночный старт проходит (дефолтный кап аккаунта не задет)', async () => {
+    // Релиз 2 (Task 27): account_id — NOT NULL, бесхозных виджетов больше нет
+    // (прежний тест «account_id IS NULL капом не ограничен» проверял состояние,
+    // которого схема не допускает). seedWidget заводит владельца; один старт при
+    // дефолтном капе (300) заведомо проходит — кап на этом пути не мешает.
     const { token } = await seedWidget(pool, { allowedOrigins: [ORIGIN] });
-    core.enqueue({ status: 201, body: CREATED('sess_legacy_1') });
+    core.enqueue({ status: 201, body: CREATED('sess_owned_1') });
     const res = await app.inject({
       method: 'POST', url: `/w/v1/${token}/dialogs`,
       headers: { origin: ORIGIN, 'x-forwarded-for': '203.0.113.10' },

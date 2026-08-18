@@ -285,14 +285,15 @@ jobs:
       - name: health
         run: ssh -F "$SSHF" target "bash ${DEPLOY_PATH}/infra/deploy/release.sh health"
 
-      - name: smoke — негативы (чужой Origin, суточный кап, фейк-подпись)
+      - name: smoke — негативы + панель (чужой Origin, кап, фейк-подпись, регистрация→виджет)
         if: ${{ !inputs.skip_smoke }}
         env:
           SMOKE_TOKEN: ${{ secrets.WIDGET_SMOKE_TOKEN }}
-        # Сценарий 6 — единственный, который И самодостаточен (не нуждается в
-        # dialog_id из сценария 1), И не жжёт кредиты вендоров: все три отказа
-        # происходят ДО создания сессии ядра. Поэтому он гейт КАЖДОГО деплоя.
-        # Остальные пять — платные, им место в nightly и предпрод-прогоне.
+        # Сценарии 6 и 7 — единственные, которые И самодостаточны (не нуждаются в
+        # dialog_id из сценария 1), И не жгут кредиты вендоров: у 6 все три отказа
+        # происходят ДО создания сессии ядра, а 7 (панель: регистрация → виджет →
+        # /config → удаление аккаунта) вообще не трогает ядро. Поэтому они — гейт
+        # КАЖДОГО деплоя. Остальные пять — платные, им место в nightly и предпрод.
         # Гоняется НА СЕРВЕРЕ: сценарию нужен psql БД виджета.
         run: |
           if [ -z "$SMOKE_TOKEN" ]; then
@@ -313,7 +314,7 @@ jobs:
           # WIDGET_PUBLISH_TOKEN из окружения — этот путь уже поддержан.
           printf '%s' "$SMOKE_TOKEN" | ssh -F "$SSHF" target \
             "cd ${DEPLOY_PATH} && WIDGET_PUBLISH_TOKEN=\$(cat) python3 scripts/widget_smoke.py \
-              --only 6 \
+              --only 6,7 \
               --base-url http://localhost:8200 \
               --psql 'docker compose exec -T widget-db psql -U widget -d site_widget'"
 

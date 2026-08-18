@@ -926,6 +926,66 @@ def scenario_6_negatives(ctx: Ctx) -> None:
     ok("сценарий 6: чужой Origin/суточный кап/фейк-подпись — все три отклонены корректно")
 
 
+def scenario_7_panel(ctx: Ctx) -> None:
+    """(7) панель витрины БЕЗ кредитов ядра: регистрация → создание виджета →
+    /config отдаёт полную тему и enabled → удаление аккаунта прямым SQL.
+
+    САМОДОСТАТОЧЕН (не читает ctx.token/ctx.dialog_id) и БЕСПЛАТЕН — сессия ядра
+    не создаётся, поэтому годится в гейт КАЖДОГО деплоя (в отличие от 1–5).
+    Origin панельных ручек = base_url: на однодоменном стенде panelOrigin ==
+    WIDGET_PUBLIC_ORIGIN == base_url. На мультидоменной раскладке (G3) сюда
+    придёт правка вместе с --base-url — тот же известный хвост, что у смока в
+    целом (R-7).
+    """
+    panel_origin = ctx.base_url
+    suffix = uuid.uuid4().hex
+    email = f"smoke-panel-{suffix}@vell.local"
+    password = f"smoke-panel-pass-{suffix[:12]}"  # ≥10 символов, не одни цифры
+
+    reg = ctx.http(
+        "POST", "/api/v1/auth/register",
+        json={"email": email, "password": password},
+        headers={"Origin": panel_origin},
+    )
+    assert reg.status == 201, f"регистрация не прошла: {reg.status} {reg.text[:200]}"
+    account_id = _safe_id((reg.json().get("account") or {}).get("id", ""), what="account_id")
+
+    # Кука сессии — в Set-Cookie ответа регистрации (httpOnly, D-3).
+    set_cookie = next((v for k, v in reg.headers.items() if k.lower() == "set-cookie"), "")
+    session_cookie = set_cookie.split(";", 1)[0]
+    assert session_cookie.startswith("vell_sid="), f"регистрация не выдала сессию: {set_cookie!r}"
+
+    create = ctx.http(
+        "POST", "/api/v1/widgets",
+        json={
+            "name": "Смок-виджет панели",
+            "agent_config": {"instructions": "Ты консультант сайта. Отвечай коротко."},
+            "allowed_origins": [panel_origin],
+        },
+        headers={"Origin": panel_origin, "Cookie": session_cookie},
+    )
+    assert create.status == 201, f"виджет не создан: {create.status} {create.text[:200]}"
+    token = (create.json().get("widget") or {}).get("publish_token", "")
+    assert token.startswith("wgt_"), f"неожиданный publish_token: {token!r}"
+
+    cfg = ctx.http("GET", f"/w/v1/{token}/config")
+    assert cfg.status == 200, f"/config -> {cfg.status}: {cfg.text[:200]}"
+    body = cfg.json()
+    assert body.get("enabled") is True, f"виджет панели выключен: {body}"
+    theme = body.get("theme")
+    # Публичный /config отдаёт ПОЛНУЮ тему с добитыми дефолтами (themeForConfig).
+    assert isinstance(theme, dict) and theme.get("color"), f"/config не отдал полную тему: {theme}"
+
+    # Уборка: удаляем аккаунт прямым SQL — виджет уходит каскадом (ON DELETE CASCADE).
+    ctx.psql_exec(f"DELETE FROM accounts WHERE id = '{account_id}'")
+    rows = ctx.psql_fields(
+        f"SELECT count(*) FROM widgets WHERE publish_token = '{_safe_id(token, what='publish_token')}'"
+    )
+    assert rows[0] == "0", f"виджет не удалился каскадом после удаления аккаунта: {rows}"
+
+    ok("сценарий 7: регистрация → виджет → /config с темой → удаление аккаунта (кредиты не тронуты)")
+
+
 SCENARIOS: list[tuple[str, Any]] = [
     ("1-chat-and-echo-dedup", scenario_1_chat_and_echo_dedup),
     ("2-reenter", scenario_2_reenter),
@@ -933,6 +993,7 @@ SCENARIOS: list[tuple[str, Any]] = [
     ("4-lead", scenario_4_lead),
     ("5-webhook-to-usage", scenario_5_webhook_to_usage),
     ("6-negatives", scenario_6_negatives),
+    ("7-panel", scenario_7_panel),
 ]
 
 # Сценарии, которым НЕ нужен livekit-rtc: целиком HTTP + psql, комнату не
@@ -943,7 +1004,7 @@ SCENARIOS: list[tuple[str, Any]] = [
 # 4-lead сюда НЕ входит, хотя сам по себе тоже обходится без LiveKit: он читает
 # ctx.dialog_id, который создаёт сценарий 1, и в одиночку падает
 # «сценарий 1 не подготовил dialog_id». Отвязка — отдельная работа.
-LIVEKIT_FREE: frozenset = frozenset({"6-negatives"})
+LIVEKIT_FREE: frozenset = frozenset({"6-negatives", "7-panel"})
 
 
 class OnlyError(Exception):

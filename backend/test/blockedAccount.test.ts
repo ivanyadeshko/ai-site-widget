@@ -76,9 +76,12 @@ describe('блокировка владельца гасит публичный 
     expect(start.statusCode).toBe(201);
   });
 
-  it('ТЕСТ-СТРАЖ аддитивности: виджет с account_id IS NULL (наследие релиза 1) работает как раньше', async () => {
-    // LEFT JOIN, а не INNER: строки без владельца обязаны продолжать
-    // находиться, иначе релиз 1 (Constraint 1) убил бы весь прод.
+  it('виджет с невыключенным владельцем работает по всему публичному пути (config, /app, старт)', async () => {
+    // Релиз 2 (Task 27): widgets.account_id — NOT NULL, бесхозных строк больше
+    // нет (прежний «страж аддитивности релиза 1» проверял виджет с account_id
+    // IS NULL, которого схема теперь не допускает). seedWidget заводит
+    // владельца сам; сторожим, что виджет с НЕзаблокированным владельцем
+    // проходит config → /app → старт диалога без сучка.
     const { token } = await seedWidget(pool, { allowedOrigins: [ORIGIN] });
     const cfg = await app.inject({ method: 'GET', url: `/w/v1/${token}/config`, headers: { origin: ORIGIN } });
     expect(cfg.statusCode).toBe(200);

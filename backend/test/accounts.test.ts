@@ -40,12 +40,15 @@ describe('аккаунты витрины', () => {
     expect((await findAccountByEmail(pool, 'a@b.c'))!.blocked_at).toBeNull();
   });
 
-  it('виджет без явного владельца создаётся с account_id = NULL (релиз 1 аддитивен)', async () => {
-    const { id } = await seedWidget(pool);
-    const { rows } = await pool.query<{ account_id: string | null }>(
-      'SELECT account_id FROM widgets WHERE id = $1', [id],
-    );
-    expect(rows[0]!.account_id).toBeNull();
+  it('виджет без account_id больше НЕ создаётся (NOT NULL, релиз 2)', async () => {
+    // Инверсия теста релиза 1 «создаётся с NULL»: он фиксировал промежуточное
+    // состояние аддитивной миграции Task 1 и здесь умирает по плану. Второй
+    // релиз (Task 27) ставит NOT NULL — сырой INSERT без владельца обязан
+    // падать 23502, а не тихо заводить бесхозный виджет.
+    await expect(pool.query(
+      `INSERT INTO widgets (publish_token, name, agent_config, kb_ids, allowed_origins, enabled)
+       VALUES ('wgt_notnull_probe', 'x', '{}'::jsonb, '[]'::jsonb, '[]'::jsonb, true)`,
+    )).rejects.toThrow(/null value in column "account_id"|not-null|23502/i);
   });
 
   it('удаление аккаунта уносит его виджеты (ON DELETE CASCADE)', async () => {

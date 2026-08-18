@@ -13,8 +13,12 @@ export type WidgetRow = {
   allowed_origins: string[];
   enabled: boolean;
   created_at: Date;
-  /** NULL — наследие релиза 1: виджеты, заведённые до появления аккаунтов. */
-  account_id: string | null;
+  /**
+   * Владелец виджета. NOT NULL со ВТОРОГО релиза (Task 27): бесхозных строк в
+   * проде не осталось (бэкфилл релиза 1 увёл их на системный аккаунт). FK на
+   * accounts, ON DELETE CASCADE.
+   */
+  account_id: string;
   /** Только то, что владелец реально задал; `{}` = «всё по умолчанию». */
   theme: WidgetTheme;
 };
@@ -34,9 +38,11 @@ export type WidgetPatch = {
 const COLS = 'id, publish_token, name, agent_config, kb_ids, allowed_origins, enabled, created_at, account_id, theme';
 
 export async function findWidgetByToken(db: Queryable, token: string): Promise<WidgetWithOwner | null> {
-  // LEFT JOIN, а НЕ INNER: строки с account_id IS NULL обязаны продолжать
-  // находиться (Constraint 1, аддитивность релиза 1) — INNER погасил бы весь
-  // существующий прод разом. У таких строк owner_blocked = false.
+  // LEFT JOIN, а НЕ INNER. Со второго релиза (Task 27) account_id — NOT NULL,
+  // бесхозных строк больше нет, так что практической разницы уже не даёт; LEFT
+  // остаётся как ДЕФЕНСИВНЫЙ выбор (INNER молча спрятал бы виджет, у которого
+  // FK по какой-то аномалии не сошёлся, вместо того чтобы вернуть его без
+  // владельца). Исторически же он был обязателен для аддитивности релиза 1.
   const { rows } = await db.query<WidgetWithOwner>(
     `SELECT w.id, w.publish_token, w.name, w.agent_config, w.kb_ids, w.allowed_origins,
             w.enabled, w.created_at, w.account_id, w.theme,
@@ -173,10 +179,12 @@ export async function countWidgetsByAccount(db: Queryable, accountId: string): P
 /**
  * Строка админского списка виджетов.
  *
- * `owner_email` — nullable: LEFT JOIN оставляет в списке бесхозные виджеты
- * (`account_id IS NULL`, наследие релиза 1). INNER спрятал бы их, а оператору
- * они нужны как раз больше всего — именно у них нет ни лимитов, ни адресата
- * жалобы.
+ * `owner_email`/`account_id` — nullable как ДЕФЕНСИВНЫЙ residue LEFT JOIN
+ * (`adminListWidgets`). Со второго релиза (Task 27) account_id — NOT NULL,
+ * бесхозных виджетов (когда-то `account_id IS NULL`, наследие релиза 1) больше
+ * не бывает, поэтому на практике оба поля всегда заполнены; тип оставлен
+ * nullable, чтобы LEFT JOIN не пришлось менять на INNER (тот молча спрятал бы
+ * виджет с несошедшимся FK вместо того, чтобы показать его оператору).
  *
  * `publish_token` отдаётся намеренно: он не секрет (лежит в HTML клиентского
  * сайта), а поддержка приходит на этот экран ровно с ним в руках — «клиент
