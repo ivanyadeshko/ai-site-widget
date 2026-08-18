@@ -193,6 +193,25 @@ describe('админ-поверхность: расход в разрезе ак
     expect(tooWide.statusCode).toBe(422);
     expect(tooWide.json().error.code).toBe('invalid_period');
   });
+
+  it('отчёт ограничен строже листингов: 31-й запрос в минуту — 429', async () => {
+    // Самый тяжёлый запрос админки: разворачивает jsonb по ВСЕМ диалогам
+    // периода через accounts × widgets × dialogs. Без явного потолка (лимитер
+    // зарегистрирован с global:false) один зациклившийся экран кладёт базу
+    // витрины целиком, а не только свою страницу.
+    const admin = await signIn('rate@example.com', true);
+    for (let i = 0; i < 30; i += 1) {
+      const res = await app.inject({
+        method: 'GET', url: `/api/v1/admin/usage?${PERIOD}`, headers: { cookie: admin.cookie },
+      });
+      expect(res.statusCode, `запрос ${i + 1}`).toBe(200);
+    }
+    const over = await app.inject({
+      method: 'GET', url: `/api/v1/admin/usage?${PERIOD}`, headers: { cookie: admin.cookie },
+    });
+    expect(over.statusCode).toBe(429);
+    expect(over.json().error.code).toBe('rate_limited');
+  });
 });
 
 describe('админ-поверхность: лимиты аккаунта', () => {

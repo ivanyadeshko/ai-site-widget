@@ -178,6 +178,21 @@ describe('админ-поверхность: аккаунты витрины', (
     }
   });
 
+  it('список аккаунтов ограничен по частоте: 61-й запрос в минуту — 429', async () => {
+    // Ручки админки по умолчанию БЕЗ потолка (@fastify/rate-limit
+    // зарегистрирован с global:false), а это список ВСЕХ клиентов витрины с их
+    // почтой: украденная админская кука без лимита выкачивает его в один поток.
+    // Тот же класс дыры, что уже закрыт на панельных лидах.
+    const admin = await signIn('rate@example.com', true);
+    for (let i = 0; i < 60; i += 1) {
+      const res = await app.inject({ method: 'GET', url: '/api/v1/admin/accounts', headers: { cookie: admin.cookie } });
+      expect(res.statusCode, `запрос ${i + 1}`).toBe(200);
+    }
+    const over = await app.inject({ method: 'GET', url: '/api/v1/admin/accounts', headers: { cookie: admin.cookie } });
+    expect(over.statusCode).toBe(429);
+    expect(over.json().error.code).toBe('rate_limited');
+  });
+
   /**
    * Единственный выход из login-lock: восстановления пароля у витрины нет (D-4),
    * а счётчик неудач сам по себе не рассасывается — без этой ручки владельца
