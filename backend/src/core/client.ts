@@ -1,4 +1,6 @@
-import type { CoreSession, ParticipantToken, SessionCreate, SessionCreated, TranscriptPage } from './types.ts';
+import type {
+  CoreSession, CreditsBalance, ParticipantToken, SessionCreate, SessionCreated, TranscriptPage,
+} from './types.ts';
 
 export class CoreHttpError extends Error {
   readonly status: number;
@@ -112,5 +114,15 @@ export class CoreClient {
 
   getSession(sessionId: string): Promise<CoreSession> {
     return this.request<CoreSession>('GET', `/v1/sessions/${sessionId}`, { okStatuses: [200] }) as Promise<CoreSession>;
+  }
+
+  /**
+   * Баланс кредитов ТЕНАНТА — единственная цифра ядра, которую видит оператор
+   * витрины. Для ядра весь виджет-продукт один тенант (D-1), поэтому это баланс
+   * ОБЩИЙ на всех клиентов, а не персональный: подпись в UI обязана это
+   * говорить прямым текстом.
+   */
+  getCreditsBalance(): Promise<CreditsBalance> {
+    return this.request<CreditsBalance>('GET', '/v1/credits/balance', { okStatuses: [200] }) as Promise<CreditsBalance>;
   }
 }

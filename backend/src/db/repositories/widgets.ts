@@ -1,3 +1,4 @@
+import type { Cursor } from '../../panel/pagination.ts';
 import type { WidgetTheme } from '../../widgets/theme.ts';
 import type { Queryable } from '../pool.ts';
 
@@ -158,4 +159,62 @@ export async function countWidgetsByAccount(db: Queryable, accountId: string): P
     'SELECT count(*)::text AS count FROM widgets WHERE account_id = $1', [accountId],
   );
   return Number.parseInt(rows[0]?.count ?? '0', 10);
+}
+
+/*
+ * МЕЖАРЕНДАТОРНОЕ ЧТЕНИЕ — ТОЛЬКО НИЖЕ ЭТОЙ ЧЕРТЫ (Task 19, админка оператора).
+ *
+ * Всё выше несёт `account_id = $N` в самом SQL — это и есть изоляция. Функция
+ * ниже скоупа НЕ имеет по построению, поэтому названа `admin*` и зовётся
+ * исключительно из-под `requireAdmin`: на ревью такой вызов в панельной ручке
+ * виден по имени, не вчитываясь в запрос.
+ */
+
+/**
+ * Строка админского списка виджетов.
+ *
+ * `owner_email` — nullable: LEFT JOIN оставляет в списке бесхозные виджеты
+ * (`account_id IS NULL`, наследие релиза 1). INNER спрятал бы их, а оператору
+ * они нужны как раз больше всего — именно у них нет ни лимитов, ни адресата
+ * жалобы.
+ *
+ * `publish_token` отдаётся намеренно: он не секрет (лежит в HTML клиентского
+ * сайта), а поддержка приходит на этот экран ровно с ним в руках — «клиент
+ * прислал токен, чей это виджет».
+ */
+export type AdminWidgetRow = {
+  id: string;
+  name: string;
+  publish_token: string;
+  enabled: boolean;
+  created_at: Date;
+  account_id: string | null;
+  owner_email: string | null;
+  owner_blocked: boolean;
+  dialogs_total: number;
+  cursor_at: string;
+};
+
+export async function adminListWidgets(
+  db: Queryable,
+  input: { accountId: string | null; limit: number; cursor: Cursor | null },
+): Promise<AdminWidgetRow[]> {
+  const { rows } = await db.query<AdminWidgetRow>(
+    // Число диалогов — коррелированным подзапросом, а не JOIN + GROUP BY:
+    // группировка по всей строке виджета ради одного счётчика читается хуже и
+    // ломается на первом добавленном поле.
+    `SELECT w.id, w.name, w.publish_token, w.enabled, w.created_at, w.account_id,
+            a.email AS owner_email,
+            (a.blocked_at IS NOT NULL) AS owner_blocked,
+            to_char(w.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_at,
+            (SELECT count(*)::int FROM dialogs d WHERE d.widget_id = w.id) AS dialogs_total
+       FROM widgets w
+       LEFT JOIN accounts a ON a.id = w.account_id
+      WHERE ($2::uuid IS NULL OR w.account_id = $2::uuid)
+        AND ($3::timestamptz IS NULL OR (w.created_at, w.id) < ($3::timestamptz, $4::uuid))
+      ORDER BY w.created_at DESC, w.id DESC
+      LIMIT $1`,
+    [input.limit, input.accountId, input.cursor?.at ?? null, input.cursor?.id ?? null],
+  );
+  return rows;
 }
