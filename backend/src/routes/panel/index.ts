@@ -1,6 +1,7 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { requireSameOrigin } from '../../auth/guards.ts';
 import { ApiError, sendApiError } from '../../http/errors.ts';
+import { adminRoutes } from './admin.ts';
 import { authRoutes } from './auth.ts';
 import { dialogRoutes } from './dialogs.ts';
 import { leadRoutes } from './leads.ts';
@@ -44,4 +45,9 @@ export const panelRoutes: FastifyPluginAsync = async (app) => {
   await app.register(leadRoutes);
   await app.register(dialogRoutes);
   await app.register(usageRoutes);
+  // Админка — ДОЧЕРНИМ плагином здесь же, со своим префиксом. Собственный
+  // скоуп нужен ради `requireAdmin` хуком: гард действует на все ручки внутри
+  // и ни на одну снаружи, поэтому новая админская ручка не может появиться
+  // мимо проверки роли.
+  await app.register(adminRoutes, { prefix: '/admin' });
 };
