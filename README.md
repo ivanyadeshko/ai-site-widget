@@ -38,6 +38,12 @@ curl -fsS http://localhost:8200/healthz   # {"status":"ok","db":"ok"}
 `/w/v1/:token/dialogs` (старт диалога) упадёт — ходить некуда. Для полного
 локального цикла с ядром см. `ai-conversation-core` (свой стенд, свой `.env`).
 
+⚠️ В `.env.example` строка `COMPOSE_FILE=compose.yaml:compose.core-network.yaml`
+активна — это режим `attached`, и он требует, чтобы внешняя docker-сеть ядра
+(`conversation-core_default`) уже существовала, иначе `up` падает «network …
+declared as external, but could not be found». Поднимаете виджет БЕЗ ядра —
+закомментируйте эту строку (режим `public`, см. раздел «Сетевые режимы»).
+
 ### Обязательные плейсхолдеры перед первым запуском
 
 `.env.example` содержит несколько значений, которые **обязаны** быть заменены

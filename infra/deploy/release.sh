@@ -249,14 +249,23 @@ site_health_url() { printf '%s' "${SITE_HEALTH_URL:-http://127.0.0.1:3000/api/he
 # закомментированной строкой или с чужим файлом вроде
 # `compose.core-network.yaml.bak`, и стенд в режиме `public` получил бы
 # требование несуществующей сети — то есть отказ деплоя на ровном месте.
+#
+# Побочный эффект намеренный: путь найденного override'а кладётся в
+# CORE_NETWORK_OVERRIDE, чтобы preflight проверил наличие ИМЕННО ТОГО файла,
+# на который ссылается .env (он может лежать и в подкаталоге), а не угаданного.
+CORE_NETWORK_OVERRIDE=""
 core_network_mode_attached() {
     local files item
+    CORE_NETWORK_OVERRIDE=""
     files="$(env_get COMPOSE_FILE)"
     [ -n "$files" ] || return 1
     local IFS=':'
     for item in $files; do
         item="$(printf '%s' "$item" | tr -d '[:space:]')"
-        [ "$(basename "$item")" = "compose.core-network.yaml" ] && return 0
+        if [ "$(basename "$item")" = "compose.core-network.yaml" ]; then
+            CORE_NETWORK_OVERRIDE="$item"
+            return 0
+        fi
     done
     return 1
 }
@@ -325,8 +334,13 @@ cmd_preflight() {
         docker network inspect "$net" >/dev/null 2>&1 \
             || die "внешняя сеть '$net' не существует — стек ядра не поднят? BFF без неё не стартует"
         info "сеть ядра '$net' на месте"
-        [ -f "$REPO_DIR/compose.core-network.yaml" ] \
-            || die "COMPOSE_FILE ссылается на compose.core-network.yaml, но файла нет в $REPO_DIR — compose упадёт «no such file» на каждой команде; файл кладёт шаг «Sync deploy assets» деплоя"
+        # Путь берём ровно тот, что стоит в COMPOSE_FILE: относительный
+        # разрешается от каталога стека (compose делает так же), абсолютный —
+        # как есть.
+        local override="$CORE_NETWORK_OVERRIDE"
+        case "$override" in /*) ;; *) override="$REPO_DIR/$override" ;; esac
+        [ -f "$override" ] \
+            || die "COMPOSE_FILE ссылается на '$CORE_NETWORK_OVERRIDE', но файла нет ($override) — compose упадёт «no such file» на КАЖДОЙ команде, включая rollback; файл кладёт шаг «Sync deploy assets» деплоя"
     else
         info "сетевой режим public — внешняя сеть ядра не требуется"
     fi
