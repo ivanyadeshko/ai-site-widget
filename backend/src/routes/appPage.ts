@@ -11,7 +11,12 @@ export const appPageRoutes: FastifyPluginAsync = async (app) => {
 
   app.get<{ Params: { token: string } }>('/app/:token', async (req, reply) => {
     const widget = await findWidgetByToken(app.deps.pool, req.params.token);
-    if (!widget) return reply.code(404).type('text/plain; charset=utf-8').send('Виджет не найден');
+    // Заблокированный владелец — как несуществующий виджет: iframe на чужом
+    // сайте не должен грузиться вовсе, а отличать «нет такого» от «владелец
+    // заблокирован» посетителю незачем.
+    if (!widget || widget.owner_blocked) {
+      return reply.code(404).type('text/plain; charset=utf-8').send('Виджет не найден');
+    }
 
     template ??= await readFile(SHELL, 'utf8');
 
