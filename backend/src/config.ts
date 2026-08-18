@@ -67,6 +67,20 @@ const REQUIRED = [
 
 const trimSlash = (v: string): string => v.replace(/\/+$/, '');
 
+/**
+ * Origin из env с фолбэком — и с ЯВНОЙ проверкой на пустоту.
+ *
+ * `??` здесь недостаточно (находка кросс-ревью): docker `env_file` отдаёт
+ * строку `WIDGET_APP_ORIGIN=` как `''`, а не как `undefined`, и `??` пустую
+ * строку пропускает. Цена ошибки выросла ровно с введением цепочки фолбэков:
+ * пустой `appOrigin` тянет за собой пустые `publicOrigin`, `panelOrigin` и
+ * `cdnOrigin`, а это — относительный `app_url` (iframe грузится с домена
+ * ЧУЖОГО сайта), 403 на каждый не-GET к `/api/v1` и потерянный Secure у куки.
+ * Пробелы срезаем по той же причине: `KEY= ` в .env — та же опечатка.
+ */
+const originOr = (raw: string | undefined, fallback: string): string =>
+  trimSlash((raw ?? '').trim() === '' ? fallback : raw!.trim());
+
 const int = (raw: string | undefined, fallback: number): number => {
   if (raw === undefined || raw === '') return fallback;
   const parsed = Number.parseInt(raw, 10);
@@ -88,11 +102,11 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
   // единой правки. Цепочка именно такая (app → public), а не «каждый сам к
   // public»: стенд, задавший только WIDGET_APP_ORIGIN, ожидает, что панель и
   // статика переехали ВМЕСТЕ с приложением, а не остались на старом хосте.
-  const appOrigin = trimSlash(env.WIDGET_APP_ORIGIN ?? env.WIDGET_PUBLIC_ORIGIN!);
+  const appOrigin = originOr(env.WIDGET_APP_ORIGIN, env.WIDGET_PUBLIC_ORIGIN!);
   // Панель по умолчанию живёт на том же origin, что и остальной BFF
   // (app.vell.pro: /panel + /api/v1 + /app/:token). Отдельная переменная нужна
   // лишь на раскладке, где SPA раздаётся с другого хоста.
-  const panelOrigin = trimSlash(env.WIDGET_PANEL_ORIGIN ?? appOrigin);
+  const panelOrigin = originOr(env.WIDGET_PANEL_ORIGIN, appOrigin);
   return {
     port: int(env.PORT, 8200),
     databaseUrl: env.DATABASE_URL!,
@@ -124,7 +138,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
     panelOrigin,
     // Фолбэк на origin приложения: существующие стенды продолжают работать без
     // единой правки .env, а сниппет на них остаётся однодоменным (без data-host).
-    cdnOrigin: trimSlash(env.WIDGET_CDN_ORIGIN ?? appOrigin),
+    cdnOrigin: originOr(env.WIDGET_CDN_ORIGIN, appOrigin),
     // На https-происхождении Secure включается сам; явный SESSION_COOKIE_SECURE=1
     // форсирует его на раскладке, где TLS терминируется выше по цепочке.
     cookieSecure: (env.SESSION_COOKIE_SECURE ?? '') === '1' || panelOrigin.startsWith('https://'),

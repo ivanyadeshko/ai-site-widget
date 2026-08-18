@@ -93,6 +93,49 @@ describe('мультидомен app/cdn: публичный API', () => {
   });
 });
 
+describe('мультидомен app/cdn: appOrigin — самостоятельное поле, а не переименование', () => {
+  /**
+   * Ключевой кейс (добавлен по кросс-ревью): во всех тестах выше `appOrigin`
+   * и `publicOrigin` совпадают, поэтому они прошли бы и на старом коде,
+   * читавшем `publicOrigin`. Здесь значения РАЗВЕДЕНЫ: `publicOrigin` держит
+   * старый адрес, `appOrigin` — новый. Если код где-то откатится обратно на
+   * `publicOrigin`, красным станет именно этот тест.
+   */
+  const STALE = 'https://stale.example';
+
+  it('app_url и Origin-guard идут за appOrigin, а не за старым publicOrigin', async () => {
+    const built = await buildTestApp({
+      appOrigin: APP_ORIGIN, publicOrigin: STALE, cdnOrigin: CDN_ORIGIN, panelOrigin: APP_ORIGIN,
+    });
+    try {
+      const { token } = await seedWidget(built.pool, { allowedOrigins: [SHOP] });
+
+      const config = await built.app.inject({
+        method: 'GET', url: `/w/v1/${token}/config`, headers: { origin: SHOP },
+      });
+      expect(config.json().app_url).toBe(`${APP_ORIGIN}/app/${token}`);
+
+      // Origin самого iframe (appOrigin) проходит guard: 422 на кривом
+      // visitor_key означает, что до валидации тела дело дошло.
+      const fromApp = await built.app.inject({
+        method: 'POST', url: `/w/v1/${token}/dialogs`,
+        headers: { origin: APP_ORIGIN }, payload: { visitor_key: 'не-uuid' },
+      });
+      expect(fromApp.statusCode).toBe(422);
+
+      // А старый publicOrigin доверенным больше НЕ является.
+      const fromStale = await built.app.inject({
+        method: 'POST', url: `/w/v1/${token}/dialogs`,
+        headers: { origin: STALE }, payload: { visitor_key: '11111111-1111-4111-8111-111111111111' },
+      });
+      expect(fromStale.statusCode).toBe(403);
+      expect(fromStale.json().error.code).toBe('origin_not_allowed');
+    } finally {
+      await built.app.close(); await built.core.stop(); await built.pool.end();
+    }
+  });
+});
+
 describe('мультидомен app/cdn: статика лоадера', () => {
   it('шим /w.js отдаётся с Access-Control-Allow-Origin: * — его тянет чужой сайт кросс-доменно', async () => {
     const res = await app.inject({ method: 'GET', url: '/w.js' });

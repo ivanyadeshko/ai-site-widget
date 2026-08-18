@@ -63,6 +63,18 @@ describe('loadConfig', () => {
     expect(cfg.cookieSecure).toBe(true);
   });
 
+  it('ПУСТАЯ строка в .env = переменная не задана: docker отдаёт `KEY=` как ""', () => {
+    // `??` такую строку пропустил бы, и пустой appOrigin утащил бы за собой
+    // panel/cdn: относительный app_url (iframe грузится с домена чужого сайта),
+    // 403 на каждый не-GET к /api/v1 и потерянный Secure у куки сессии.
+    const cfg = loadConfig({
+      ...FULL, WIDGET_APP_ORIGIN: '', WIDGET_PANEL_ORIGIN: '   ', WIDGET_CDN_ORIGIN: '',
+    });
+    expect(cfg.appOrigin).toBe('http://localhost:8200');
+    expect(cfg.panelOrigin).toBe('http://localhost:8200');
+    expect(cfg.cdnOrigin).toBe('http://localhost:8200');
+  });
+
   it('trustProxy по умолчанию ВЫКЛЮЧЕН: иначе IP-кап обходится одним заголовком', () => {
     expect(loadConfig(FULL).trustProxy).toBe(false);
     expect(loadConfig({ ...FULL, TRUST_PROXY: 'true' }).trustProxy).toBe(false); // включает только '1'

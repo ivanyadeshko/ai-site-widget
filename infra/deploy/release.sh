@@ -68,9 +68,23 @@ info() { printf '→ %b\n' "$*"; }
 
 # Значение ключа из .env. Кавычки снимаются, `|| true` обязателен: иначе
 # отсутствие .env роняет скрипт молча через pipefail.
+#
+# У НЕквотированного значения срезается инлайн-комментарий и хвостовые пробелы
+# — ровно так же, как это делает парсер самого compose (находка кросс-ревью).
+# Без этого `TRUST_PROXY=1  # за nginx` читалось как `1  # за nginx`, гард
+# TRUST_PROXY отказывал деплою на КОРРЕКТНОМ .env, а
+# `COMPOSE_FILE=…:compose.core-network.yaml # attached` определялся как режим
+# `public` — то есть проверка сети ядра пропускалась, а compose файл всё равно
+# подхватывал, и `up` падал уже после подмены тега. Внутри кавычек `#` не
+# трогаем: там он часть значения.
 env_get() {
+    # Порядок ветвления значим: квотированное значение уходит из скрипта по
+    # `b` СРАЗУ после снятия кавычек — иначе `#` внутри кавычек срезался бы
+    # как комментарий следующим выражением.
     { sed -n "s|^$1=||p" .env 2>/dev/null | tail -1 \
-        | sed -e 's|^"\(.*\)"$|\1|' -e "s|^'\(.*\)'$|\1|"; } || true
+        | sed -e '/^"/{ s|^"\([^"]*\)".*$|\1|; b; }' \
+              -e "/^'/{ s|^'\([^']*\)'.*\$|\1|; b; }" \
+              -e 's|[[:space:]]*#.*$||' -e 's|[[:space:]]*$||'; } || true
 }
 
 # Сервисы, обязанные присутствовать в выдаче `docker compose ps`. Нужны
@@ -250,20 +264,23 @@ site_health_url() { printf '%s' "${SITE_HEALTH_URL:-http://127.0.0.1:3000/api/he
 # `compose.core-network.yaml.bak`, и стенд в режиме `public` получил бы
 # требование несуществующей сети — то есть отказ деплоя на ровном месте.
 #
-# Побочный эффект намеренный: путь найденного override'а кладётся в
-# CORE_NETWORK_OVERRIDE, чтобы preflight проверил наличие ИМЕННО ТОГО файла,
-# на который ссылается .env (он может лежать и в подкаталоге), а не угаданного.
-CORE_NETWORK_OVERRIDE=""
-core_network_mode_attached() {
+# Найденный путь ПЕЧАТАЕТСЯ в stdout (а не кладётся в глобальную переменную —
+# скрытый out-параметр молча терялся бы при вызове в подшелле): preflight
+# проверяет наличие ИМЕННО ТОГО файла, на который ссылается .env — он может
+# лежать и в подкаталоге, — а не угаданного по имени в корне.
+#
+# Режим читается ТОЛЬКО из .env. Экспортированный в окружении COMPOSE_FILE
+# compose бы уважил, а мы нет — но деплой таких переменных не ставит
+# (.github/workflows/deploy.yml передаёт по ssh только IMAGE_TAG).
+core_network_override_path() {
     local files item
-    CORE_NETWORK_OVERRIDE=""
     files="$(env_get COMPOSE_FILE)"
     [ -n "$files" ] || return 1
     local IFS=':'
     for item in $files; do
         item="$(printf '%s' "$item" | tr -d '[:space:]')"
         if [ "$(basename "$item")" = "compose.core-network.yaml" ]; then
-            CORE_NETWORK_OVERRIDE="$item"
+            printf '%s' "$item"
             return 0
         fi
     done
@@ -331,8 +348,8 @@ cmd_preflight() {
     #
     # Её отсутствие в режиме `attached` роняет `up` — но уже ПОСЛЕ того, как
     # мы подменили тег в .env, то есть в состоянии «наполовину задеплоено».
-    if core_network_mode_attached; then
-        local net
+    local override override_path net
+    if override="$(core_network_override_path)"; then
         net="$(env_get CORE_NETWORK)"; net="${net:-conversation-core_default}"
         docker network inspect "$net" >/dev/null 2>&1 \
             || die "внешняя сеть '$net' не существует — стек ядра не поднят? BFF без неё не стартует"
@@ -340,10 +357,10 @@ cmd_preflight() {
         # Путь берём ровно тот, что стоит в COMPOSE_FILE: относительный
         # разрешается от каталога стека (compose делает так же), абсолютный —
         # как есть.
-        local override="$CORE_NETWORK_OVERRIDE"
-        case "$override" in /*) ;; *) override="$REPO_DIR/$override" ;; esac
-        [ -f "$override" ] \
-            || die "COMPOSE_FILE ссылается на '$CORE_NETWORK_OVERRIDE', но файла нет ($override) — compose упадёт «no such file» на КАЖДОЙ команде, включая rollback; файл кладёт шаг «Sync deploy assets» деплоя"
+        override_path="$override"
+        case "$override_path" in /*) ;; *) override_path="$REPO_DIR/$override_path" ;; esac
+        [ -f "$override_path" ] \
+            || die "COMPOSE_FILE ссылается на '$override', но файла нет ($override_path) — compose упадёт «no such file» на КАЖДОЙ команде, включая rollback; файл кладёт шаг «Sync deploy assets» деплоя"
     else
         info "сетевой режим public — внешняя сеть ядра не требуется"
     fi
