@@ -10,6 +10,7 @@ export default function setup(): void {
     env: { ...process.env, DATABASE_URL: process.env.DATABASE_URL },
   });
   ensureAppShellPlaceholder();
+  ensurePanelShellPlaceholder();
 }
 
 /**
@@ -34,3 +35,31 @@ function ensureAppShellPlaceholder(): void {
       + '<body><div id="app" data-widget-token=""></div></body></html>\n',
   );
 }
+
+/**
+ * То же самое для SPA кабинета: `panel/dist/` — build-артефакт (`vite build`
+ * в воркспейсе `panel`), в git его нет, а `@fastify/static` в panelApp.ts
+ * падает ПРИ РЕГИСТРАЦИИ, если корня не существует — то есть без заглушки не
+ * поднимается ВЕСЬ тестовый инстанс, а не только тесты панели. Каталог
+ * `assets/` нужен отдельно: на нём стоит проверка «протухший чанк отдаёт 404».
+ */
+function ensurePanelShellPlaceholder(): void {
+  const dir = fileURLToPath(new URL('../../../panel/dist/', import.meta.url));
+  mkdirSync(`${dir}assets`, { recursive: true });
+  // Хэшированный чанк с ИМЕНЕМ ПО ШАБЛОНУ Vite 7 (`<имя>-<хэш>.js`): на нём
+  // держится проверка иммутабельного кэша, и без него правило заголовков
+  // можно было бы сломать, ничего не уронив.
+  const chunk = `${dir}assets/${PANEL_TEST_CHUNK}`;
+  if (!existsSync(chunk)) writeFileSync(chunk, 'export const placeholder = true;\n');
+
+  const file = `${dir}index.html`;
+  if (existsSync(file)) return;
+  writeFileSync(
+    file,
+    '<!doctype html><html lang="ru"><head><meta charset="UTF-8" /><title>Vell — кабинет</title></head>'
+      + '<body><div id="panel"></div></body></html>\n',
+  );
+}
+
+/** Имя чанка-заглушки: используется тестом раздачи панели. */
+export const PANEL_TEST_CHUNK = 'placeholder-Zz09Aa18.js';
