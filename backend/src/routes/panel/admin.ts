@@ -101,6 +101,16 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', requireAccount);
   app.addHook('preHandler', requireAdmin);
 
+  /*
+   * Потолок частоты на ручках админки. @fastify/rate-limit зарегистрирован с
+   * `global:false`, то есть без явного `config.rateLimit` ручка не имеет потолка
+   * вовсе — тот же пробел, что уже ловило кросс-ревью на панельных GET.
+   * Украденная админская кука без лимита перебирает блокировки и лимиты по всей
+   * базе клиентов быстрее, чем оператор успеет заметить. Шестьдесят обращений в
+   * минуту — заведомо больше, чем нужно живому человеку.
+   */
+  const throttled = { config: { rateLimit: { max: 60, timeWindow: '1 minute' } } };
+
   /** Аккаунт из пути + все запреты, общие для block/unblock/unlock-login. */
   const loadTarget = async (id: string): Promise<AccountRow> => {
     // Кривой uuid — 404, а не 500: `WHERE id = 'не-uuid'` роняет Postgres
@@ -113,7 +123,7 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
 
   app.get<{ Querystring: { limit?: string; cursor?: string } }>(
     '/accounts',
-    { config: { rateLimit: { max: 60, timeWindow: '1 minute' } } },
+    throttled,
     async (req, reply) => {
       const limit = parseLimit(req.query.limit);
       const cursor = parseCursor(req.query.cursor);
@@ -132,7 +142,7 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
    * обязателен: без него заблокированный работает в открытой вкладке до
    * истечения куки — то есть до 30 суток.
    */
-  app.post<{ Params: { id: string } }>('/accounts/:id/block', async (req, reply) => {
+  app.post<{ Params: { id: string } }>('/accounts/:id/block', throttled, async (req, reply) => {
     const target = await loadTarget(req.params.id);
 
     // Оператор, запёрший себя снаружи, не может разблокироваться сам: админка
@@ -156,7 +166,7 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
     return reply.send({ account: toPublicAccount(updated) });
   });
 
-  app.post<{ Params: { id: string } }>('/accounts/:id/unblock', async (req, reply) => {
+  app.post<{ Params: { id: string } }>('/accounts/:id/unblock', throttled, async (req, reply) => {
     const target = await loadTarget(req.params.id);
     await setAccountBlocked(app.deps.pool, target.id, false);
     // Сессии НЕ восстанавливаются: отозванные — отозваны, владелец входит
@@ -177,7 +187,7 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
    * Парный фикс живёт в `bumpFailure`: отсидевшее окно обнуляет счётчик, иначе
    * оператор снимал бы одну и ту же блокировку бесконечно.
    */
-  app.post<{ Params: { id: string } }>('/accounts/:id/unlock-login', async (req, reply) => {
+  app.post<{ Params: { id: string } }>('/accounts/:id/unlock-login', throttled, async (req, reply) => {
     const target = await loadTarget(req.params.id);
     // Ключ собирается ровно так же, как в `auth.ts`: email в нижнем регистре.
     // В БД лежит ИСХОДНОЕ написание, поэтому lower() здесь обязателен — иначе
@@ -189,7 +199,7 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
   /** Все виджеты витрины: чей это токен, включён ли, жив ли владелец. */
   app.get<{ Querystring: { account_id?: string; limit?: string; cursor?: string } }>(
     '/widgets',
-    { config: { rateLimit: { max: 60, timeWindow: '1 minute' } } },
+    throttled,
     async (req, reply) => {
       const accountId = req.query.account_id ?? null;
       // Кривой uuid в фильтре — пустой список, а не 500 из Postgres (22P02).
@@ -228,7 +238,7 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
     },
   );
 
-  app.get<{ Params: { id: string } }>('/accounts/:id/limits', async (req, reply) => {
+  app.get<{ Params: { id: string } }>('/accounts/:id/limits', throttled, async (req, reply) => {
     const target = await loadTarget(req.params.id);
     const limits = await findAccountLimits(app.deps.pool, target.id);
     return reply.send({
@@ -248,6 +258,7 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
    */
   app.put<{ Params: { id: string }; Body: { max_sessions_per_day?: unknown } }>(
     '/accounts/:id/limits',
+    throttled,
     async (req, reply) => {
       const target = await loadTarget(req.params.id);
       const maxSessionsPerDay = parseSessionsCap(req.body?.max_sessions_per_day);
@@ -281,7 +292,7 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
    * Баланс кредитов тенанта. ОБЩИЙ на всю витрину (D-1) — UI обязан подписать
    * это прямым текстом, иначе оператор прочитает цифру как баланс клиента.
    */
-  app.get('/core/credits', async (_req, reply) => {
+  app.get('/core/credits', throttled, async (_req, reply) => {
     if (cached === null || Date.now() - cached.fetchedAt.getTime() > CREDITS_CACHE_MS) {
       try {
         cached = { balance: await app.deps.core.getCreditsBalance(), fetchedAt: new Date() };

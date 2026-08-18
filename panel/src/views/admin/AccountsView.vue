@@ -105,8 +105,8 @@ async function saveLimit(): Promise<void> {
   savingLimit.value = true;
   error.value = '';
   try {
-    const res = await PanelApi.request<{ limits: Limits }>(
-      'PUT', `/admin/accounts/${target.id}/limits`, { max_sessions_per_day: limitValue.value },
+    const res = await PanelApi.put<{ limits: Limits }>(
+      `/admin/accounts/${target.id}/limits`, { max_sessions_per_day: limitValue.value },
     );
     notice.value = `${target.email}: суточный кап — ${res.limits.max_sessions_per_day}.`;
     editing.value = null;

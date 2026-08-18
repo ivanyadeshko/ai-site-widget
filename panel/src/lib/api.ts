@@ -59,5 +59,7 @@ export class PanelApi {
   static get<T>(path: string): Promise<T> { return PanelApi.request<T>('GET', path); }
   static post<T>(path: string, body?: unknown): Promise<T> { return PanelApi.request<T>('POST', path, body); }
   static patch<T>(path: string, body?: unknown): Promise<T> { return PanelApi.request<T>('PATCH', path, body); }
+  /** PUT — замена значения целиком (лимиты аккаунта в админке), в отличие от частичного PATCH. */
+  static put<T>(path: string, body?: unknown): Promise<T> { return PanelApi.request<T>('PUT', path, body); }
   static delete<T>(path: string): Promise<T> { return PanelApi.request<T>('DELETE', path); }
 }
