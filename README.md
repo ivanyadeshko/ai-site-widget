@@ -139,17 +139,28 @@ scp infra/compose.core-network.yaml root@<хост>:/opt/site-widget/
 
 # 2. На хосте:
 cd /opt/site-widget
+docker compose version          # нужен >= 2.24: COMPOSE_FILE из .env читают
+                                # только эти версии, на старой строка молча
+                                # проигнорируется и сеть ядра не вернётся
 cp .env .env.bak-$(date +%F)
 grep -q '^COMPOSE_FILE=' .env \
   || echo 'COMPOSE_FILE=compose.yaml:compose.core-network.yaml' >> .env
+
+# 3. Проверка, которая РАБОТАЕТ ДО ДЕПЛОЯ (на старой версии release.sh тоже):
+docker compose config | grep -A3 '^networks:'
+#   ожидается блок `core: … external: true` — это и есть доказательство, что
+#   COMPOSE_FILE подхватился
 docker compose config --quiet && bash infra/deploy/release.sh preflight
 ```
 
-В логе preflight обязана появиться строка `→ сеть ядра '…' на месте`. Если
-вместо неё напечаталось `→ сетевой режим public`, значит `COMPOSE_FILE` не
-подхватился (правили не тот каталог либо строка ушла в комментарий) —
-деплой запускать **нельзя**: `apply` пересоздаст `backend` без сети ядра, и
-все диалоги встанут с `core_unreachable`.
+⚠️ Строка `→ сеть ядра '…' на месте` в логе preflight различает режимы только
+на **новой** версии `release.sh` — до первого деплоя на хосте лежит старая, где
+проверка сети безусловна и печатает эту строку всегда. Поэтому до деплоя
+доверять нужно выводу `docker compose config` (шаг 3), а не строке preflight.
+После деплоя — наоборот: в логе шага preflight обязана быть `→ сеть ядра '…'
+на месте`, а не `→ сетевой режим public`; вторая означает, что `COMPOSE_FILE`
+не подхватился, и `apply` пересоздал `backend` без сети ядра — все диалоги
+встанут с `core_unreachable`.
 
 ## Мультидомен: `app` / `cdn` / apex
 
