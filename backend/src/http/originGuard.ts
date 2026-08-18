@@ -14,7 +14,13 @@ const SAFE_METHODS = new Set(['GET', 'HEAD']);
 
 export function originVerdict(
   widget: Pick<WidgetRow, 'allowed_origins'>,
-  ctx: { origin: string | undefined; publicOrigin: string; method: string },
+  // `appOrigin` — origin, с которого отдаётся сам iframe `/app/:token`, и он
+  // доверен ВСЕГДА: запрос из нашей собственной страницы обязан проходить,
+  // даже если владелец сайта не вписал наш домен в свой `allowed_origins`.
+  // На мультидоменной раскладке это именно APP-хост, а не CDN: с cdn.vell.pro
+  // в API не ходит никто (там только статика), и доверять ему было бы
+  // расширением guard'а впустую.
+  ctx: { origin: string | undefined; appOrigin: string; method: string },
 ): 'allow' | 'deny' {
   // Пустой список = виджет не настроен ни на один сайт → закрыт весь публичный
   // путь. Это ЯВНОЕ отличие от монолита, где пустой список значил «любой».
@@ -30,5 +36,5 @@ export function originVerdict(
 
   const wanted = normalizeOrigin(ctx.origin);
   const allowed = widget.allowed_origins.map(normalizeOrigin);
-  return wanted === normalizeOrigin(ctx.publicOrigin) || allowed.includes(wanted) ? 'allow' : 'deny';
+  return wanted === normalizeOrigin(ctx.appOrigin) || allowed.includes(wanted) ? 'allow' : 'deny';
 }

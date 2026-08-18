@@ -149,3 +149,36 @@ jobs:
           docker build -f site/Dockerfile site/ -t vell-site:ci \
             --build-arg NEXT_PUBLIC_SERVER_URL=https://vell.pro \
             --build-arg NEXT_PUBLIC_APP_URL=https://app.vell.pro
+
+  infra-checks:
+    name: release.sh _selftest + nginx -t (vell.pro.conf)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # Чистые bash-функции разбора .env и проверки merge'а сети ядра
+      # (infra/deploy/release.sh): без docker, без .env. Гейт против регресса
+      # логики, которая при поломке молча пропускает несмёрженный override сети
+      # ядра (→ core_unreachable в проде) или ломает чтение .env.
+      - name: release.sh _selftest
+        run: bash infra/deploy/release.sh _selftest
+
+      # nginx-конфиг vell.pro.conf в этап E не применяется (вход для G3), но
+      # синтаксис его до тех пор ничем не защищён — гейтим `nginx -t` на той же
+      # версии, что стоит на РФ-фронте (1.24; там нет директивы `http2 on`).
+      # Конфиг ссылается на серт по фиксированному пути — генерим самоподписанный
+      # ровно под него, содержимое серта для `nginx -t` роли не играет.
+      - name: nginx -t (vell.pro.conf, nginx 1.24 = версия РФ-фронта)
+        run: |
+          mkdir -p certs
+          openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+            -keyout certs/privkey.pem -out certs/fullchain.pem \
+            -subj "/CN=vell.pro" \
+            -addext "subjectAltName=DNS:vell.pro,DNS:www.vell.pro,DNS:app.vell.pro,DNS:cdn.vell.pro"
+          docker run --rm \
+            -v "$PWD/infra/nginx/vell.pro.conf:/etc/nginx/conf.d/vell.pro.conf:ro" \
+            -v "$PWD/certs:/etc/letsencrypt/live/vell.pro:ro" \
+            nginx:1.24-alpine nginx -t

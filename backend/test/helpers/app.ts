@@ -25,6 +25,7 @@ export async function buildTestApp(overrides: Partial<AppConfig> = {}): Promise<
     coreBaseUrl: core.baseUrl,
     coreTenantKey: 'sk_test_x',
     coreWebhookSecret: 'секрет-длиной-больше-шестнадцати',
+    appOrigin: 'https://widget.aski.pro',
     publicOrigin: 'https://widget.aski.pro',
     cspConnectSrc: "'self'",
     ipHashSalt: 'соль',

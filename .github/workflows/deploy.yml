@@ -261,6 +261,13 @@ jobs:
         run: |
           ssh -F "$SSHF" target "mkdir -p ${DEPLOY_PATH}/infra/deploy ${DEPLOY_PATH}/scripts"
           scp -F "$SSHF" infra/compose.yaml       "target:${DEPLOY_PATH}/compose.yaml"
+          # Override сетевого режима `attached` едет ВСЕГДА, на любой стенд.
+          # Сам по себе он ничего не включает: compose подхватит файл, только
+          # если стенд перечислил его в COMPOSE_FILE своего .env. Зато стенд,
+          # который эту строку уже прописал, никогда не окажется в состоянии
+          # «COMPOSE_FILE ссылается на файл, которого на хосте нет» — а это
+          # падение КАЖДОЙ команды compose, включая preflight и rollback.
+          scp -F "$SSHF" infra/compose.core-network.yaml "target:${DEPLOY_PATH}/compose.core-network.yaml"
           scp -F "$SSHF" infra/deploy/release.sh  "target:${DEPLOY_PATH}/infra/deploy/release.sh"
           scp -F "$SSHF" scripts/widget_smoke.py  "target:${DEPLOY_PATH}/scripts/widget_smoke.py"
           ssh -F "$SSHF" target "chmod +x ${DEPLOY_PATH}/infra/deploy/release.sh"

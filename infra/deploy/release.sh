@@ -5,7 +5,8 @@
 # Заменяет infra/deploy.sh (rsync исходников + сборка на месте). Интерфейс
 # подкоманд общий для трёх репозиториев программы распила:
 #
-#   preflight            — диск/иноды, .env, сеть ядра, compose config, образ
+#   preflight            — диск/иноды, .env, сеть ядра (только в режиме
+#                          attached), TRUST_PROXY, compose config, образ
 #   backup               — pg_dump -Fc + верификация pg_restore + ретенция
 #   apply                — пин тега → pull → up --no-build → миграции → health
 #   health               — /healthz BFF
@@ -28,9 +29,12 @@
 #   4. Откат одной командой вместо «собери предыдущий коммит заново».
 #
 # Специфика виджета:
-#   • BFF присоединён к ВНЕШНЕЙ сети ядра (conversation-core_default). Её
-#     отсутствие — не «предупреждение», а гарантированный отказ `up`, поэтому
-#     preflight проверяет сеть до того, как тронуть стенд.
+#   • Сетевой режим стенда задаётся COMPOSE_FILE в .env. В режиме `attached`
+#     (стенд рядом с ядром) в COMPOSE_FILE перечислен compose.core-network.yaml,
+#     BFF входит во ВНЕШНЮЮ сеть ядра, и её отсутствие — не «предупреждение», а
+#     гарантированный отказ `up`: preflight проверяет сеть до того, как тронуть
+#     стенд. В режиме `public` (прод витрины, ядро за HTTPS) сети нет вовсе, и
+#     проверка пропускается — иначе прод было бы не задеплоить в принципе.
 #   • Миграции — node-pg-migrate через exec в backend, после `up`.
 #
 #   • Лендинг (профиль `site`, образ vell-site) — второй сервис того же
@@ -62,11 +66,57 @@ cd "$REPO_DIR"
 die() { printf '❌ %b\n' "$*" >&2; exit 1; }
 info() { printf '→ %b\n' "$*"; }
 
-# Значение ключа из .env. Кавычки снимаются, `|| true` обязателен: иначе
-# отсутствие .env роняет скрипт молча через pipefail.
+# Нормализация значения из .env (stdin → stdout). Вынесено отдельной функцией,
+# чтобы `release.sh _selftest` мог прогнать её на строках-фикстурах.
+#
+# Правила совпадают с парсером самого compose (находка кросс-ревью):
+#   • квотированное значение — берётся содержимое кавычек, всё после закрывающей
+#     кавычки отбрасывается, `#` внутри НЕ трогается (там он часть значения);
+#   • неквотированное — срезается инлайн-комментарий, но `#` считается началом
+#     комментария ТОЛЬКО когда перед ним есть пробел (уточнение кросс-ревью:
+#     `ORIGIN=https://host#frag` — это значение целиком, а не `https://host`),
+#     плюс срезаются хвостовые пробелы.
+# Без этого `TRUST_PROXY=1  # за nginx` читалось как `1  # за nginx`, гард
+# TRUST_PROXY отказывал деплою на КОРРЕКТНОМ .env, а
+# `COMPOSE_FILE=…:compose.core-network.yaml # attached` определялся как режим
+# `public` — проверка сети ядра пропускалась, а compose файл всё равно
+# подхватывал, и `up` падал уже после подмены тега.
+_strip_env_value() {
+    # Порядок ветвления значим: квотированное значение уходит по `b` СРАЗУ
+    # после снятия кавычек — иначе `#` внутри кавычек срезался бы следующим
+    # выражением. `[[:space:]][[:space:]]*#` = «пробел(ы), затем #»: без
+    # ведущего пробела `#` — часть значения.
+    sed -e '/^"/{ s|^"\([^"]*\)".*$|\1|; b; }' \
+        -e "/^'/{ s|^'\([^']*\)'.*\$|\1|; b; }" \
+        -e 's|[[:space:]][[:space:]]*#.*$||' -e 's|[[:space:]]*$||'
+}
+
+# Значение ключа из .env. `|| true` обязателен: иначе отсутствие .env роняет
+# скрипт молча через pipefail.
 env_get() {
-    { sed -n "s|^$1=||p" .env 2>/dev/null | tail -1 \
-        | sed -e 's|^"\(.*\)"$|\1|' -e "s|^'\(.*\)'$|\1|"; } || true
+    { sed -n "s|^$1=||p" .env 2>/dev/null | tail -1 | _strip_env_value; } || true
+}
+
+# По ВЫВОДУ `docker compose config` (stdin, yaml) — подключён ли backend к сети
+# ядра `core` в СМЕРЖЕННОМ графе. Это и есть проверка, что override реально
+# слился, а не просто «файл существует» и «сеть существует»: без merge у backend
+# в networks остаётся только `default`. Раньше жила ручной инструкцией в README
+# (находка кросс-ревью — сделать автоматической).
+#
+# Разбор yaml awk'ом, а не jq: jq на дев-хосте не гарантирован, а структура
+# вывода compose стабильна (2 пробела — сервис, 4 — его ключи, 6 — записи сети).
+backend_in_core_network() {
+    awk '
+        # Заголовок сервиса — ключ на 2 пробелах: "  backend:", "  widget-db:".
+        # Запись сети верхнего уровня "  core:" сюда же попадёт и просто сбросит
+        # in_backend (она != backend) — ложного срабатывания не даёт.
+        /^  [^[:space:]].*:[[:space:]]*$/ { in_backend = ($0 ~ /^  backend:[[:space:]]*$/); in_nets = 0 }
+        in_backend && /^    networks:[[:space:]]*$/ { in_nets = 1; next }
+        # Следующий ключ 4-го уровня закрывает networks-блок сервиса backend.
+        in_backend && in_nets && /^    [^[:space:]]/ { in_nets = 0 }
+        in_backend && in_nets && /^      core:/ { found = 1 }
+        END { exit(found ? 0 : 1) }
+    '
 }
 
 # Сервисы, обязанные присутствовать в выдаче `docker compose ps`. Нужны
@@ -238,6 +288,72 @@ site_profile_enabled() {
 
 site_health_url() { printf '%s' "${SITE_HEALTH_URL:-http://127.0.0.1:3000/api/health}"; }
 
+# Стенд стоит РЯДОМ с ядром и входит в его docker-сеть? Правда одна —
+# COMPOSE_FILE в .env: сеть возвращает в граф compose только override-файл
+# compose.core-network.yaml, перечисленный там. Разбираем как список путей
+# через `:` (разделитель самого compose), а не `grep`: подстрока совпала бы с
+# закомментированной строкой или с чужим файлом вроде
+# `compose.core-network.yaml.bak`, и стенд в режиме `public` получил бы
+# требование несуществующей сети — то есть отказ деплоя на ровном месте.
+#
+# Найденный путь ПЕЧАТАЕТСЯ в stdout (а не кладётся в глобальную переменную —
+# скрытый out-параметр молча терялся бы при вызове в подшелле): preflight
+# проверяет наличие ИМЕННО ТОГО файла, на который ссылается .env — он может
+# лежать и в подкаталоге, — а не угаданного по имени в корне.
+#
+# Режим читается ТОЛЬКО из .env. Экспортированный в окружении COMPOSE_FILE
+# compose бы уважил, а мы нет — но деплой таких переменных не ставит
+# (.github/workflows/deploy.yml передаёт по ssh только IMAGE_TAG).
+core_network_override_path() {
+    local files item
+    files="$(env_get COMPOSE_FILE)"
+    [ -n "$files" ] || return 1
+    local IFS=':'
+    for item in $files; do
+        item="$(printf '%s' "$item" | tr -d '[:space:]')"
+        if [ "$(basename "$item")" = "compose.core-network.yaml" ]; then
+            printf '%s' "$item"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Гард TRUST_PROXY (гэп 9 разведки). За реверс-прокси req.ip у Fastify — это
+# адрес ПРОКСИ, один и тот же для всех посетителей, пока TRUST_PROXY=1 не
+# разрешит верить X-Forwarded-For (backend/src/config.ts, app.ts). Последствие
+# не косметическое: суточный IP-кап (MAX_DIALOGS_PER_IP_PER_DAY) схлопывает
+# всех клиентов в ОДИН бакет и начинает валить живых посетителей 429 после
+# первых же шестидесяти диалогов на весь сайт.
+#
+# Почему `die`, а не warning: диагностический warn в приложении уже есть
+# (backend/src/routes/publicApi.ts, разовый лог «X-Forwarded-For пришёл, но
+# TRUST_PROXY выключен»), и он ровно эту ситуацию замечает — но только в
+# логах, которые в момент инцидента никто не читает.
+#
+# Признак «мы за прокси» — https в origin'ах: TLS у BFF не терминируется
+# никогда (он слушает голый :8200), значит https в публичном адресе означает
+# ровно одно — впереди стоит прокси.
+# Смотрим на ВСЕ четыре origin-переменные, а не только на app/public: смешанная
+# раскладка (http app + https panel) — это всё равно «где-то впереди стоит
+# прокси», и IP-кап ломается там одинаково (находка кросс-ревью).
+check_trust_proxy() {
+    local trust key value https_origin=""
+    trust="$(env_get TRUST_PROXY)"
+    for key in WIDGET_APP_ORIGIN WIDGET_PUBLIC_ORIGIN WIDGET_PANEL_ORIGIN WIDGET_CDN_ORIGIN; do
+        value="$(env_get "$key")"
+        case "$value" in
+            https://*) https_origin="$key=$value"; break ;;
+        esac
+    done
+    if [ -n "$https_origin" ]; then
+        [ "$trust" = "1" ] || die "$https_origin — https, а TRUST_PROXY='${trust:-не задан}': за реверс-прокси без TRUST_PROXY=1 IP-кап схлопнет всех клиентов в один бакет и начнёт валить живых посетителей 429.\n   Починка: TRUST_PROXY=1 в .env стенда — и убедиться, что прокси действительно ставит X-Forwarded-For (иначе кап станет обходиться заголовком)."
+        info "TRUST_PROXY=1 при https-раскладке ($https_origin) — IP-кап считает по X-Forwarded-For"
+    else
+        info "https-origin в .env нет — стенд слушает напрямую, доверие прокси не требуется"
+    fi
+}
+
 # ── preflight ─────────────────────────────────────────────────────────
 
 cmd_preflight() {
@@ -256,15 +372,49 @@ cmd_preflight() {
     fi
     info "диск ${use_pct}%, иноды ${inode_pct:-н/д}%"
 
-    # Внешняя сеть ядра. Её отсутствие роняет `up` — но уже ПОСЛЕ того, как
+    # Внешняя сеть ядра — ТОЛЬКО в режиме `attached`. Признак режима один:
+    # override-файл compose.core-network.yaml в COMPOSE_FILE из .env стенда
+    # (он же единственное, что возвращает сеть в граф compose). В режиме
+    # `public` (прод витрины, ядро за HTTPS) сети нет и быть не должно —
+    # безусловная проверка здесь делала деплой прода невозможным.
+    #
+    # Её отсутствие в режиме `attached` роняет `up` — но уже ПОСЛЕ того, как
     # мы подменили тег в .env, то есть в состоянии «наполовину задеплоено».
-    local net
-    net="$(env_get CORE_NETWORK)"; net="${net:-conversation-core_default}"
-    docker network inspect "$net" >/dev/null 2>&1 \
-        || die "внешняя сеть '$net' не существует — стек ядра не поднят? BFF без неё не стартует"
-    info "сеть ядра '$net' на месте"
+    local override override_path net attached=""
+    if override="$(core_network_override_path)"; then
+        attached=1
+        net="$(env_get CORE_NETWORK)"; net="${net:-conversation-core_default}"
+        docker network inspect "$net" >/dev/null 2>&1 \
+            || die "внешняя сеть '$net' не существует — стек ядра не поднят? BFF без неё не стартует"
+        info "сеть ядра '$net' на месте"
+        # Путь берём ровно тот, что стоит в COMPOSE_FILE: относительный
+        # разрешается от каталога стека (compose делает так же), абсолютный —
+        # как есть.
+        override_path="$override"
+        case "$override_path" in /*) ;; *) override_path="$REPO_DIR/$override_path" ;; esac
+        [ -f "$override_path" ] \
+            || die "COMPOSE_FILE ссылается на '$override', но файла нет ($override_path) — compose упадёт «no such file» на КАЖДОЙ команде, включая rollback; файл кладёт шаг «Sync deploy assets» деплоя"
+    else
+        info "сетевой режим public — внешняя сеть ядра не требуется"
+    fi
+
+    check_trust_proxy
 
     docker compose config --quiet || die "compose.yaml невалиден или в .env не хватает обязательных переменных"
+
+    # РЕАЛЬНАЯ проверка merge'а (находка кросс-ревью). Три предыдущих проверки
+    # attached-режима — «файл есть», «docker-сеть есть», «config валиден» — все
+    # дают зелёное И БЕЗ смёрженного override: `docker compose config --quiet`
+    # возвращает 0 что с ним, что без него. Значит стенд с версией compose,
+    # которая НЕ читает COMPOSE_FILE из .env, или со сбитым порядком файлов,
+    # прошёл бы preflight с обманчивым «сеть ядра на месте», а `apply` поднял бы
+    # backend без сети ядра → core_unreachable на КАЖДОМ диалоге. Поэтому
+    # спрашиваем сам смёрженный граф: подключён ли backend к сети ядра.
+    if [ -n "$attached" ]; then
+        docker compose config 2>/dev/null | backend_in_core_network \
+            || die "override compose.core-network.yaml НЕ смержился: в графе compose backend подключён только к 'default', не к сети ядра.\n   Обычно причина — версия docker compose, которая не читает COMPOSE_FILE из .env, либо сбитый порядок файлов в COMPOSE_FILE.\n   apply в таком состоянии поднимет backend без сети ядра → все диалоги встанут с core_unreachable.\n   Проверить руками: docker compose config | sed -n '/^  backend:/,/^  [a-z]/p' | grep -A3 networks"
+        info "backend в смёрженном графе подключён к сети ядра — override реально слился"
+    fi
 
     if [ -n "${IMAGE_TAG:-}" ]; then
         local owner
@@ -579,9 +729,68 @@ cmd_commit() {
     info "деплой зафиксирован: $tag"
 }
 
+# ── самопроверка чистых функций (без docker, без сети) ────────────────
+# Гоняется в CI (.github/workflows/ci.yml) и руками: `release.sh _selftest`.
+# Проверяет ровно ту механику, что при ошибке пропускает несмёрженный override
+# или ломает разбор .env — то есть логику, стоившую двух заходов кросс-ревью.
+cmd_selftest() {
+    local fails=0
+    check() { # $1 ожидание, $2 факт, $3 имя
+        if [ "$1" = "$2" ]; then printf '  ok  %s\n' "$3"
+        else printf '  FAIL %s\n     ожидалось [%s], получено [%s]\n' "$3" "$1" "$2"; fails=$((fails + 1)); fi
+    }
+
+    echo "─ _strip_env_value (разбор значения .env)"
+    check '1'                                   "$(printf '1   # за nginx'                | _strip_env_value)" 'инлайн-комментарий после пробелов срезан'
+    check '1'                                   "$(printf '1'                             | _strip_env_value)" 'голое значение не тронуто'
+    check 'https://app.vell.pro#frag'           "$(printf 'https://app.vell.pro#frag'     | _strip_env_value)" '# без пробела перед ним — часть значения'
+    check 'value'                               "$(printf 'value # c'                     | _strip_env_value)" 'значение с комментарием'
+    check 'compose.yaml:compose.core-network.yaml' \
+                                                "$(printf 'compose.yaml:compose.core-network.yaml # attached' | _strip_env_value)" 'COMPOSE_FILE с комментарием'
+    check "'self' wss://x # y"                  "$(printf '"%s"' "'self' wss://x # y"      | _strip_env_value)" '# внутри кавычек не срезан'
+    check ''                                    "$(printf ' # только комментарий'          | _strip_env_value)" 'значение-комментарий → пусто'
+
+    echo "─ backend_in_core_network (merge override сети ядра)"
+    local attached public
+    attached='services:
+  backend:
+    image: x
+    networks:
+      core: null
+      default: null
+    ports:
+      - 8200
+  widget-db:
+    image: y
+networks:
+  core:
+    external: true
+  default:
+    name: site-widget_default'
+    public='services:
+  backend:
+    image: x
+    networks:
+      default: null
+    ports:
+      - 8200
+  widget-db:
+    image: y
+networks:
+  default:
+    name: site-widget_default'
+    if printf '%s\n' "$attached" | backend_in_core_network; then printf '  ok  attached-граф: backend в сети ядра\n'; else printf '  FAIL attached-граф не распознан\n'; fails=$((fails + 1)); fi
+    if printf '%s\n' "$public"   | backend_in_core_network; then printf '  FAIL public-граф ошибочно принят за attached\n'; fails=$((fails + 1)); else printf '  ok  public-граф: backend НЕ в сети ядра\n'; fi
+
+    echo
+    [ "$fails" -eq 0 ] || die "_selftest: провалов — $fails"
+    echo "✅ _selftest пройден"
+}
+
 # ── диспетчер ─────────────────────────────────────────────────────────
 
 case "${1:-}" in
+    _selftest) cmd_selftest ;;
     preflight) cmd_preflight ;;
     backup)    cmd_backup ;;
     apply)     cmd_apply ;;

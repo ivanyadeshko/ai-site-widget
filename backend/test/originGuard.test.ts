@@ -9,7 +9,7 @@ const check = (
   origins: string[],
   origin: string | undefined,
   method: string,
-): 'allow' | 'deny' => originVerdict(widget(origins), { origin, publicOrigin: OURS, method });
+): 'allow' | 'deny' => originVerdict(widget(origins), { origin, appOrigin: OURS, method });
 
 describe('originVerdict', () => {
   it('свой сайт разрешён', () => {

@@ -30,7 +30,8 @@ beforeAll(async () => {
   app = await buildApp({
     config: {
       port: 8200, databaseUrl: process.env.DATABASE_URL!, coreBaseUrl: core.baseUrl,
-      coreTenantKey: 'sk_test_x', coreWebhookSecret: SECRET, publicOrigin: 'http://localhost:8200',
+      coreTenantKey: 'sk_test_x', coreWebhookSecret: SECRET,
+      appOrigin: 'http://localhost:8200', publicOrigin: 'http://localhost:8200',
       cspConnectSrc: "'self'", ipHashSalt: 'соль', maxDialogsPerVisitorPerDay: 10,
       maxDialogsPerIpPerDay: 30, maxDurationS: 600, trustProxy: false, logLevel: 'silent',
       maxSessionsPerAccountPerDay: 300,
