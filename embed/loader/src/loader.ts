@@ -1,8 +1,25 @@
 export type LoaderBoot = { token: string; base: string };
 
+/**
+ * Оформление из `/config`. Поля приходят ЗАПОЛНЕННЫМИ: дефолты добил и всё
+ * провалидировал бэкенд (`backend/src/widgets/theme.ts`, `themeForConfig`).
+ * Здесь нет ни валидации, ни своих дефолтов — и то и другое стоило бы байт из
+ * бюджета 8 КБ gzip и ничего не добавило бы: данные приходят из своей же БД (D-9).
+ *
+ * Поле необязательное ровно по одной причине — откат образа бэкенда при уже
+ * раскатанном на CDN бандле. Тогда `theme` не придёт вовсе, и лоадер обязан
+ * нарисовать РОВНО то, что рисовал до темизации: за это отвечают `||` ниже.
+ * Это не новые дефолты, а сохранение прежнего поведения.
+ */
+type LoaderTheme = {
+  color?: string; position?: string; button_label?: string;
+  title?: string; launcher_title?: string;
+};
+
 type LoaderConfig = {
   widget_id: string; name: string; enabled: boolean;
   allowed_origins: string[]; app_url: string; text_max_length: number;
+  theme?: LoaderTheme;
 };
 
 const MSG_FROM_FRAME = 'aski-widget';
@@ -55,15 +72,21 @@ export async function boot(input: LoaderBoot): Promise<void> {
 
   const appOrigin = new URL(config.app_url).origin;
 
+  const theme = config.theme ?? {};
+  // Одна подстановка на обе привязки: две конкурирующие (right И left) растянули
+  // бы кнопку на всю ширину вместо переезда к краю.
+  const side = theme.position === 'left' ? 'left' : 'right';
+  const launcherTitle = theme.launcher_title || `Открыть чат: ${config.name}`;
+
   onBodyReady(() => {
     const host = document.createElement('aski-site-widget');
     const root = host.attachShadow({ mode: 'open' });
     const style = document.createElement('style');
     style.textContent = `
       :host{all:initial}
-      .btn{position:fixed;right:20px;bottom:20px;z-index:2147483000;width:56px;height:56px;
-           border:none;border-radius:50%;background:#2563eb;color:#fff;font:600 22px/1 system-ui;cursor:pointer}
-      .frame{position:fixed;right:20px;bottom:20px;z-index:2147483001;width:380px;
+      .btn{position:fixed;${side}:20px;bottom:20px;z-index:2147483000;width:56px;height:56px;
+           border:none;border-radius:50%;background:${theme.color || '#2563eb'};color:#fff;font:600 22px/1 system-ui;cursor:pointer}
+      .frame{position:fixed;${side}:20px;bottom:20px;z-index:2147483001;width:380px;
              height:min(640px,calc(100vh - 40px));border:none;border-radius:18px;display:none;
              background:#fff;color-scheme:light;box-shadow:0 12px 48px rgba(0,0,0,.24)}
       @media (max-width:767px){.frame{inset:0;width:100%;height:100dvh;border-radius:0}}
@@ -71,8 +94,12 @@ export async function boot(input: LoaderBoot): Promise<void> {
     const button = document.createElement('button');
     button.className = 'btn';
     button.type = 'button';
-    button.setAttribute('aria-label', `Открыть чат: ${config.name}`);
-    button.textContent = '💬';
+    // Значения уходят в setAttribute/textContent — это DOM-текст, не HTML:
+    // разметку ими не собрать даже без валидации. Валидация всё равно есть, но
+    // на бэкенде (backend/src/widgets/theme.ts), где ей и место.
+    button.setAttribute('aria-label', launcherTitle);
+    button.setAttribute('title', launcherTitle);
+    button.textContent = theme.button_label || '💬';
     root.append(style, button);
     document.body.appendChild(host);
 
@@ -123,7 +150,12 @@ export async function boot(input: LoaderBoot): Promise<void> {
 
       if (data.type === 'ready') {
         frameReady = true;
-        post({ type: 'init', visitorKey, dialogId: lsGet(dialogKeyName), parentOrigin: location.origin });
+        // Тему iframe получает ОТСЮДА, а не своим запросом: `/config` уже
+        // загружен хостом, и лишний сетевой вызов внутри панели не нужен (D-8).
+        post({
+          type: 'init', visitorKey, dialogId: lsGet(dialogKeyName),
+          parentOrigin: location.origin, theme: config.theme,
+        });
         // Флашим накопленное: iframe грузится секунды, «open» иначе теряется.
         for (const message of pending.splice(0)) frame.contentWindow?.postMessage(message, appOrigin);
       } else if (data.type === 'state') {

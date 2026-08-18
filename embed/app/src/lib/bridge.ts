@@ -26,6 +26,17 @@ function normalizeOrigin(raw: string): string {
   }
 }
 
+/**
+ * Оформление, приехавшее в `init` от хоста. Хост взял его из `/config`, то есть
+ * с НАШЕГО же бэкенда, где оно и провалидировано
+ * (`backend/src/widgets/theme.ts`) — второй сетевой вызов из iframe за той же
+ * темой не нужен (D-8). Поле необязательное: старый бэкенд темы не отдаёт.
+ */
+export type BridgeTheme = {
+  color?: string; position?: string; button_label?: string;
+  title?: string; launcher_title?: string;
+};
+
 export type Bridge = {
   ready(): void;
   listen(): void;
@@ -36,7 +47,7 @@ export type Bridge = {
 
 export function createBridge(opts: {
   allowedOrigins: string[];
-  onInit: (p: { visitorKey: string; dialogId: string | null }) => void;
+  onInit: (p: { visitorKey: string; dialogId: string | null; theme?: BridgeTheme }) => void;
   onVisibility: (visible: boolean) => void;
 }): Bridge {
   // Список изменяемый: App создаёт мост ДО ответа /config, а разрешённые
@@ -53,7 +64,7 @@ export function createBridge(opts: {
     if (event.source !== window.parent) return;
     const data = event.data as {
       src?: unknown; type?: unknown; visitorKey?: unknown; dialogId?: unknown;
-      parentOrigin?: unknown; visible?: unknown;
+      parentOrigin?: unknown; visible?: unknown; theme?: unknown;
     };
     // (2) маркер конверта хоста.
     if (data?.src !== MSG_TO_FRAME) return;
@@ -67,7 +78,14 @@ export function createBridge(opts: {
       if (typeof data.visitorKey !== 'string') return;
       hostOrigin = origin; // все дальнейшие posts — строго сюда, никогда на '*'.
       const dialogId = typeof data.dialogId === 'string' && data.dialogId !== '' ? data.dialogId : null;
-      opts.onInit({ visitorKey: data.visitorKey, dialogId });
+      // Тему пропускаем как есть, проверяя ровно одно — что это объект, а не
+      // массив/строка (иначе `theme.title` дал бы мусор в разметке). Значения
+      // уже провалидированы бэкендом, и повторять его работу здесь незачем: до
+      // этой строки конверт прошёл тройную проверку источника выше.
+      const theme = typeof data.theme === 'object' && data.theme !== null && !Array.isArray(data.theme)
+        ? (data.theme as BridgeTheme)
+        : undefined;
+      opts.onInit({ visitorKey: data.visitorKey, dialogId, ...(theme === undefined ? {} : { theme }) });
       return;
     }
     if (data.type === 'visibility') {

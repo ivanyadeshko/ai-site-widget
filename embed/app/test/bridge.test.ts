@@ -18,6 +18,33 @@ describe('мост iframe↔хост', () => {
     expect(onInit).toHaveBeenCalledWith({ visitorKey: 'v1', dialogId: null });
   });
 
+  it('тема из init доезжает объектом, мусор вместо неё отбрасывается', () => {
+    const onInit = vi.fn();
+    const bridge = createBridge({ allowedOrigins: ['https://shop.example'], onInit, onVisibility: vi.fn() });
+    bridge.listen();
+    const init = (theme: unknown): void => {
+      window.dispatchEvent(new MessageEvent('message', {
+        data: {
+          src: 'aski-widget-host', type: 'init', visitorKey: 'v1', dialogId: null,
+          parentOrigin: 'https://shop.example', theme,
+        },
+        origin: 'https://shop.example', source: window.parent,
+      }));
+    };
+
+    init({ color: '#ff0000', title: 'Магазин' });
+    expect(onInit).toHaveBeenLastCalledWith({
+      visitorKey: 'v1', dialogId: null, theme: { color: '#ff0000', title: 'Магазин' },
+    });
+
+    // Строка/массив/число в разметке дали бы мусор вместо заголовка: панель
+    // обязана остаться просто без темы.
+    for (const junk of ['#ff0000', ['#ff0000'], 42]) {
+      init(junk);
+      expect(onInit).toHaveBeenLastCalledWith({ visitorKey: 'v1', dialogId: null });
+    }
+  });
+
   it('после init отправка идёт строго на подтверждённый origin, никогда на *', () => {
     const post = vi.fn();
     vi.stubGlobal('parent', { postMessage: post } as unknown as Window);
