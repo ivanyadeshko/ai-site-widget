@@ -245,6 +245,86 @@ describe('панельный CRUD виджетов', () => {
     expect(res.json().enabled).toBe(true);
   });
 
+  it('ротация меняет токен: старый перестаёт работать, новый работает', async () => {
+    const cookie = await owner('rotate@example.com');
+    const before = (await createWidget(cookie)).json().widget;
+
+    const res = await app.inject({
+      method: 'POST', url: `/api/v1/widgets/${before.id}/rotate-token`,
+      headers: { origin: ORIGIN, cookie },
+    });
+    expect(res.statusCode).toBe(200);
+
+    const after = res.json().widget;
+    expect(after.publish_token).toMatch(/^wgt_[0-9a-f]{32}$/);
+    expect(after.publish_token).not.toBe(before.publish_token);
+    expect(after.id).toBe(before.id);
+
+    const old = await app.inject({
+      method: 'GET', url: `/w/v1/${before.publish_token}/config`, headers: { origin: 'https://shop.example' },
+    });
+    expect(old.statusCode).toBe(404);
+    expect(old.json().error.code).toBe('widget_not_found');
+
+    const fresh = await app.inject({
+      method: 'GET', url: `/w/v1/${after.publish_token}/config`, headers: { origin: 'https://shop.example' },
+    });
+    expect(fresh.statusCode).toBe(200);
+    expect(fresh.json().widget_id).toBe(before.id);
+  });
+
+  it('ротация НЕ теряет диалоги: привязка идёт по widget_id, а не по токену', async () => {
+    const cookie = await owner('rotate-history@example.com');
+    const widget = (await createWidget(cookie)).json().widget;
+    const { rows } = await pool.query<{ id: string }>(
+      `INSERT INTO dialogs (widget_id, visitor_key, client_reference)
+       VALUES ($1, gen_random_uuid(), $2) RETURNING id`,
+      [widget.id, `ref-rotate-${widget.id}`],
+    );
+    const dialogId = rows[0]!.id;
+
+    const res = await app.inject({
+      method: 'POST', url: `/api/v1/widgets/${widget.id}/rotate-token`,
+      headers: { origin: ORIGIN, cookie },
+    });
+    expect(res.statusCode).toBe(200);
+
+    const kept = await pool.query<{ widget_id: string }>(
+      'SELECT widget_id FROM dialogs WHERE id = $1', [dialogId],
+    );
+    expect(kept.rowCount).toBe(1);
+    expect(kept.rows[0]!.widget_id).toBe(widget.id);
+  });
+
+  it('ротация чужого виджета — 404 и токен соседа не меняется', async () => {
+    const alice = await owner('rot-alice@example.com');
+    const bob = await owner('rot-bob@example.com');
+    const widget = (await createWidget(alice)).json().widget;
+
+    const res = await app.inject({
+      method: 'POST', url: `/api/v1/widgets/${widget.id}/rotate-token`,
+      headers: { origin: ORIGIN, cookie: bob },
+    });
+    expect(res.statusCode).toBe(404);
+    expect(res.json().error.code).toBe('widget_not_found');
+
+    const mine = await app.inject({ method: 'GET', url: `/api/v1/widgets/${widget.id}`, headers: { cookie: alice } });
+    expect(mine.json().widget.publish_token).toBe(widget.publish_token);
+  });
+
+  it('ротация ограничена по частоте: шестая подряд — 429', async () => {
+    const cookie = await owner('rotate-limit@example.com');
+    const widget = (await createWidget(cookie)).json().widget;
+    const rotate = () => app.inject({
+      method: 'POST', url: `/api/v1/widgets/${widget.id}/rotate-token`,
+      headers: { origin: ORIGIN, cookie },
+    });
+    for (let i = 0; i < 5; i += 1) expect((await rotate()).statusCode).toBe(200);
+    const sixth = await rotate();
+    expect(sixth.statusCode).toBe(429);
+    expect(sixth.json().error.code).toBe('rate_limited');
+  });
+
   it('несуществующий и синтаксически кривой id дают 404, а не 500', async () => {
     const cookie = await owner('badid@example.com');
     const ghost = await app.inject({

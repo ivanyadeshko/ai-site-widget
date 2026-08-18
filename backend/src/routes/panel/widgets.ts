@@ -2,7 +2,7 @@ import type { FastifyPluginAsync } from 'fastify';
 import { requireAccount } from '../../auth/guards.ts';
 import {
   countWidgetsByAccount, deleteWidget, findWidgetByIdForAccount, insertWidget,
-  listWidgetsByAccount, updateWidget,
+  listWidgetsByAccount, rotatePublishToken, updateWidget,
   type WidgetPatch, type WidgetRow,
 } from '../../db/repositories/widgets.ts';
 import { ApiError } from '../../http/errors.ts';
@@ -134,6 +134,40 @@ export const widgetRoutes: FastifyPluginAsync = async (app) => {
     if (!updated) throw notFound();
     return reply.send({ widget: toPublic(updated, app.deps.config.publicOrigin) });
   });
+
+  /**
+   * Перевыпуск публичного токена — кнопка «после ухода подрядчика».
+   *
+   * Токен не секрет (он в HTML чужого сайта), но владелец обязан иметь способ
+   * оборвать все уже раздатые копии сниппета. Цена операции — СТАРЫЙ сниппет
+   * на сайте немедленно перестаёт работать (404 на /w/v1/:token/config),
+   * поэтому панель обязана предупреждать об этом до нажатия.
+   *
+   * История НЕ теряется: диалоги и лиды привязаны к widget_id, а не к токену.
+   *
+   * Лимит — 5/час на IP (штатный keyGenerator из app.ts): гард requireAccount
+   * работает на preHandler, то есть ПОЗЖЕ onRequest-хука лимитера, и ключом
+   * по аккаунту здесь воспользоваться нельзя. Для легитимного владельца пять
+   * ротаций в час — заведомо больше, чем нужно.
+   */
+  app.post<{ Params: { id: string } }>(
+    '/widgets/:id/rotate-token',
+    { config: { rateLimit: { max: 5, timeWindow: '1 hour' } } },
+    async (req, reply) => {
+      const accountId = req.account!.id;
+      await load(req.params.id, accountId);
+      let widget: WidgetRow | null = null;
+      for (let attempt = 0; attempt < 2 && widget === null; attempt += 1) {
+        try {
+          widget = await rotatePublishToken(app.deps.pool, req.params.id, accountId, generatePublishToken());
+        } catch (err) {
+          if ((err as { code?: unknown }).code !== '23505' || attempt === 1) throw err;
+        }
+      }
+      if (!widget) throw notFound();
+      return reply.send({ widget: toPublic(widget, app.deps.config.publicOrigin) });
+    },
+  );
 
   app.delete<{ Params: { id: string } }>('/widgets/:id', async (req, reply) => {
     if (!UUID_RE.test(req.params.id)) throw notFound();

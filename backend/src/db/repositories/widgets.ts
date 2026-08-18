@@ -121,6 +121,16 @@ export async function deleteWidget(db: Queryable, id: string, accountId: string)
   return (rowCount ?? 0) > 0;
 }
 
+export async function rotatePublishToken(
+  db: Queryable, id: string, accountId: string, token: string,
+): Promise<WidgetRow | null> {
+  const { rows } = await db.query<WidgetRow>(
+    `UPDATE widgets SET publish_token = $3 WHERE id = $1 AND account_id = $2 RETURNING ${COLS}`,
+    [id, accountId, token],
+  );
+  return rows[0] ?? null;
+}
+
 export async function countWidgetsByAccount(db: Queryable, accountId: string): Promise<number> {
   const { rows } = await db.query<{ count: string }>(
     'SELECT count(*)::text AS count FROM widgets WHERE account_id = $1', [accountId],
