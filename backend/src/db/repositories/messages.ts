@@ -47,6 +47,31 @@ export async function listThreadTail(db: Queryable, dialogId: string, limit: num
   return rows;
 }
 
+/**
+ * Страница ленты ВПЕРЁД, от начала разговора — чтение кабинета.
+ *
+ * Зачем отдельно от `listThreadTail`: посетителю нужен ХВОСТ (он вернулся в
+ * виджет и продолжает разговор), а владелец в кабинете читает диалог С НАЧАЛА и
+ * листает вниз. Отдать ему хвост означало бы открыть чужой разговор с середины
+ * фразы, а «перевернуть» хвост на клиенте нельзя — страница уже не та.
+ *
+ * Курсор — `id` (BIGSERIAL, монотонный в пределах нити), поэтому пары
+ * (время, id) здесь не нужно: порядок вставки и есть порядок разговора.
+ */
+export async function listThreadPage(
+  db: Queryable, dialogId: string, input: { limit: number; afterId: string | null },
+): Promise<MessageRow[]> {
+  const { rows } = await db.query<MessageRow>(
+    `SELECT id::text, dialog_id, role, text, source, core_session_id, seq, created_at
+       FROM dialog_messages
+      WHERE dialog_id = $1 AND ($2::bigint IS NULL OR id > $2::bigint)
+      ORDER BY id ASC
+      LIMIT $3`,
+    [dialogId, input.afterId, input.limit],
+  );
+  return rows;
+}
+
 /** Максимальный seq клиентского журнала — с него продолжится нумерация после reload. */
 export async function maxClientSeq(db: Queryable, dialogId: string): Promise<number> {
   const { rows } = await db.query<{ seq: number | null }>(
