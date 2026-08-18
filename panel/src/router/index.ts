@@ -3,6 +3,8 @@ import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
 import PanelLayout from '../layouts/PanelLayout.vue';
 import LoginView from '../views/LoginView.vue';
 import RegisterView from '../views/RegisterView.vue';
+import WidgetEditView from '../views/WidgetEditView.vue';
+import WidgetsView from '../views/WidgetsView.vue';
 import { useSessionStore } from '../stores/session.ts';
 
 /**
@@ -22,8 +24,8 @@ export const routes: RouteRecordRaw[] = [
     path: '/',
     component: PanelLayout,
     children: [
-      { path: '', name: 'widgets', component: stub('Виджеты') },
-      { path: 'widgets/:id', name: 'widget', component: stub('Настройка виджета') },
+      { path: '', name: 'widgets', component: WidgetsView },
+      { path: 'widgets/:id', name: 'widget', component: WidgetEditView },
       { path: 'widgets/:id/install', name: 'widget-install', component: stub('Установка на сайт') },
       { path: 'leads', name: 'leads', component: stub('Лиды') },
       { path: 'dialogs', name: 'dialogs', component: stub('Диалоги') },
