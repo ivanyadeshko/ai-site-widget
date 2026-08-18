@@ -285,21 +285,24 @@ core_network_mode_attached() {
 # Признак «мы за прокси» — https в origin'ах: TLS у BFF не терминируется
 # никогда (он слушает голый :8200), значит https в публичном адресе означает
 # ровно одно — впереди стоит прокси.
+# Смотрим на ВСЕ четыре origin-переменные, а не только на app/public: смешанная
+# раскладка (http app + https panel) — это всё равно «где-то впереди стоит
+# прокси», и IP-кап ломается там одинаково (находка кросс-ревью).
 check_trust_proxy() {
-    local trust app_origin public_origin origin
+    local trust key value https_origin=""
     trust="$(env_get TRUST_PROXY)"
-    app_origin="$(env_get WIDGET_APP_ORIGIN)"
-    public_origin="$(env_get WIDGET_PUBLIC_ORIGIN)"
-    origin="${app_origin:-$public_origin}"
-    case "$origin" in
-        https://*)
-            [ "$trust" = "1" ] || die "origin '$origin' — https, а TRUST_PROXY='${trust:-не задан}': за реверс-прокси без TRUST_PROXY=1 IP-кап схлопнет всех клиентов в один бакет и начнёт валить живых посетителей 429.\n   Починка: TRUST_PROXY=1 в .env стенда — и убедиться, что прокси действительно ставит X-Forwarded-For (иначе кап станет обходиться заголовком)."
-            info "TRUST_PROXY=1 при https-origin '$origin' — IP-кап считает по X-Forwarded-For"
-            ;;
-        *)
-            info "origin '${origin:-не задан}' — http, доверие прокси не требуется"
-            ;;
-    esac
+    for key in WIDGET_APP_ORIGIN WIDGET_PUBLIC_ORIGIN WIDGET_PANEL_ORIGIN WIDGET_CDN_ORIGIN; do
+        value="$(env_get "$key")"
+        case "$value" in
+            https://*) https_origin="$key=$value"; break ;;
+        esac
+    done
+    if [ -n "$https_origin" ]; then
+        [ "$trust" = "1" ] || die "$https_origin — https, а TRUST_PROXY='${trust:-не задан}': за реверс-прокси без TRUST_PROXY=1 IP-кап схлопнет всех клиентов в один бакет и начнёт валить живых посетителей 429.\n   Починка: TRUST_PROXY=1 в .env стенда — и убедиться, что прокси действительно ставит X-Forwarded-For (иначе кап станет обходиться заголовком)."
+        info "TRUST_PROXY=1 при https-раскладке ($https_origin) — IP-кап считает по X-Forwarded-For"
+    else
+        info "https-origin в .env нет — стенд слушает напрямую, доверие прокси не требуется"
+    fi
 }
 
 # ── preflight ─────────────────────────────────────────────────────────
