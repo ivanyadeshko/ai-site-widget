@@ -2,12 +2,14 @@ import { fileURLToPath } from 'node:url';
 import Fastify, { type FastifyBaseLogger, type FastifyInstance } from 'fastify';
 import fastifyStatic from '@fastify/static';
 import rateLimit from '@fastify/rate-limit';
+import cookie from '@fastify/cookie';
 import type { Pool } from 'pg';
 import type { AppConfig } from './config.ts';
 import type { CoreClient } from './core/client.ts';
 import { appPageRoutes } from './routes/appPage.ts';
 import { coreWebhookRoutes } from './routes/coreWebhooks.ts';
 import { healthRoutes } from './routes/health.ts';
+import { panelRoutes } from './routes/panel/index.ts';
 import { publicApiRoutes } from './routes/publicApi.ts';
 
 export type AppDeps = {
@@ -45,6 +47,13 @@ export async function buildApp(input: AppDepsInput): Promise<FastifyInstance> {
   });
   await app.register(publicApiRoutes);
   await app.register(coreWebhookRoutes);
+
+  // Порядок обязателен: cookie — ДО панельных роутов (иначе req.cookies нет),
+  // панель — ПОСЛЕ rateLimit (лимитер обязан быть зарегистрирован раньше
+  // потребителей) и ДО fastifyStatic с prefix '/' (иначе статика перехватит
+  // путь раньше роутов).
+  await app.register(cookie);
+  await app.register(panelRoutes, { prefix: '/api/v1' });
 
   await app.register(fastifyStatic, {
     // Порядок важен: первый корень, где нашёлся файл, побеждает.
