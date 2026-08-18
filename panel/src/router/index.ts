@@ -18,8 +18,8 @@ const stub = (title: string) => defineComponent({
 });
 
 export const routes: RouteRecordRaw[] = [
-  { path: '/login', name: 'login', component: LoginView, meta: { public: true } },
-  { path: '/register', name: 'register', component: RegisterView, meta: { public: true } },
+  { path: '/login', name: 'login', component: LoginView, meta: { public: true, guestOnly: true } },
+  { path: '/register', name: 'register', component: RegisterView, meta: { public: true, guestOnly: true } },
   {
     path: '/',
     component: PanelLayout,
@@ -46,8 +46,17 @@ export const router = createRouter({
 });
 
 router.beforeEach(async (to) => {
-  if (to.meta.public === true) return true;
   const session = useSessionStore();
+
+  if (to.meta.public === true) {
+    // Вошедшему на экранах входа делать нечего: форма логина под живой сессией
+    // выглядит как «меня выкинуло». Флаг guestOnly, а не просто public, —
+    // экран 404 тоже публичный, и вошедшего с него уводить нельзя.
+    // Спрашивать /me тут НЕ идём: аноним на логине не должен платить лишним
+    // запросом, а вошедший уже имеет аккаунт в сторе.
+    if (to.meta.guestOnly === true && session.account !== null) return { name: 'widgets' };
+    return true;
+  }
 
   // Сначала спрашиваем сервер, кто мы, и ТОЛЬКО потом решаем про редирект:
   // иначе обычная перезагрузка страницы кабинета всегда выкидывала бы на

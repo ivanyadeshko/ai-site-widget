@@ -49,6 +49,28 @@ describe('гард роутера панели', () => {
     expect(router.currentRoute.value.name).toBe('admin-accounts');
   });
 
+  it('вошедшего с экранов входа уводит в кабинет, а с 404 — нет', async () => {
+    respondMe(200, { account: ACCOUNT });
+    await router.push('/leads');
+    expect(router.currentRoute.value.name).toBe('leads');
+
+    // Форма логина под живой сессией читается как «меня выкинуло».
+    await router.push('/login');
+    expect(router.currentRoute.value.name).toBe('widgets');
+    await router.push('/register');
+    expect(router.currentRoute.value.name).toBe('widgets');
+
+    // Экран 404 тоже публичный — но с него вошедшего уводить нельзя.
+    await router.push('/такого-экрана-нет');
+    expect(router.currentRoute.value.name).toBe('not-found');
+  });
+
+  it('аноним с экрана регистрации никуда не уезжает', async () => {
+    respondMe(401, { error: { code: 'unauthenticated', message: 'Требуется вход.' } });
+    await router.push('/register');
+    expect(router.currentRoute.value.name).toBe('register');
+  });
+
   it('после выхода следующий переход снова требует входа — без повторного /me', async () => {
     respondMe(200, { account: ACCOUNT });
     await router.push('/leads');

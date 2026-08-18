@@ -152,6 +152,17 @@ describe('панельный CRUD виджетов', () => {
     expect(ftp.statusCode).toBe(422);
   });
 
+  it('схема javascript: в списке сайтов отвергается', async () => {
+    // Тот же код-путь, что и у ftp://, но названный отдельно: значение
+    // допущенного origin уезжает в CSP frame-ancestors (appPage.ts) и в
+    // Access-Control-Allow-Origin — пропустить туда javascript: значит
+    // однажды подарить исполнение тому, кто про этот тест не знал.
+    const cookie = await owner('js-scheme@example.com');
+    const res = await createWidget(cookie, { allowed_origins: ['javascript:alert(1)'] });
+    expect(res.statusCode).toBe(422);
+    expect(res.json().error.code).toBe('invalid_origins');
+  });
+
   it('инструкции агента: пустые и длиннее 8000 символов отвергаются', async () => {
     const cookie = await owner('instr@example.com');
 

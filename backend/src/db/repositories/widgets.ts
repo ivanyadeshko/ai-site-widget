@@ -121,6 +121,10 @@ export async function deleteWidget(db: Queryable, id: string, accountId: string)
   return (rowCount ?? 0) > 0;
 }
 
+// Обрывает ЖИВЫЕ диалоги: все ручки /w/v1 резолвят виджет по токену из пути, и
+// вкладка посетителя со старым токеном получит 404 на следующем же сообщении.
+// Известное следствие — панель предупреждает об этом до нажатия; телеметрию
+// различимости добавит поток VI.
 export async function rotatePublishToken(
   db: Queryable, id: string, accountId: string, token: string,
 ): Promise<WidgetRow | null> {
