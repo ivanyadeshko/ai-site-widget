@@ -4,6 +4,19 @@ export type AppConfig = {
   coreBaseUrl: string;
   coreTenantKey: string;
   coreWebhookSecret: string;
+  /**
+   * Origin ПРИЛОЖЕНИЯ: iframe `/app/:token`, публичный API `/w/v1/*`, кабинет
+   * `/panel` и `/api/v1/*` — всё это один хост (app.vell.pro). Отсюда строится
+   * `app_url`, и он же считается доверенным в Origin-guard: запрос из самого
+   * iframe обязан проходить, даже если владелец не вписал наш домен в свой
+   * `allowed_origins`.
+   */
+  appOrigin: string;
+  /**
+   * Алиас `appOrigin`, оставленный намеренно: на него завязано три десятка
+   * мест и все существующие `.env`. Значения РАСХОДИТЬСЯ не могут — новое
+   * читает `appOrigin`, старое продолжает читать `publicOrigin`.
+   */
   publicOrigin: string;
   cspConnectSrc: string;
   ipHashSalt: string;
@@ -69,17 +82,26 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
     // Падаем ГРОМКО и разом: половина конфига — хуже, чем его отсутствие.
     throw new Error(`Не заданы обязательные переменные окружения: ${missing.join(', ')}`);
   }
+  // Мультидоменная раскладка (Task 24). Три origin'а вместо одного, и у всех
+  // ТРЁХ фолбэк ведёт в конечном счёте на WIDGET_PUBLIC_ORIGIN — он остаётся
+  // в REQUIRED, и старый однодоменный .env обязан продолжать работать без
+  // единой правки. Цепочка именно такая (app → public), а не «каждый сам к
+  // public»: стенд, задавший только WIDGET_APP_ORIGIN, ожидает, что панель и
+  // статика переехали ВМЕСТЕ с приложением, а не остались на старом хосте.
+  const appOrigin = trimSlash(env.WIDGET_APP_ORIGIN ?? env.WIDGET_PUBLIC_ORIGIN!);
   // Панель по умолчанию живёт на том же origin, что и остальной BFF
   // (app.vell.pro: /panel + /api/v1 + /app/:token). Отдельная переменная нужна
   // лишь на раскладке, где SPA раздаётся с другого хоста.
-  const panelOrigin = trimSlash(env.WIDGET_PANEL_ORIGIN ?? env.WIDGET_PUBLIC_ORIGIN!);
+  const panelOrigin = trimSlash(env.WIDGET_PANEL_ORIGIN ?? appOrigin);
   return {
     port: int(env.PORT, 8200),
     databaseUrl: env.DATABASE_URL!,
     coreBaseUrl: trimSlash(env.CORE_BASE_URL!),
     coreTenantKey: env.CORE_TENANT_KEY!,
     coreWebhookSecret: env.CORE_WEBHOOK_SECRET!,
-    publicOrigin: trimSlash(env.WIDGET_PUBLIC_ORIGIN!),
+    appOrigin,
+    // Алиас, не вторая точка правды: значение то же самое.
+    publicOrigin: appOrigin,
     cspConnectSrc: env.WIDGET_CSP_CONNECT_SRC!,
     ipHashSalt: env.IP_HASH_SALT!,
     // Фикс-раунд 1: капы теперь считают СОЗДАНИЯ СЕССИЙ (budget.ts), а не
@@ -100,9 +122,9 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
     // каждый существующий стенд перестал бы подниматься на этом релизе.
     sessionTtlDays: int(env.SESSION_TTL_DAYS, 30),
     panelOrigin,
-    // Фолбэк на публичный origin: существующие стенды продолжают работать без
+    // Фолбэк на origin приложения: существующие стенды продолжают работать без
     // единой правки .env, а сниппет на них остаётся однодоменным (без data-host).
-    cdnOrigin: trimSlash(env.WIDGET_CDN_ORIGIN ?? env.WIDGET_PUBLIC_ORIGIN!),
+    cdnOrigin: trimSlash(env.WIDGET_CDN_ORIGIN ?? appOrigin),
     // На https-происхождении Secure включается сам; явный SESSION_COOKIE_SECURE=1
     // форсирует его на раскладке, где TLS терминируется выше по цепочке.
     cookieSecure: (env.SESSION_COOKIE_SECURE ?? '') === '1' || panelOrigin.startsWith('https://'),

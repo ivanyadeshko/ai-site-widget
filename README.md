@@ -145,6 +145,47 @@ docker compose config --quiet && bash infra/deploy/release.sh preflight
 деплой запускать **нельзя**: `apply` пересоздаст `backend` без сети ядра, и
 все диалоги встанут с `core_unreachable`.
 
+## Мультидомен: `app` / `cdn` / apex
+
+Целевая раскладка прода витрины (DNS и TLS включает этап G3, здесь — только
+конфигурация):
+
+```
+vell.pro      → site:3000     лендинг + /admin CMS Payload
+app.vell.pro  → backend:8200  /app/:token, /w/v1, /panel, /api/v1
+cdn.vell.pro  → backend:8200  /w.js, /w.<hash>.js, /assets/* (и больше ничего)
+```
+
+Три переменные, у всех фолбэк в конечном счёте на `WIDGET_PUBLIC_ORIGIN` —
+однодоменный стенд продолжает работать без единой правки `.env`:
+
+| Переменная | Что задаёт | Фолбэк |
+|---|---|---|
+| `WIDGET_APP_ORIGIN` | `app_url` iframe; доверенный Origin публичного API | `WIDGET_PUBLIC_ORIGIN` |
+| `WIDGET_PANEL_ORIGIN` | единственный Origin, принимаемый не-GET `/api/v1` (D-5) | `WIDGET_APP_ORIGIN` |
+| `WIDGET_CDN_ORIGIN` | откуда сниппет зовёт `w.js`; расхождение с app включает `data-host` | `WIDGET_APP_ORIGIN` |
+
+Что делает разъезд доменов рабочим:
+
+- **`app_url` строится из `appOrigin`, а не из cdn** — iframe обязан грузиться
+  с хоста, где есть API и кука сессии.
+- **`/w.js`, `/w.<hash>.js` и `/assets/*` отдаются с
+  `Access-Control-Allow-Origin: *`** — их тянет чужой сайт кросс-доменно, и на
+  CDN-хосте без этого заголовка статика просто не загрузится. Панельная
+  статика (`/panel/assets/`) заголовок НЕ получает: она живёт на одном хосте с
+  кукой сессии.
+- **Origin-guard доверяет `appOrigin`**, но не `cdnOrigin`: с CDN-хоста в API
+  не ходит никто.
+- **`frame-ancestors` разъезд не расширяет** — право встраивания по-прежнему
+  даёт только `allowed_origins` виджета.
+
+`infra/nginx/vell.pro.conf` — готовый конфиг под эту раскладку. В этап E он
+**не применяется** (вход для G3): слушает `127.0.0.1:9443 ssl proxy_protocol`
+как локальный апстрим SNI-разводки на РФ-фронте, разводит два разных `/admin`
+(CMS на apex vs админка оператора `/panel/admin` на app) и держит
+`proxy_read_timeout 90s` — с запасом к 45-секундному таймауту `CoreClient`.
+Проверен `nginx -t` на 1.24 (версия фронта) и 1.27.
+
 ## Провижининг оператора витрины (первый администратор)
 
 Админка (`/panel/admin/*` и `/api/v1/admin/*`) открывается только аккаунту с

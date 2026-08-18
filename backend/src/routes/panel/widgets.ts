@@ -54,9 +54,11 @@ const toPublic = (widget: WidgetRow, config: AppConfig): WidgetPublic => ({
   embed_snippet: buildEmbedSnippet({
     token: widget.publish_token,
     cdnOrigin: config.cdnOrigin,
-    publicOrigin: config.publicOrigin,
+    // `appOrigin` (== publicOrigin, алиас): в сниппет уезжает адрес, по
+    // которому лоадер будет бить в API, а API живёт на app-хосте.
+    publicOrigin: config.appOrigin,
   }),
-  app_url: `${config.publicOrigin}/app/${widget.publish_token}`,
+  app_url: `${config.appOrigin}/app/${widget.publish_token}`,
 });
 
 /**

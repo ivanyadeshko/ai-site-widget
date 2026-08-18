@@ -31,6 +31,38 @@ describe('loadConfig', () => {
     expect(cfg.maxDurationS).toBe(600);
   });
 
+  it('однодоменный .env: app/panel/cdn — все три падают на WIDGET_PUBLIC_ORIGIN', () => {
+    const cfg = loadConfig(FULL);
+    expect(cfg.appOrigin).toBe('http://localhost:8200');
+    expect(cfg.publicOrigin).toBe(cfg.appOrigin); // алиас, не вторая точка правды
+    expect(cfg.panelOrigin).toBe('http://localhost:8200');
+    expect(cfg.cdnOrigin).toBe('http://localhost:8200');
+  });
+
+  it('задан только WIDGET_APP_ORIGIN — панель и статика переезжают ВМЕСТЕ с приложением', () => {
+    const cfg = loadConfig({ ...FULL, WIDGET_APP_ORIGIN: 'https://app.vell.pro/' });
+    expect(cfg.appOrigin).toBe('https://app.vell.pro'); // хвостовой слэш срезан
+    expect(cfg.publicOrigin).toBe('https://app.vell.pro');
+    // Иначе кабинет остался бы на старом хосте и КАЖДЫЙ не-GET к /api/v1
+    // получал бы 403 по Origin (CSRF-барьер D-5), а сниппет звал бы старый CDN.
+    expect(cfg.panelOrigin).toBe('https://app.vell.pro');
+    expect(cfg.cdnOrigin).toBe('https://app.vell.pro');
+  });
+
+  it('полная мультидоменная раскладка: три разных origin', () => {
+    const cfg = loadConfig({
+      ...FULL,
+      WIDGET_APP_ORIGIN: 'https://app.vell.pro',
+      WIDGET_CDN_ORIGIN: 'https://cdn.vell.pro',
+      WIDGET_PANEL_ORIGIN: 'https://app.vell.pro',
+    });
+    expect(cfg.appOrigin).toBe('https://app.vell.pro');
+    expect(cfg.cdnOrigin).toBe('https://cdn.vell.pro');
+    expect(cfg.panelOrigin).toBe('https://app.vell.pro');
+    // https-раскладка сама включает Secure у куки сессии.
+    expect(cfg.cookieSecure).toBe(true);
+  });
+
   it('trustProxy по умолчанию ВЫКЛЮЧЕН: иначе IP-кап обходится одним заголовком', () => {
     expect(loadConfig(FULL).trustProxy).toBe(false);
     expect(loadConfig({ ...FULL, TRUST_PROXY: 'true' }).trustProxy).toBe(false); // включает только '1'

@@ -19,7 +19,7 @@ beforeAll(async () => {
     config: {
       port: 8200, databaseUrl: process.env.DATABASE_URL!, coreBaseUrl: core.baseUrl,
       coreTenantKey: 'sk_test_x', coreWebhookSecret: 'секрет-длиной-больше-шестнадцати',
-      publicOrigin: 'http://localhost:8200', cspConnectSrc: "'self'", ipHashSalt: 'соль',
+      appOrigin: 'http://localhost:8200', publicOrigin: 'http://localhost:8200', cspConnectSrc: "'self'", ipHashSalt: 'соль',
       maxDialogsPerVisitorPerDay: 10, maxDialogsPerIpPerDay: 30, maxDurationS: 600,
       maxSessionsPerAccountPerDay: 300,
       trustProxy: false, logLevel: 'silent',

@@ -90,6 +90,12 @@ export async function buildApp(input: AppDepsInput): Promise<FastifyInstance> {
       reply.header('Cache-Control', /w\.[^.]+\.js$/.test(path)
         ? 'public, max-age=31536000, immutable'
         : 'public, max-age=60');
+      // CORS настежь — обязателен, а не «на всякий случай»: `w.js` подключают
+      // <script>'ом с ЧУЖОГО сайта, а на мультидоменной раскладке он ещё и
+      // приезжает с другого нашего хоста (cdn.vell.pro). Безопасно: файлы
+      // публичны по назначению, кук не читают и данных аккаунта не несут —
+      // раздача ничем не отличается от любого CDN.
+      reply.header('Access-Control-Allow-Origin', '*');
     },
   });
 
@@ -98,6 +104,13 @@ export async function buildApp(input: AppDepsInput): Promise<FastifyInstance> {
     prefix: '/assets/',
     decorateReply: false, // reply.sendFile уже задекорирован первым register
     index: false,
+    // Та же причина, что у лоадера: ассеты iframe-приложения тоже раздаются с
+    // CDN-хоста. Панельная статика (`/panel/assets/`, panelApp.ts) этого
+    // намеренно НЕ получает: она живёт на одном хосте с кукой сессии, и
+    // кросс-доменный доступ ей не нужен.
+    setHeaders: (reply) => {
+      reply.header('Access-Control-Allow-Origin', '*');
+    },
   });
 
   await app.register(appPageRoutes);

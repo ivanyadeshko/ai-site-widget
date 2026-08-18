@@ -50,7 +50,7 @@ const requireWidget = async (req: FastifyRequest, token: string, checkOrigin: bo
   if (checkOrigin) {
     const verdict = originVerdict(widget, {
       origin: req.headers.origin,
-      publicOrigin: req.server.deps.config.publicOrigin,
+      appOrigin: req.server.deps.config.appOrigin,
       method: req.method,
     });
     if (verdict === 'deny') throw new ApiError(403, 'origin_not_allowed', 'Этот сайт не разрешён для виджета.');
@@ -135,7 +135,7 @@ export const publicApiRoutes: FastifyPluginAsync = async (app) => {
       // CORS-эхо ТОЛЬКО для разрешённых сайтов: сам ответ не секрет, но и раздавать
       // его каждому встречному незачем. Vary обязателен — кэш иначе перепутает.
       reply.header('Vary', 'Origin');
-      if (origin && originVerdict(widget, { origin, publicOrigin: app.deps.config.publicOrigin, method: 'GET' }) === 'allow') {
+      if (origin && originVerdict(widget, { origin, appOrigin: app.deps.config.appOrigin, method: 'GET' }) === 'allow') {
         reply.header('Access-Control-Allow-Origin', origin);
       }
       reply.header('Cache-Control', 'public, max-age=60');
@@ -147,7 +147,9 @@ export const publicApiRoutes: FastifyPluginAsync = async (app) => {
         // посетителю чужого сайта.
         enabled: widget.enabled && !widget.owner_blocked,
         allowed_origins: widget.allowed_origins,
-        app_url: `${app.deps.config.publicOrigin}/app/${widget.publish_token}`,
+        // Именно appOrigin, а НЕ cdnOrigin: iframe должен грузиться с хоста,
+        // где живут API и сессия. На CDN-хосте нет ни того, ни другого.
+        app_url: `${app.deps.config.appOrigin}/app/${widget.publish_token}`,
         text_max_length: TEXT_MAX,
         // Тема — ВСЕГДА полная, с добитыми дефолтами: лоадер на чужой странице
         // живёт под бюджетом 8 КБ gzip и не должен носить в себе ни одного
