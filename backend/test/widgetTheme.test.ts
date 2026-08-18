@@ -71,6 +71,44 @@ describe('тема виджета', () => {
     }
   });
 
+  it('дефолты темы совпадают с фолбэками лоадера — константа продублирована в двух сборках', () => {
+    // `embed/loader/src/loader.ts` держит ТЕ ЖЕ значения на случай отката
+    // образа бэкенда (тогда /config приходит без theme). Общего файла у бандла
+    // для чужого сайта и у бэкенда нет и быть не может, поэтому расхождение
+    // ловится ровно здесь: меняя брендовый цвет, обязаны поменять оба места.
+    expect(DEFAULT_THEME).toEqual({ color: '#2563eb', position: 'right', button_label: '💬' });
+  });
+
+  it('POST принимает тему при создании и отвергает мусорную, а не глотает молча', async () => {
+    const cookie = await owner('create-theme@example.com');
+    const created = await app.inject({
+      method: 'POST', url: '/api/v1/widgets', headers: { origin: ORIGIN, cookie },
+      payload: {
+        name: 'Виджет магазина',
+        agent_config: { instructions: 'Ты консультант магазина.' },
+        allowed_origins: ['https://shop.example'],
+        theme: { color: '#00ff00', position: 'left' },
+      },
+    });
+    expect(created.statusCode).toBe(201);
+    expect(created.json().widget.theme).toEqual({ color: '#00ff00', position: 'left' });
+
+    const rejected = await app.inject({
+      method: 'POST', url: '/api/v1/widgets', headers: { origin: ORIGIN, cookie },
+      payload: {
+        name: 'Второй виджет',
+        agent_config: { instructions: 'Ты консультант магазина.' },
+        allowed_origins: [],
+        theme: { color: 'красный' },
+      },
+    });
+    expect(rejected.statusCode).toBe(422);
+    expect(rejected.json().error.code).toBe('invalid_theme');
+    // Отказ ДО записи: второй виджет не создался.
+    const list = await app.inject({ method: 'GET', url: '/api/v1/widgets', headers: { cookie } });
+    expect(list.json().widgets).toHaveLength(1);
+  });
+
   it('PATCH сохраняет тему и она видна в публичном /config', async () => {
     const cookie = await owner('theme@example.com');
     const widget = (await createWidget(cookie)).json().widget;

@@ -76,17 +76,30 @@ export async function findWidgetByIdForAccount(
   return rows[0] ?? null;
 }
 
+/*
+ * ИНВАРИАНТ ТЕМЫ (держит безопасность лоадера на чужом сайте).
+ *
+ * `widgets.theme` уезжает в `/w/v1/:token/config`, а оттуда — прямо в
+ * шаблонную строку `<style>` внутри Shadow DOM на ЧУЖОЙ странице
+ * (`embed/loader/src/loader.ts`). Лоадер валидации не содержит вовсе — это
+ * осознанное решение ради бюджета 8 КБ gzip (D-9). Значит, единственная
+ * линия защиты — вот эти две функции: любая запись в колонку `theme` обязана
+ * идти через `parseTheme` (`backend/src/widgets/theme.ts`). Появится третий
+ * путь записи (админка, импорт, сид) без него — получим CSS-инъекцию у
+ * каждого посетителя сайта владельца.
+ */
 export async function insertWidget(db: Queryable, input: {
   accountId: string; name: string; publishToken: string;
-  agentConfig: AgentConfig; allowedOrigins: string[];
+  agentConfig: AgentConfig; allowedOrigins: string[]; theme?: WidgetTheme;
 }): Promise<WidgetRow> {
   const { rows } = await db.query<WidgetRow>(
-    `INSERT INTO widgets (account_id, name, publish_token, agent_config, allowed_origins)
-     VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)
+    `INSERT INTO widgets (account_id, name, publish_token, agent_config, allowed_origins, theme)
+     VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb)
      RETURNING ${COLS}`,
     [
       input.accountId, input.name, input.publishToken,
       JSON.stringify(input.agentConfig), JSON.stringify(input.allowedOrigins),
+      JSON.stringify(input.theme ?? {}),
     ],
   );
   return rows[0]!;

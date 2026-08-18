@@ -82,7 +82,9 @@ export const widgetRoutes: FastifyPluginAsync = async (app) => {
     return reply.send({ widgets: widgets.map((w) => toPublic(w, app.deps.config)) });
   });
 
-  app.post<{ Body: { name?: unknown; agent_config?: unknown; allowed_origins?: unknown } }>(
+  app.post<{
+    Body: { name?: unknown; agent_config?: unknown; allowed_origins?: unknown; theme?: unknown };
+  }>(
     '/widgets',
     { config: { rateLimit: { max: 60, timeWindow: '1 minute' } } },
     async (req, reply) => {
@@ -90,6 +92,11 @@ export const widgetRoutes: FastifyPluginAsync = async (app) => {
       const name = parseWidgetName(req.body?.name);
       const agentConfig = parseAgentConfig(req.body?.agent_config);
       const allowedOrigins = parseAllowedOrigins(req.body?.allowed_origins ?? []);
+      // Тема при создании необязательна (форма панели её не собирает), но
+      // ПРИСЛАННУЮ обязана либо сохранить, либо отвергнуть: молча проглоченное
+      // поле — тихая потеря данных, а `parseTheme` в PATCH придирается даже к
+      // опечатке в имени поля. Две ручки не должны вести себя по-разному.
+      const theme = req.body?.theme === undefined ? {} : parseTheme(req.body.theme);
 
       // Кап читается ПОСЛЕ валидации: мусорное тело не должно даже считаться.
       // Гонка двух параллельных созданий на границе капа теоретически даёт
@@ -109,7 +116,7 @@ export const widgetRoutes: FastifyPluginAsync = async (app) => {
       for (let attempt = 0; attempt < 2 && widget === null; attempt += 1) {
         try {
           widget = await insertWidget(app.deps.pool, {
-            accountId, name, publishToken: generatePublishToken(), agentConfig, allowedOrigins,
+            accountId, name, publishToken: generatePublishToken(), agentConfig, allowedOrigins, theme,
           });
         } catch (err) {
           if ((err as { code?: unknown }).code !== '23505' || attempt === 1) throw err;

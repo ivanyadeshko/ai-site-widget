@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mount, flushPromises } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
-import { createMemoryHistory, createRouter } from 'vue-router';
+import { RouterLink, createMemoryHistory, createRouter } from 'vue-router';
 import { defineComponent, h } from 'vue';
 import WidgetInstallView from '../src/views/WidgetInstallView.vue';
 
@@ -88,6 +88,12 @@ describe('экран установки на сайт', () => {
     expect(wrapper.text()).toMatch(/разрешённых сайтов/i);
     // Ссылка ведёт на настройки виджета, где этот список и правится.
     expect(wrapper.find('[data-test="origins-link"]').attributes('href')).toBe('/widgets/w-1');
+    // И ведёт ИМЕННО через роутер. SPA раздаётся с базой /panel/, поэтому
+    // обычный <a href="/widgets/w-1"> увёл бы браузер на путь БЕЗ префикса —
+    // в статику виджета, где ответ 404. По одному href это неотличимо: в
+    // тестовом memory-роутере база пустая, и обе формы дают ту же строку.
+    expect(wrapper.findAllComponents(RouterLink)
+      .some((link) => link.attributes('data-test') === 'origins-link')).toBe(true);
   });
 
   it('даёт ссылку на демо-страницу с этим токеном', async () => {

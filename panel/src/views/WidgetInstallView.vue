@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue';
-import { useRoute } from 'vue-router';
+import { RouterLink, useRoute } from 'vue-router';
 import { NAlert, NButton, NCard, NSpace, NSpin, NText } from 'naive-ui';
 import { useWidgetsStore, type Widget } from '../stores/widgets.ts';
 import { PanelApiError } from '../lib/api.ts';
@@ -89,7 +89,10 @@ async function copySnippet(): Promise<void> {
         <n-space vertical size="small">
           <n-text>
             1. Добавьте адрес своего сайта в
-            <a data-test="origins-link" :href="`/widgets/${widget.id}`">список разрешённых сайтов</a>:
+            <!-- Именно router-link: SPA раздаётся с базой /panel/ (router/index.ts),
+                 и обычный <a href="/widgets/…"> увёл бы браузер на путь БЕЗ этого
+                 префикса — то есть в статику виджета, где ответ 404. -->
+            <router-link data-test="origins-link" :to="`/widgets/${widget.id}`">список разрешённых сайтов</router-link>:
             без него виджет не откроется ни у одного посетителя.
           </n-text>
           <n-text>2. Вставьте сниппет перед закрывающим &lt;/body&gt; на всех страницах.</n-text>
