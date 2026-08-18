@@ -98,6 +98,53 @@ MTU на этом сервере — 1400: большие передачи по 
 rsync, а не один толстый scp (уже известная гоча стенда, см. `docs/dev_stand`
 в родственных репозиториях программы распила).
 
+## Сетевые режимы: `attached` и `public`
+
+BFF добирается до ядра одним из двух способов, и выбирает их **одна строка
+`COMPOSE_FILE` в `.env` стенда** — ни `release.sh`, ни workflow деплоя её не
+пишут и не мигрируют, они только читают.
+
+| | `attached` (дев рядом с ядром) | `public` (прод витрины) |
+|---|---|---|
+| `COMPOSE_FILE` | `compose.yaml:compose.core-network.yaml` | не задан |
+| Сеть ядра | внешняя `conversation-core_default` | не используется |
+| `CORE_BASE_URL` | `http://control-plane:8000/api` | `https://api.ai-speak.ru/api` |
+| `TRUST_PROXY` | `0` (BFF слушает `:8200` напрямую) | `1` (за nginx, обязателен) |
+
+Базовый `infra/compose.yaml` описывает `public`: сети ядра в нём **нет**.
+Возвращает её только override `infra/compose.core-network.yaml`. Причина —
+`external: true` нельзя сделать условным: пока сеть была объявлена в базовом
+файле, `up` на хосте без стека ядра падал «network … declared as external, but
+could not be found», то есть прод витрины был структурно невозможен.
+
+`preflight` проверяет сеть **только** в режиме `attached` (смотрит на
+`COMPOSE_FILE`), а в `public` печатает `сетевой режим public — внешняя сеть
+ядра не требуется`. Отдельным стоп-условием он проверяет связку
+«https-origin + `TRUST_PROXY=1`»: без доверия прокси `req.ip` равен адресу
+nginx для всех посетителей сразу, и суточный IP-кап начинает валить живых
+людей 429.
+
+**Переключение существующего стенда в `attached`** (порядок обязателен):
+
+```bash
+# 1. Файл — на хост РАНЬШЕ строки в .env (иначе compose падает «no such file»
+#    на каждой команде). Штатно его кладёт деплой, до первого прогона — руками:
+scp infra/compose.core-network.yaml root@<хост>:/opt/site-widget/
+
+# 2. На хосте:
+cd /opt/site-widget
+cp .env .env.bak-$(date +%F)
+grep -q '^COMPOSE_FILE=' .env \
+  || echo 'COMPOSE_FILE=compose.yaml:compose.core-network.yaml' >> .env
+docker compose config --quiet && bash infra/deploy/release.sh preflight
+```
+
+В логе preflight обязана появиться строка `→ сеть ядра '…' на месте`. Если
+вместо неё напечаталось `→ сетевой режим public`, значит `COMPOSE_FILE` не
+подхватился (правили не тот каталог либо строка ушла в комментарий) —
+деплой запускать **нельзя**: `apply` пересоздаст `backend` без сети ядра, и
+все диалоги встанут с `core_unreachable`.
+
 ## Провижининг оператора витрины (первый администратор)
 
 Админка (`/panel/admin/*` и `/api/v1/admin/*`) открывается только аккаунту с

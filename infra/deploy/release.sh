@@ -5,7 +5,8 @@
 # Заменяет infra/deploy.sh (rsync исходников + сборка на месте). Интерфейс
 # подкоманд общий для трёх репозиториев программы распила:
 #
-#   preflight            — диск/иноды, .env, сеть ядра, compose config, образ
+#   preflight            — диск/иноды, .env, сеть ядра (только в режиме
+#                          attached), TRUST_PROXY, compose config, образ
 #   backup               — pg_dump -Fc + верификация pg_restore + ретенция
 #   apply                — пин тега → pull → up --no-build → миграции → health
 #   health               — /healthz BFF
@@ -28,9 +29,12 @@
 #   4. Откат одной командой вместо «собери предыдущий коммит заново».
 #
 # Специфика виджета:
-#   • BFF присоединён к ВНЕШНЕЙ сети ядра (conversation-core_default). Её
-#     отсутствие — не «предупреждение», а гарантированный отказ `up`, поэтому
-#     preflight проверяет сеть до того, как тронуть стенд.
+#   • Сетевой режим стенда задаётся COMPOSE_FILE в .env. В режиме `attached`
+#     (стенд рядом с ядром) в COMPOSE_FILE перечислен compose.core-network.yaml,
+#     BFF входит во ВНЕШНЮЮ сеть ядра, и её отсутствие — не «предупреждение», а
+#     гарантированный отказ `up`: preflight проверяет сеть до того, как тронуть
+#     стенд. В режиме `public` (прод витрины, ядро за HTTPS) сети нет вовсе, и
+#     проверка пропускается — иначе прод было бы не задеплоить в принципе.
 #   • Миграции — node-pg-migrate через exec в backend, после `up`.
 #
 #   • Лендинг (профиль `site`, образ vell-site) — второй сервис того же
@@ -238,6 +242,57 @@ site_profile_enabled() {
 
 site_health_url() { printf '%s' "${SITE_HEALTH_URL:-http://127.0.0.1:3000/api/health}"; }
 
+# Стенд стоит РЯДОМ с ядром и входит в его docker-сеть? Правда одна —
+# COMPOSE_FILE в .env: сеть возвращает в граф compose только override-файл
+# compose.core-network.yaml, перечисленный там. Разбираем как список путей
+# через `:` (разделитель самого compose), а не `grep`: подстрока совпала бы с
+# закомментированной строкой или с чужим файлом вроде
+# `compose.core-network.yaml.bak`, и стенд в режиме `public` получил бы
+# требование несуществующей сети — то есть отказ деплоя на ровном месте.
+core_network_mode_attached() {
+    local files item
+    files="$(env_get COMPOSE_FILE)"
+    [ -n "$files" ] || return 1
+    local IFS=':'
+    for item in $files; do
+        item="$(printf '%s' "$item" | tr -d '[:space:]')"
+        [ "$(basename "$item")" = "compose.core-network.yaml" ] && return 0
+    done
+    return 1
+}
+
+# Гард TRUST_PROXY (гэп 9 разведки). За реверс-прокси req.ip у Fastify — это
+# адрес ПРОКСИ, один и тот же для всех посетителей, пока TRUST_PROXY=1 не
+# разрешит верить X-Forwarded-For (backend/src/config.ts, app.ts). Последствие
+# не косметическое: суточный IP-кап (MAX_DIALOGS_PER_IP_PER_DAY) схлопывает
+# всех клиентов в ОДИН бакет и начинает валить живых посетителей 429 после
+# первых же шестидесяти диалогов на весь сайт.
+#
+# Почему `die`, а не warning: диагностический warn в приложении уже есть
+# (backend/src/routes/publicApi.ts, разовый лог «X-Forwarded-For пришёл, но
+# TRUST_PROXY выключен»), и он ровно эту ситуацию замечает — но только в
+# логах, которые в момент инцидента никто не читает.
+#
+# Признак «мы за прокси» — https в origin'ах: TLS у BFF не терминируется
+# никогда (он слушает голый :8200), значит https в публичном адресе означает
+# ровно одно — впереди стоит прокси.
+check_trust_proxy() {
+    local trust app_origin public_origin origin
+    trust="$(env_get TRUST_PROXY)"
+    app_origin="$(env_get WIDGET_APP_ORIGIN)"
+    public_origin="$(env_get WIDGET_PUBLIC_ORIGIN)"
+    origin="${app_origin:-$public_origin}"
+    case "$origin" in
+        https://*)
+            [ "$trust" = "1" ] || die "origin '$origin' — https, а TRUST_PROXY='${trust:-не задан}': за реверс-прокси без TRUST_PROXY=1 IP-кап схлопнет всех клиентов в один бакет и начнёт валить живых посетителей 429.\n   Починка: TRUST_PROXY=1 в .env стенда — и убедиться, что прокси действительно ставит X-Forwarded-For (иначе кап станет обходиться заголовком)."
+            info "TRUST_PROXY=1 при https-origin '$origin' — IP-кап считает по X-Forwarded-For"
+            ;;
+        *)
+            info "origin '${origin:-не задан}' — http, доверие прокси не требуется"
+            ;;
+    esac
+}
+
 # ── preflight ─────────────────────────────────────────────────────────
 
 cmd_preflight() {
@@ -256,13 +311,27 @@ cmd_preflight() {
     fi
     info "диск ${use_pct}%, иноды ${inode_pct:-н/д}%"
 
-    # Внешняя сеть ядра. Её отсутствие роняет `up` — но уже ПОСЛЕ того, как
+    # Внешняя сеть ядра — ТОЛЬКО в режиме `attached`. Признак режима один:
+    # override-файл compose.core-network.yaml в COMPOSE_FILE из .env стенда
+    # (он же единственное, что возвращает сеть в граф compose). В режиме
+    # `public` (прод витрины, ядро за HTTPS) сети нет и быть не должно —
+    # безусловная проверка здесь делала деплой прода невозможным.
+    #
+    # Её отсутствие в режиме `attached` роняет `up` — но уже ПОСЛЕ того, как
     # мы подменили тег в .env, то есть в состоянии «наполовину задеплоено».
-    local net
-    net="$(env_get CORE_NETWORK)"; net="${net:-conversation-core_default}"
-    docker network inspect "$net" >/dev/null 2>&1 \
-        || die "внешняя сеть '$net' не существует — стек ядра не поднят? BFF без неё не стартует"
-    info "сеть ядра '$net' на месте"
+    if core_network_mode_attached; then
+        local net
+        net="$(env_get CORE_NETWORK)"; net="${net:-conversation-core_default}"
+        docker network inspect "$net" >/dev/null 2>&1 \
+            || die "внешняя сеть '$net' не существует — стек ядра не поднят? BFF без неё не стартует"
+        info "сеть ядра '$net' на месте"
+        [ -f "$REPO_DIR/compose.core-network.yaml" ] \
+            || die "COMPOSE_FILE ссылается на compose.core-network.yaml, но файла нет в $REPO_DIR — compose упадёт «no such file» на каждой команде; файл кладёт шаг «Sync deploy assets» деплоя"
+    else
+        info "сетевой режим public — внешняя сеть ядра не требуется"
+    fi
+
+    check_trust_proxy
 
     docker compose config --quiet || die "compose.yaml невалиден или в .env не хватает обязательных переменных"
 
