@@ -1,8 +1,12 @@
 import { defineComponent, h } from 'vue';
 import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router';
 import PanelLayout from '../layouts/PanelLayout.vue';
+import DialogView from '../views/DialogView.vue';
+import DialogsView from '../views/DialogsView.vue';
+import LeadsView from '../views/LeadsView.vue';
 import LoginView from '../views/LoginView.vue';
 import RegisterView from '../views/RegisterView.vue';
+import UsageView from '../views/UsageView.vue';
 import WidgetEditView from '../views/WidgetEditView.vue';
 import WidgetInstallView from '../views/WidgetInstallView.vue';
 import WidgetsView from '../views/WidgetsView.vue';
@@ -28,9 +32,10 @@ export const routes: RouteRecordRaw[] = [
       { path: '', name: 'widgets', component: WidgetsView },
       { path: 'widgets/:id', name: 'widget', component: WidgetEditView },
       { path: 'widgets/:id/install', name: 'widget-install', component: WidgetInstallView },
-      { path: 'leads', name: 'leads', component: stub('Лиды') },
-      { path: 'dialogs', name: 'dialogs', component: stub('Диалоги') },
-      { path: 'usage', name: 'usage', component: stub('Использование') },
+      { path: 'leads', name: 'leads', component: LeadsView },
+      { path: 'dialogs', name: 'dialogs', component: DialogsView },
+      { path: 'dialogs/:id', name: 'dialog', component: DialogView },
+      { path: 'usage', name: 'usage', component: UsageView },
       { path: 'admin/accounts', name: 'admin-accounts', component: stub('Аккаунты'), meta: { admin: true } },
       { path: 'admin/usage', name: 'admin-usage', component: stub('Расход витрины'), meta: { admin: true } },
     ],

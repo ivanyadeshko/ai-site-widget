@@ -11,7 +11,7 @@ describe('роутер панели', () => {
   it('каждый объявленный путь резолвится в непустой компонент', () => {
     const paths = [
       '/login', '/register', '/', '/widgets/abc', '/widgets/abc/install',
-      '/leads', '/dialogs', '/usage', '/admin/accounts', '/admin/usage',
+      '/leads', '/dialogs', '/dialogs/abc', '/usage', '/admin/accounts', '/admin/usage',
     ];
     for (const path of paths) {
       const resolved = router.resolve(path);

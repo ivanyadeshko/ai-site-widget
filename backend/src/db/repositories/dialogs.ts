@@ -1,3 +1,4 @@
+import type { Cursor } from '../../panel/pagination.ts';
 import type { Queryable } from '../pool.ts';
 
 export type DialogStatus = 'active' | 'escalating' | 'ended' | 'error';
@@ -22,6 +23,13 @@ export type DialogRow = {
 const COLS = `id, widget_id, visitor_key, status, core_session_ids, settled_session_ids,
               current_core_session_id, current_channel, client_reference,
               usage, credits_total, started_at, ended_at, last_activity_at`;
+
+/**
+ * Те же колонки с префиксом таблицы — для запросов с `JOIN widgets`: без него
+ * `id` неоднозначен (он есть и у виджета), и Postgres валит запрос 42702.
+ * Считается из COLS, а не пишется второй копией: расхождения быть не может.
+ */
+const D_COLS = COLS.split(',').map((column) => `d.${column.trim()}`).join(', ');
 
 export async function insertDialog(db: Queryable, input: { widgetId: string; visitorKey: string }): Promise<DialogRow> {
   // ОДНИМ statement'ом: client_reference — NOT NULL UNIQUE, и промежуточная
@@ -139,6 +147,72 @@ export async function countDialogsStartedByVisitor(db: Queryable, visitorKey: st
     [visitorKey],
   );
   return Number.parseInt(rows[0]!.n, 10);
+}
+
+/*
+ * ЧТЕНИЕ ДИАЛОГОВ В КАБИНЕТЕ. Изоляция арендаторов — в SQL (`JOIN widgets w`
+ * + `w.account_id = $1`), как у виджетов и лидов: у диалога своей колонки
+ * владельца нет, владелец приходит через виджет.
+ */
+
+/**
+ * Срез диалога ДЛЯ ВЛАДЕЛЬЦА, а не сырая строка таблицы.
+ *
+ * Владельцу нужны «сколько реплик», «оставил ли контакт» и «сколько это
+ * стоило» — то, чего в самой строке `dialogs` нет. Технические поля нити
+ * (`core_session_ids`, `visitor_key`, `client_reference`) наружу не уезжают:
+ * посетителя мы не выдаём, а идентификаторы сессий ядра владельцу бесполезны.
+ *
+ * `cursor_at` — служебная метка keyset-курсора с микросекундами (см.
+ * `panel/pagination.ts`), наружу не отдаётся.
+ */
+export type DialogListRow = {
+  id: string;
+  widget_id: string;
+  widget_name: string;
+  status: DialogStatus;
+  current_channel: 'chat' | 'voice' | null;
+  messages_count: number;
+  has_lead: boolean;
+  usage: Record<string, number>;
+  credits_total: number;
+  started_at: Date;
+  ended_at: Date | null;
+  last_activity_at: Date;
+  cursor_at: string;
+};
+
+export async function listDialogsByAccount(
+  db: Queryable,
+  input: { accountId: string; widgetId: string | null; limit: number; cursor: Cursor | null },
+): Promise<DialogListRow[]> {
+  const { rows } = await db.query<DialogListRow>(
+    `SELECT d.id, d.widget_id, w.name AS widget_name, d.status, d.current_channel,
+            d.usage, d.credits_total, d.started_at, d.ended_at, d.last_activity_at,
+            to_char(d.started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_at,
+            (SELECT count(*) FROM dialog_messages m WHERE m.dialog_id = d.id)::int AS messages_count,
+            EXISTS (SELECT 1 FROM leads l WHERE l.dialog_id = d.id) AS has_lead
+       FROM dialogs d
+       JOIN widgets w ON w.id = d.widget_id
+      WHERE w.account_id = $1
+        AND ($2::uuid IS NULL OR d.widget_id = $2::uuid)
+        AND ($3::timestamptz IS NULL OR (d.started_at, d.id) < ($3::timestamptz, $4::uuid))
+      ORDER BY d.started_at DESC, d.id DESC
+      LIMIT $5`,
+    [input.accountId, input.widgetId, input.cursor?.at ?? null, input.cursor?.id ?? null, input.limit],
+  );
+  return rows;
+}
+
+/** Диалог в скоупе аккаунта: чужой неотличим от несуществующего (оба — null). */
+export async function findDialogForAccount(db: Queryable, dialogId: string, accountId: string): Promise<DialogRow | null> {
+  const { rows } = await db.query<DialogRow>(
+    `SELECT ${D_COLS}
+       FROM dialogs d JOIN widgets w ON w.id = d.widget_id
+      WHERE d.id = $1 AND w.account_id = $2`,
+    [dialogId, accountId],
+  );
+  return rows[0] ?? null;
 }
 
 export async function listStaleActiveDialogs(db: Queryable, olderThanMinutes: number, limit: number): Promise<DialogRow[]> {

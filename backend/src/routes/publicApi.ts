@@ -18,7 +18,35 @@ const SEQ_MAX = 2147483647; // Postgres INTEGER (dialog_messages.seq) — бол
 
 const requireWidget = async (req: FastifyRequest, token: string, checkOrigin: boolean): Promise<WidgetWithOwner> => {
   const widget = await findWidgetByToken(req.server.deps.pool, token);
-  if (!widget) throw new ApiError(404, 'widget_not_found', 'Виджет не найден.');
+  if (!widget) {
+    /*
+     * РАЗЛИЧИМОСТЬ РОТАЦИИ (вводная кросс-ревью потоков II+III).
+     *
+     * Ротация `publish_token` владельцем ОБРЫВАЕТ живые диалоги: вкладка
+     * посетителя со старым токеном получает 404 на следующем же сообщении
+     * (widgets.ts, rotatePublishToken). В данных это неотличимо от сбоя —
+     * диалог просто перестаёт получать реплики, — и поддержка ищет инцидент
+     * там, где владелец нажал кнопку сам.
+     *
+     * `dialog_id` берётся из пути, если он там есть: именно он связывает
+     * событие с оборванным разговором. Поле пишется ВСЕГДА, в том числе
+     * `null`, чтобы grep по логам не зависел от формы события.
+     *
+     * Токен целиком в лог не уезжает — только хвост: он не секрет (лежит в
+     * HTML сайта владельца), но и раздавать его копипастой в логи незачем.
+     */
+    const dialogId = (req.params as { id?: unknown }).id;
+    req.server.log.warn(
+      {
+        evt: 'token_rotated_or_deleted',
+        token_tail: token.slice(-6),
+        dialog_id: typeof dialogId === 'string' ? dialogId : null,
+        path: req.routeOptions.url ?? req.url,
+      },
+      'виджет по токену не найден: токен ротирован или виджет удалён — живые диалоги на старом токене оборваны',
+    );
+    throw new ApiError(404, 'widget_not_found', 'Виджет не найден.');
+  }
   if (checkOrigin) {
     const verdict = originVerdict(widget, {
       origin: req.headers.origin,
