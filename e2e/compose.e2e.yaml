@@ -1,0 +1,81 @@
+# Герметичный стек e2e: widget-db + backend (образ из infra/Dockerfile) +
+# fake-core. Ядра здесь НЕТ — его подменяет fake-core на голом node:http
+# (D-14, Constraint 6): чат-канал виджета идёт через LiveKit data-channel и без
+# живого ядра физически не поднимается, но BFF обязан отвечать 201 на старт
+# диалога и принимать подписанный вебхук session.finalized — этого достаточно
+# для герметичного гейта панели.
+name: widget-e2e
+services:
+  widget-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: widget
+      POSTGRES_PASSWORD: widget
+      POSTGRES_DB: site_widget
+    # Порт на хост НЕ публикуем: в БФФ-Postgres снаружи из теста не ходим,
+    # money-синк проверяется через панель, а не psql.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U widget -d site_widget"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # One-shot: катает миграции BFF и завершается. backend стартует только после
+  # его успешного выхода — иначе поднялся бы на пустой схеме и валился 500.
+  # node-pg-migrate лежит в runtime-образе (backend/package.json → dependencies,
+  # НЕ devDependencies), поэтому npx --no-install его находит; тот же вызов,
+  # что в infra/deploy/release.sh.
+  migrate:
+    build: { context: .., dockerfile: infra/Dockerfile }
+    image: site-widget-backend:e2e
+    restart: "no"
+    command: ["npx", "--no-install", "node-pg-migrate", "-m", "backend/migrations", "up"]
+    environment:
+      DATABASE_URL: postgres://widget:widget@widget-db:5432/site_widget
+    depends_on:
+      widget-db: { condition: service_healthy }
+
+  backend:
+    build: { context: .., dockerfile: infra/Dockerfile }
+    image: site-widget-backend:e2e
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://widget:widget@widget-db:5432/site_widget
+      PORT: "8200"
+      # Ядро подменено фейком. CORE_TENANT_KEY — любая latin1-строка (Constraint 11).
+      CORE_BASE_URL: http://fake-core:8000/api
+      CORE_TENANT_KEY: e2e-tenant-key
+      # ОДИН И ТОТ ЖЕ секрет у backend и fake-core: иначе подпись вебхука не сойдётся.
+      CORE_WEBHOOK_SECRET: e2e-core-webhook-secret
+      # Однодоменная раскладка: панель, публичный API, iframe и статика — всё на
+      # localhost:8200. Отсюда же строится app_url и трастед-Origin (config.ts).
+      WIDGET_PUBLIC_ORIGIN: http://localhost:8200
+      WIDGET_CSP_CONNECT_SRC: "'self'"
+      IP_HASH_SALT: e2e-salt
+      LOG_LEVEL: warn
+    ports: ["8200:8200"]
+    depends_on:
+      widget-db: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+      fake-core: { condition: service_started }
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8200/healthz"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  fake-core:
+    image: node:22-alpine
+    restart: unless-stopped
+    working_dir: /srv
+    # server.mjs монтируется, а не копируется в образ: node:22-alpine и голый
+    # node:http, ноль зависимостей — пересобирать нечего.
+    volumes: ["./fake-core/server.mjs:/srv/server.mjs:ro"]
+    command: ["node", "/srv/server.mjs"]
+    environment:
+      CORE_WEBHOOK_SECRET: e2e-core-webhook-secret
+      BFF_URL: http://backend:8200
+    # 8100 на хост: служебную ручку /__test__/finalize дёргает Playwright СНАРУЖИ
+    # (шаг 9 сценария) — без публикации порта она недоступна.
+    ports: ["8100:8000"]
