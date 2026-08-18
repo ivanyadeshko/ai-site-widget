@@ -2,6 +2,7 @@ import type { FastifyPluginAsync } from 'fastify';
 import { requireSameOrigin } from '../../auth/guards.ts';
 import { ApiError, sendApiError } from '../../http/errors.ts';
 import { authRoutes } from './auth.ts';
+import { leadRoutes } from './leads.ts';
 import { widgetRoutes } from './widgets.ts';
 
 /**
@@ -38,4 +39,5 @@ export const panelRoutes: FastifyPluginAsync = async (app) => {
   // только внутри этого скоупа она наследует CSRF-хук и формат ошибок выше.
   await app.register(authRoutes);
   await app.register(widgetRoutes);
+  await app.register(leadRoutes);
 };
