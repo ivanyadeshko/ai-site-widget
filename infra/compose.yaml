@@ -120,7 +120,13 @@ services:
     healthcheck:
       # /api/health не ходит в Payload/БД: здоровье контейнера не зависит от
       # того, засеян ли контент.
-      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
+      #
+      # 127.0.0.1, а НЕ localhost: standalone-сервер Next слушает только
+      # IPv4 0.0.0.0:3000, а `localhost` внутри контейнера резолвится сначала
+      # в ::1 — busybox-wget получает connection refused и контейнер вечно
+      # висит unhealthy при полностью живом сервисе (проверено: 22 подряд
+      # неудачных пробы, при этом curl снаружи отдаёт 200).
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/health"]
       interval: 15s
       timeout: 5s
       retries: 5
