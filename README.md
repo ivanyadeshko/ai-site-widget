@@ -15,7 +15,7 @@ LiveKit-агент). Собственной БД для разговоров у 
 | `embed/loader/` | `w.js` — сниппет, который вставляет владелец сайта |
 | `embed/app/` | Vue 3 iframe-приложение (чат + голос) |
 | `embed/public/` | Статика демо-страницы (`demo.html`) |
-| `contracts/` | Синхронизированный контракт ядра (`core-api.d.ts` из `openapi.core.yaml`) |
+| `contracts/` | Вендорённый контракт ядра, запиненный по коммиту (`core.pin.json` → `openapi.core.yaml` → `core-api.d.ts`), см. «Контракт ядра» ниже |
 | `infra/` | Dockerfile, compose дев-стенда, `.env.example`, `deploy.sh` |
 | `.superpowers/sdd/` | SDD-леджер задачи (планы/брифы/отчёты тасков) |
 
@@ -310,26 +310,68 @@ verdicts=6`; коды выхода 0/1/2/3 и полный разбор сцен
 выше) — гонять пачкой не стоит. Красный смок — чинить код, а НЕ ослаблять
 ассерт.
 
+## Контракт ядра: пин, а не `origin/main`
+
+Виджет держит вендорённую копию OpenAPI ядра. Источник правды — **пин**
+`contracts/core.pin.json`: коммит ядра, тег его образов и sha256 спеки на этом
+коммите.
+
+```
+contracts/core.pin.json   ← коммит ядра (SSOT)
+        │  contracts/sync.mjs
+        ▼
+contracts/openapi.core.yaml   ← байт-в-байт contracts/openapi.yaml ядра на core_sha
+        │  openapi-typescript
+        ▼
+contracts/core-api.d.ts   ← типы, которые тянет backend/src/core/types.ts
+```
+
+```bash
+npm run contracts:sync  -w @aski/site-widget-backend   # подтянуть по пину + перегенерить .d.ts
+npm run contracts:check -w @aski/site-widget-backend   # только сверка (гейт CI)
+```
+
+`sync.mjs` берёт спеку двумя путями: из **локального чекаута ядра**
+(`git show <core_sha>:contracts/openapi.yaml`, по умолчанию сосед
+`../ai-conversation-core`, переопределяется `CORE_REPO`) либо, если чекаута нет
+(это и есть случай CI), из **GitHub Contents API** с `?ref=<core_sha>` и токеном
+из `GH_TOKEN`/`GITHUB_TOKEN`. Режим форсируется `CORE_CONTRACTS_SOURCE=git|api`.
+Полученные байты в любом случае сверяются с `spec_sha256` пина — расхождение
+означает испорченный пин, а не дрейф контракта, и падает отдельным сообщением.
+
+Пин двигает **не человек**: ядро после публикации образов шлёт
+`repository_dispatch` (`core-released`), а `.github/workflows/core-pin-bump.yml`
+переписывает пин, перегенерирует `contracts/` и открывает PR
+`chore(contracts): bump core pin to sha-XXXXXXX`. Ревьюер читает дифф спеки —
+это единственное место, где изменение внешнего контракта видно глазами.
+
+Для обоих механизмов нужны секреты (см. «Известные ограничения»):
+`CORE_CONTRACTS_TOKEN` в этом репозитории и `WIDGET_DISPATCH_TOKEN` в ядре.
+
 ## CI (`.github/workflows/ci.yml`)
 
 Гейт репозитория (`ubuntu-latest`, npm workspaces):
 
 1. `npm ci` — весь монорепо разом (общий `package-lock.json`).
-2. Тестовый Postgres — `infra/compose.test.yaml` (порт `55433`, БД
+2. Гейт дрейфа контракта ядра — `contracts:check` по пину (см. раздел выше).
+   Мягкий, пока не заведён секрет `CORE_CONTRACTS_TOKEN`: без него шаг пишет
+   `::warning` и выходит нулём, потому что приватное ядро штатным
+   `github.token` публичного репозитория не читается в принципе.
+3. Тестовый Postgres — `infra/compose.test.yaml` (порт `55433`, БД
    `widget_test`) — тот же compose-файл, что и локальный `npm run
    db:test:up` в `backend/package.json`; порт совпадает с фолбэком
    `DATABASE_URL` в `backend/test/helpers/globalSetup.ts`, отдельно
    прокидывать переменную в CI не нужно.
-3. `npm run typecheck --workspaces --if-present` — `tsc` (backend),
+4. `npm run typecheck --workspaces --if-present` — `tsc` (backend),
    `vue-tsc` (embed/app), `tsc` (embed/loader).
-4. `npm run test --workspaces --if-present` — vitest во всех трёх
+5. `npm run test --workspaces --if-present` — vitest во всех трёх
    воркспейсах; backend-тесты сами мигрируют тестовую БД на старте
    (`globalSetup`).
-5. `npm run build --workspaces --if-present` — это ЖЕ бюджет-гейт `w.js`:
+6. `npm run build --workspaces --if-present` — это ЖЕ бюджет-гейт `w.js`:
    `embed/loader`'s `build`-скрипт цепочкой гоняет `vite build && make-shim
    && size-check.mjs` (потолок 8КБ gzip); отдельного шага не заводил —
    размер уже проверяется билдом, дублировать нечем.
-6. Отдельная джоба `docker-build` — просто `docker build -f infra/Dockerfile .`
+7. Отдельная джоба `docker-build` — просто `docker build -f infra/Dockerfile .`
    без публикации (реестр образов — после MVP, см. `infra/deploy.sh`:
    раскатка = rsync исходников + сборка на месте).
 
@@ -342,3 +384,16 @@ verdicts=6`; коды выхода 0/1/2/3 и полный разбор сцен
 - Кабинета для управления виджетами нет — первый (и единственный на MVP)
   виджет заводится прямым SQL (см. выше).
 - `?token=` вместо правки `demo.html` — не реализовано.
+- **Секреты кросс-репо-пина не заведены** (их создаёт человек, не CI):
+  - `CORE_CONTRACTS_TOKEN` — здесь, в `ai-site-widget`. Fine-grained PAT,
+    **только** `Contents: Read-only` на `ivanyadeshko/ai-conversation-core`.
+    Пока его нет, гейт дрейфа в `ci.yml` пишет `::warning` и пропускает
+    проверку, а `core-pin-bump.yml` падает (без чтения ядра ему нечего делать).
+  - `WIDGET_DISPATCH_TOKEN` — в `ai-conversation-core`. Fine-grained PAT,
+    `Contents: Read-write` на `ivanyadeshko/ai-site-widget` (право слать
+    `repository_dispatch`). Пока его нет, ядро после релиза пишет `::warning`
+    и не уведомляет виджет — пин двигают руками
+    (Actions → «core pin bump» → `workflow_dispatch`).
+  - Плюс настройка репозитория: Settings → Actions → General → **Allow GitHub
+    Actions to create and approve pull requests** — иначе `core-pin-bump.yml`
+    не сможет открыть PR штатным `GITHUB_TOKEN`.

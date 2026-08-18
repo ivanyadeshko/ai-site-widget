@@ -47,6 +47,39 @@ jobs:
       - name: npm ci
         run: npm ci
 
+      # Гейт дрейфа контракта ядра: вендорённая copy contracts/openapi.core.yaml
+      # обязана совпадать с contracts/openapi.yaml ядра НА КОММИТЕ ИЗ ПИНА
+      # (contracts/core.pin.json). Спеку тянет contracts/sync.mjs — на раннере
+      # соседнего чекаута ядра нет, поэтому режим один: GitHub Contents API
+      # с ?ref=<core_sha>.
+      #
+      # ПОЧЕМУ ТОЛЬКО secrets.CORE_CONTRACTS_TOKEN, без `|| github.token`.
+      # Ядро (ivanyadeshko/ai-conversation-core) — ПРИВАТНЫЙ репозиторий, а
+      # виджет — ПУБЛИЧНЫЙ; штатный github.token — installation-токен, скоуп
+      # которого ограничен репозиторием прогона, и на чужое приватное ядро он
+      # получит 404 (GitHub не подтверждает существование приватных репо).
+      # Фолбэк `|| github.token` был бы хуже отсутствия фолбэка: GH_TOKEN
+      # никогда не пуст → мягкая ветка ниже не сработала бы → гейт падал бы
+      # ВСЕГДА и на всех PR, включая форки, с невнятным 404. Нужен отдельный
+      # fine-grained PAT (read-only Contents на ядре) в секрете
+      # CORE_CONTRACTS_TOKEN.
+      #
+      # МЯГКО ДО ЗАВЕДЕНИЯ СЕКРЕТА. Пока секрета нет — ::warning + exit 0, а не
+      # красный CI: гейт вводится вместе с этим файлом, а секрет заводит человек
+      # руками, и блокировать все PR репозитория на этот промежуток нечестно.
+      # Побочный (и желаемый) эффект: на PR из форков секреты не пробрасываются
+      # вовсе, и такой PR тоже не упрётся в 404 — он просто пройдёт без этого
+      # гейта, а дрейф поймает прогон на ветке апстрима.
+      - name: Гейт контракта ядра (пин contracts/core.pin.json)
+        env:
+          GH_TOKEN: ${{ secrets.CORE_CONTRACTS_TOKEN }}
+        run: |
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::warning title=Гейт дрейфа контракта неактивен::нет секрета CORE_CONTRACTS_TOKEN (fine-grained PAT, read-only Contents на ivanyadeshko/ai-conversation-core) — спека ядра не проверена"
+            exit 0
+          fi
+          npm run contracts:check -w @aski/site-widget-backend
+
       # Тестовый Postgres — тот же compose-файл, что описан в backend/package.json
       # (`npm run db:test:up`) и которым разработчик поднимает БД локально:
       # порт 55433, БД widget_test — совпадает с фолбэком DATABASE_URL в

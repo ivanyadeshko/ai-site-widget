@@ -43,6 +43,12 @@ jobs:
   ci:
     name: Гейт образа
     uses: ./.github/workflows/ci.yml
+    # secrets: inherit — иначе вызванный workflow НЕ видит секретов вызывающего
+    # (workflow_call не наследует их по умолчанию), и гейт дрейфа контракта в
+    # ci.yml молча ушёл бы в мягкую ветку «нет CORE_CONTRACTS_TOKEN» на каждом
+    # релизе. То есть образ уезжал бы в GHCR без проверки контракта ядра —
+    # ровно там, где она нужнее всего.
+    secrets: inherit
 
   publish:
     name: Publish image

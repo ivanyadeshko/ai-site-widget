@@ -1,0 +1,231 @@
+name: core pin bump
+
+# Авто-подъём пина контракта ядра (contracts/core.pin.json) по сигналу ЯДРА.
+#
+# Цепочка целиком:
+#   ядро (ivanyadeshko/ai-conversation-core), build-and-push.yml, после того как
+#   ОБА образа уехали в GHCR
+#     → repository_dispatch event_type=core-released с
+#       client_payload {core_sha, core_image_tag, spec_sha256}
+#     → этот workflow: пишет пин, перегенерирует contracts/ по нему, открывает PR
+#     → человек читает дифф контракта и мёржит (или не мёржит).
+#
+# Почему PR, а не прямой коммит в main: смена контракта ядра — это возможный
+# ломающий дифф у ПОТРЕБИТЕЛЯ (backend/src/core/types.ts импортирует
+# contracts/core-api.d.ts). Автомат имеет право сообщить и подготовить, но не
+# имеет права молча переписать main.
+#
+# Почему `gh pr create` руками, а не peter-evans/create-pull-request:
+#   1. Репозиторий ПУБЛИЧНЫЙ, а джобе нужны `contents: write` +
+#      `pull-requests: write`. Каждое стороннее действие в таком контексте —
+#      surface для supply-chain (перемещённый тег = новый код с правом писать в
+#      репозиторий); пин по sha лечит это, но превращает обновления в ручной
+#      труд, который никто не делает.
+#   2. Все остальные workflow этого репо используют только first-party actions
+#      (actions/*, docker/*) — не заводим исключение ради пяти команд.
+#   3. `gh` предустановлен на ubuntu-latest, а вся операция — ветка, коммит,
+#      push, pr create. Поведение видно целиком, без опций-«магии».
+#
+# ⚠️ ГОЧА, из-за которой в теле PR стоит инструкция: PR, ОТКРЫТЫЙ штатным
+# GITHUB_TOKEN, НЕ ЗАПУСКАЕТ workflow по `push`/`pull_request` — это защита
+# GitHub от рекурсии. То есть ci.yml на авто-PR сам не заведётся. Поэтому
+# джоба прогоняет здесь же самое важное из гейта (contracts:check + typecheck
+# всех воркспейсов — ровно то, что ломает смена контракта), а человеку
+# остаётся закрыть/открыть PR, чтобы получить полный CI перед мёржем.
+
+on:
+  repository_dispatch:
+    types: [core-released]
+  # Ручной путь: тот же bump без релиза ядра (починить разъехавшийся пин,
+  # подтянуть конкретный коммит ядра). repository_dispatch и workflow_dispatch
+  # оба исполняются от ДЕФОЛТНОЙ ВЕТКИ — иначе этого файла для них не существует.
+  workflow_dispatch:
+    inputs:
+      core_sha:
+        description: Полный 40-символьный sha коммита ядра
+        required: true
+      core_image_tag:
+        description: Тег образов ядра (sha-XXXXXXX)
+        required: true
+      spec_sha256:
+        description: sha256 файла contracts/openapi.yaml ядра на этом коммите
+        required: true
+
+# Два релиза ядра подряд не должны гонять один и тот же PR-бранч.
+# cancel-in-progress=false: прогон, уже дошедший до push, обрывать нельзя.
+concurrency:
+  group: core-pin-bump
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    name: bump core pin → PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Payload приходит СНАРУЖИ (repository_dispatch — это HTTP-вызов с чужим
+      # токеном) и уезжает дальше в URL GitHub API и в имя git-ветки. Проверяем
+      # формат ДО первого использования и только через env, никогда прямой
+      # подстановкой ${{ }} в тело скрипта.
+      - name: Разобрать и проверить payload
+        id: payload
+        env:
+          CORE_SHA: ${{ github.event.client_payload.core_sha || inputs.core_sha }}
+          CORE_IMAGE_TAG: ${{ github.event.client_payload.core_image_tag || inputs.core_image_tag }}
+          SPEC_SHA256: ${{ github.event.client_payload.spec_sha256 || inputs.spec_sha256 }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "${CORE_SHA}" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::core_sha должен быть полным 40-символьным sha, получено '${CORE_SHA}'"
+            exit 1
+          fi
+          if ! printf '%s' "${CORE_IMAGE_TAG}" | grep -Eq '^sha-[0-9a-f]{7}$'; then
+            echo "::error::core_image_tag должен быть sha-XXXXXXX, получено '${CORE_IMAGE_TAG}'"
+            exit 1
+          fi
+          if ! printf '%s' "${SPEC_SHA256}" | grep -Eq '^[0-9a-f]{64}$'; then
+            echo "::error::spec_sha256 должен быть 64-символьным hex, получено '${SPEC_SHA256}'"
+            exit 1
+          fi
+          {
+            echo "core_sha=${CORE_SHA}"
+            echo "core_image_tag=${CORE_IMAGE_TAG}"
+            echo "spec_sha256=${SPEC_SHA256}"
+            echo "short=${CORE_SHA:0:7}"
+          } >> "$GITHUB_OUTPUT"
+
+      # Уже на этом пине — выходим до установки зависимостей.
+      - name: Пин уже актуален?
+        id: state
+        env:
+          CORE_SHA: ${{ steps.payload.outputs.core_sha }}
+        run: |
+          set -euo pipefail
+          current="$(jq -r '.core_sha' contracts/core.pin.json)"
+          if [ "${current}" = "${CORE_SHA}" ]; then
+            echo "::notice::пин уже указывает на ${CORE_SHA} — делать нечего"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "previous=${current}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.state.outputs.skip == 'false'
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: npm ci
+        if: steps.state.outputs.skip == 'false'
+        run: npm ci
+
+      # jq, а не sed: пин — JSON, и формат записи (2 пробела + перевод строки в
+      # конце) обязан совпадать с тем, что лежит в репозитории, иначе каждый
+      # bump тащит косметический дифф.
+      - name: Записать новый пин
+        if: steps.state.outputs.skip == 'false'
+        env:
+          CORE_SHA: ${{ steps.payload.outputs.core_sha }}
+          CORE_IMAGE_TAG: ${{ steps.payload.outputs.core_image_tag }}
+          SPEC_SHA256: ${{ steps.payload.outputs.spec_sha256 }}
+        run: |
+          set -euo pipefail
+          jq -n --indent 2 \
+            --arg core_sha "${CORE_SHA}" \
+            --arg core_image_tag "${CORE_IMAGE_TAG}" \
+            --arg spec_sha256 "${SPEC_SHA256}" \
+            '{core_sha: $core_sha, core_image_tag: $core_image_tag, spec_sha256: $spec_sha256}' \
+            > contracts/core.pin.json.new
+          mv contracts/core.pin.json.new contracts/core.pin.json
+          cat contracts/core.pin.json
+
+      # Здесь токен ОБЯЗАТЕЛЕН и мягкой ветки нет (в отличие от гейта в ci.yml):
+      # без чтения приватного ядра этот workflow не может сделать ровно то, ради
+      # чего запущен. Красный прогон — и есть уведомление «секрет не заведён».
+      - name: Перегенерировать contracts/ по новому пину
+        if: steps.state.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.CORE_CONTRACTS_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::error title=Нет секрета CORE_CONTRACTS_TOKEN::fine-grained PAT с read-only Contents на ivanyadeshko/ai-conversation-core обязателен: спеку приватного ядра иначе не прочитать"
+            exit 1
+          fi
+          npm run contracts:sync -w @aski/site-widget-backend
+
+      # Замена автоматического CI на авто-PR (см. гочу в шапке): сверка пина с
+      # тем, что реально получилось, и typecheck всех воркспейсов — ровно то,
+      # что ломает смена контракта (backend/src/core/types.ts тянет
+      # contracts/core-api.d.ts).
+      - name: Проверить результат (contracts:check + typecheck)
+        if: steps.state.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.CORE_CONTRACTS_TOKEN }}
+        run: |
+          set -euo pipefail
+          npm run contracts:check -w @aski/site-widget-backend
+          npm run typecheck --workspaces --if-present
+
+      - name: Ветка, коммит, PR
+        if: steps.state.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHORT: ${{ steps.payload.outputs.short }}
+          CORE_SHA: ${{ steps.payload.outputs.core_sha }}
+          CORE_IMAGE_TAG: ${{ steps.payload.outputs.core_image_tag }}
+          PREVIOUS: ${{ steps.state.outputs.previous }}
+        run: |
+          set -euo pipefail
+
+          if git diff --quiet -- contracts/; then
+            echo "::notice::пин сменился, но артефакты contracts/ не изменились — PR не нужен"
+            exit 0
+          fi
+
+          branch="chore/core-pin-${SHORT}"
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git checkout -B "${branch}"
+          git add contracts/
+          git commit -m "chore(contracts): bump core pin to ${CORE_IMAGE_TAG}" \
+                     -m "Ядро ${CORE_SHA} (образы ${CORE_IMAGE_TAG}). Пин и вендорённый контракт подняты автоматически по repository_dispatch из ai-conversation-core." \
+                     -m 'Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>'
+          # --force: повторный dispatch того же sha должен переиспользовать ветку,
+          # а не падать на «уже существует».
+          git push --force origin "${branch}"
+
+          if gh pr view "${branch}" --json number >/dev/null 2>&1; then
+            echo "::notice::PR для ${branch} уже открыт — обновлён push'ем"
+            exit 0
+          fi
+
+          # Разделитель НЕ в кавычках — нужны подстановки ${...}; обратные
+          # кавычки markdown поэтому экранированы.
+          cat > "${RUNNER_TEMP}/pr-body.md" <<EOF
+          Автоматический подъём пина контракта ядра по \`repository_dispatch\` (\`core-released\`) из \`ivanyadeshko/ai-conversation-core\`.
+
+          | | |
+          |---|---|
+          | Ядро было | \`${PREVIOUS}\` |
+          | Ядро стало | \`${CORE_SHA}\` |
+          | Образы ядра | \`${CORE_IMAGE_TAG}\` |
+
+          Что в диффе: \`contracts/core.pin.json\` + перегенерённые по нему \`contracts/openapi.core.yaml\` и \`contracts/core-api.d.ts\`.
+
+          **Перед мёржем прочитайте дифф \`openapi.core.yaml\`** — это изменение внешнего контракта, от которого зависит \`backend/src/core/\`.
+
+          ⚠️ **CI на этом PR не запустился сам.** PR открыт штатным \`GITHUB_TOKEN\`, а GitHub намеренно не триггерит \`push\`/\`pull_request\`-workflow'ы от таких PR (защита от рекурсии). В самой джобе уже прошли \`contracts:check\` и \`typecheck\` всех воркспейсов; чтобы получить полный прогон \`ci.yml\` — закройте и снова откройте этот PR.
+          EOF
+
+          gh pr create \
+            --base main \
+            --head "${branch}" \
+            --title "chore(contracts): bump core pin to ${CORE_IMAGE_TAG}" \
+            --body-file "${RUNNER_TEMP}/pr-body.md"
