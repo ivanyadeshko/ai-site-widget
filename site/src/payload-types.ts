@@ -167,6 +167,86 @@ export interface Page {
    */
   slug: string;
   /**
+   * Блоки лендинга. Порядок в списке = порядок на странице. Если блоков нет — показывается content.
+   */
+  layout?:
+    | (
+        | {
+            /**
+             * Маленькая плашка над заголовком.
+             */
+            badge?: string | null;
+            title: string;
+            subtitle?: string | null;
+            /**
+             * Ведёт в кабинет, на регистрацию. URL берётся из окружения, не из контента.
+             */
+            primaryLabel?: string | null;
+            /**
+             * Вторая кнопка — вход в кабинет. Пусто = кнопки нет.
+             */
+            secondaryLabel?: string | null;
+            id?: string | null;
+            blockName?: string | null;
+            blockType: 'hero';
+          }
+        | {
+            title: string;
+            subtitle?: string | null;
+            items?:
+              | {
+                  title: string;
+                  text: string;
+                  id?: string | null;
+                }[]
+              | null;
+            id?: string | null;
+            blockName?: string | null;
+            blockType: 'features';
+          }
+        | {
+            title: string;
+            subtitle?: string | null;
+            steps?:
+              | {
+                  title: string;
+                  text: string;
+                  id?: string | null;
+                }[]
+              | null;
+            id?: string | null;
+            blockName?: string | null;
+            blockType: 'how-it-works';
+          }
+        | {
+            id?: string | null;
+            blockName?: string | null;
+            blockType: 'pricing';
+          }
+        | {
+            title: string;
+            items?:
+              | {
+                  question: string;
+                  answer: string;
+                  id?: string | null;
+                }[]
+              | null;
+            id?: string | null;
+            blockName?: string | null;
+            blockType: 'faq';
+          }
+        | {
+            title: string;
+            subtitle?: string | null;
+            primaryLabel: string;
+            id?: string | null;
+            blockName?: string | null;
+            blockType: 'cta';
+          }
+      )[]
+    | null;
+  /**
    * Текстовое тело страницы (оферта, политика). Для лендинга используй блоки.
    */
   content?: {
@@ -354,6 +434,80 @@ export interface UsersSelect<T extends boolean = true> {
 export interface PagesSelect<T extends boolean = true> {
   title?: T;
   slug?: T;
+  layout?:
+    | T
+    | {
+        hero?:
+          | T
+          | {
+              badge?: T;
+              title?: T;
+              subtitle?: T;
+              primaryLabel?: T;
+              secondaryLabel?: T;
+              id?: T;
+              blockName?: T;
+            };
+        features?:
+          | T
+          | {
+              title?: T;
+              subtitle?: T;
+              items?:
+                | T
+                | {
+                    title?: T;
+                    text?: T;
+                    id?: T;
+                  };
+              id?: T;
+              blockName?: T;
+            };
+        'how-it-works'?:
+          | T
+          | {
+              title?: T;
+              subtitle?: T;
+              steps?:
+                | T
+                | {
+                    title?: T;
+                    text?: T;
+                    id?: T;
+                  };
+              id?: T;
+              blockName?: T;
+            };
+        pricing?:
+          | T
+          | {
+              id?: T;
+              blockName?: T;
+            };
+        faq?:
+          | T
+          | {
+              title?: T;
+              items?:
+                | T
+                | {
+                    question?: T;
+                    answer?: T;
+                    id?: T;
+                  };
+              id?: T;
+              blockName?: T;
+            };
+        cta?:
+          | T
+          | {
+              title?: T;
+              subtitle?: T;
+              primaryLabel?: T;
+              id?: T;
+              blockName?: T;
+            };
+      };
   content?: T;
   seo?:
     | T

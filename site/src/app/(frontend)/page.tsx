@@ -1,10 +1,21 @@
+import type { Metadata } from 'next'
 import { RichText } from '@payloadcms/richtext-lexical/react'
 import type { SerializedEditorState } from '@payloadcms/richtext-lexical/lexical'
+import { PageBlocks } from '@/lib/blockRenderer'
 import { REGISTER_URL } from '@/lib/links'
 import { findPageBySlug } from '@/lib/pages'
 
 // Страницы читают Payload в рантайме — `next build` не должен требовать живую БД.
 export const dynamic = 'force-dynamic'
+
+export async function generateMetadata(): Promise<Metadata> {
+  const page = await findPageBySlug('home')
+  if (!page?.seo) return {}
+  return {
+    title: page.seo.title || undefined,
+    description: page.seo.description || undefined,
+  }
+}
 
 export default async function HomePage() {
   const page = await findPageBySlug('home')
@@ -27,12 +38,14 @@ export default async function HomePage() {
     )
   }
 
+  if (page.layout && page.layout.length > 0) {
+    return <PageBlocks layout={page.layout} />
+  }
+
   return (
     <article className="wrap section prose">
       <h1 className="section__title">{page.title}</h1>
-      {page.content ? (
-        <RichText data={page.content as SerializedEditorState} />
-      ) : null}
+      {page.content ? <RichText data={page.content as SerializedEditorState} /> : null}
     </article>
   )
 }

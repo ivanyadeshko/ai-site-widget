@@ -2,6 +2,7 @@ import type { Metadata } from 'next'
 import { notFound } from 'next/navigation'
 import { RichText } from '@payloadcms/richtext-lexical/react'
 import type { SerializedEditorState } from '@payloadcms/richtext-lexical/lexical'
+import { PageBlocks } from '@/lib/blockRenderer'
 import { findPageBySlug } from '@/lib/pages'
 
 export const dynamic = 'force-dynamic'
@@ -25,6 +26,10 @@ export default async function SlugPage({ params }: Args) {
 
   const page = await findPageBySlug(slug)
   if (!page) notFound()
+
+  if (page.layout && page.layout.length > 0) {
+    return <PageBlocks layout={page.layout} />
+  }
 
   return (
     <article className="wrap section prose">

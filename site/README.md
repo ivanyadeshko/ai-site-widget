@@ -117,15 +117,34 @@ curl -fsS localhost:3000/api/health  # {"status":"ok"}
 - Коллекции: `pages` (лендинг и текстовые страницы; `slug: home` = `/`),
   `posts` (блог), `media` (картинки), `users` (редакторы CMS).
 - Globals: `header`, `pricing`, `footer`.
+- Блоки лендинга — поле `pages.layout`: `hero`, `features`, `how-it-works`,
+  `pricing`, `faq`, `cta`. Конфиг поля — `src/blocks/*/config.ts`, рендер —
+  `src/blocks/*/Component.tsx`, диспетчер — `src/lib/blockRenderer.tsx`.
+  Блок `pricing` собственных полей не имеет: карточки берутся из global
+  `pricing`, чтобы цены жили в одном месте.
 - Ссылки на кабинет строятся в `src/lib/links.ts` из `NEXT_PUBLIC_APP_URL`
   (`/panel/register`, `/panel/login`). В контенте CMS доменов кабинета нет и
   быть не должно — иначе после переезда стенда кнопки уведут не туда.
+- SEO: `/robots.txt` (`src/app/(frontend)/robots.ts`, `/admin` закрыт от
+  индексации) и `/sitemap.xml` (страницы из Payload, `home` → `/`).
+
+### Сид стартового контента
+
+`POST /api/seed` пересоздаёт домашнюю страницу и перезаписывает globals.
+Роут **деструктивен** и закрыт двумя условиями сразу — иначе отвечает 404:
+
+```bash
+# в окружении сервиса: ENABLE_SEED_ROUTES=1
+curl -X POST localhost:3000/api/seed -H "x-seed-secret: $PAYLOAD_SECRET"
+```
+
+После первичного засева флаг снимают. Тексты — `src/seed/landing.ts`.
 
 ---
 
 ## Публичный репозиторий
 
-Тексты лендинга, тарифы и FAQ лежат в открытом коде.
+Тексты лендинга, тарифы и FAQ лежат в открытом коде (`src/seed/landing.ts`).
 Перед коммитом контента перечитайте его глазами конкурента: никакой
 себестоимости, внутренних коэффициентов, неанонсированных планов и упоминаний
 внутреннего устройства (ядро, его домены). Секреты — только через `secrets.*`

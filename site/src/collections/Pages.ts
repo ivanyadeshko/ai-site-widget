@@ -1,5 +1,11 @@
 import { lexicalEditor } from '@payloadcms/richtext-lexical'
 import type { CollectionConfig } from 'payload'
+import { CtaBlock } from '../blocks/Cta/config'
+import { FaqBlock } from '../blocks/Faq/config'
+import { FeaturesBlock } from '../blocks/Features/config'
+import { HeroBlock } from '../blocks/Hero/config'
+import { HowItWorksBlock } from '../blocks/HowItWorks/config'
+import { PricingBlock } from '../blocks/Pricing/config'
 
 /**
  * Страницы лендинга. Домашняя — `slug: 'home'` (рендерится на `/`),
@@ -26,6 +32,15 @@ export const Pages: CollectionConfig = {
       unique: true,
       index: true,
       admin: { description: 'URL-путь страницы. `home` = главная (/).' },
+    },
+    {
+      name: 'layout',
+      type: 'blocks',
+      blocks: [HeroBlock, FeaturesBlock, HowItWorksBlock, PricingBlock, FaqBlock, CtaBlock],
+      admin: {
+        description:
+          'Блоки лендинга. Порядок в списке = порядок на странице. Если блоков нет — показывается content.',
+      },
     },
     {
       name: 'content',
