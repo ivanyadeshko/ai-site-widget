@@ -29,6 +29,12 @@ export type AppConfig = {
   sessionTtlDays: number;
   /** Origin SPA панели: единственный допустимый на не-GET /api/v1/* (D-5). */
   panelOrigin: string;
+  /**
+   * Origin, с которого раздаётся `/w.js`. Отличается от `publicOrigin` только
+   * на мультидоменной раскладке (cdn.vell.pro + app.vell.pro, Task 24) — и
+   * ровно тогда в embed-сниппет добавляется `data-host` (widgets/snippet.ts).
+   */
+  cdnOrigin: string;
   /** Флаг Secure у cookie сессии: на http-стенде кука с Secure не доедет вовсе. */
   cookieSecure: boolean;
   /** Порог неудачных входов по ОДНОМУ email и длина окна блокировки. */
@@ -94,6 +100,9 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
     // каждый существующий стенд перестал бы подниматься на этом релизе.
     sessionTtlDays: int(env.SESSION_TTL_DAYS, 30),
     panelOrigin,
+    // Фолбэк на публичный origin: существующие стенды продолжают работать без
+    // единой правки .env, а сниппет на них остаётся однодоменным (без data-host).
+    cdnOrigin: trimSlash(env.WIDGET_CDN_ORIGIN ?? env.WIDGET_PUBLIC_ORIGIN!),
     // На https-происхождении Secure включается сам; явный SESSION_COOKIE_SECURE=1
     // форсирует его на раскладке, где TLS терминируется выше по цепочке.
     cookieSecure: (env.SESSION_COOKIE_SECURE ?? '') === '1' || panelOrigin.startsWith('https://'),

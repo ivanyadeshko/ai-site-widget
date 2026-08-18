@@ -40,6 +40,9 @@ export async function buildTestApp(overrides: Partial<AppConfig> = {}): Promise<
     cookieSecure: false,
     loginMaxFailures: 10,
     loginLockMinutes: 15,
+    // Однодоменная раскладка по умолчанию: embed-сниппет без data-host. Разъезд
+    // доменов проверяется точечно — переопределением overrides в самом тесте.
+    cdnOrigin: 'https://widget.aski.pro',
     ...overrides,
   };
   const app = await buildApp({

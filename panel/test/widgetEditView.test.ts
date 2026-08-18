@@ -70,6 +70,9 @@ describe('экран настройки виджета', () => {
     const wrapper = await mountEdit();
     expect(wrapper.text()).toContain(WIDGET.publish_token);
     expect(wrapper.text()).toMatch(/не секрет/i);
+    // Экран установки обязан быть достижим отсюда: иначе владелец никогда не
+    // найдёт готовый сниппет и соберёт его руками с ошибкой.
+    expect(wrapper.find('[data-test="install-link"]').attributes('href')).toBe('/widgets/w-1/install');
   });
 
   it('после ротации показывает, что старый сниппет мёртв, и новый токен', async () => {

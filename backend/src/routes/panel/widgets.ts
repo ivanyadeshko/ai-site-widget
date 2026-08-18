@@ -1,11 +1,13 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { requireAccount } from '../../auth/guards.ts';
+import type { AppConfig } from '../../config.ts';
 import {
   countWidgetsByAccount, deleteWidget, findWidgetByIdForAccount, insertWidget,
   listWidgetsByAccount, rotatePublishToken, updateWidget,
   type WidgetPatch, type WidgetRow,
 } from '../../db/repositories/widgets.ts';
 import { ApiError } from '../../http/errors.ts';
+import { buildEmbedSnippet } from '../../widgets/snippet.ts';
 import { parseTheme, type WidgetTheme } from '../../widgets/theme.ts';
 import { generatePublishToken } from '../../widgets/tokens.ts';
 import {
@@ -35,12 +37,12 @@ export type WidgetPublic = {
   agent_config: WidgetRow['agent_config'];
   created_at: Date;
   theme: WidgetTheme;
-  /** Готовый <script> для вставки на сайт. Наполняется в Task 13. */
+  /** Готовый <script> для вставки на сайт — собран целиком, копируется как есть. */
   embed_snippet: string;
   app_url: string;
 };
 
-const toPublic = (widget: WidgetRow, publicOrigin: string): WidgetPublic => ({
+const toPublic = (widget: WidgetRow, config: AppConfig): WidgetPublic => ({
   id: widget.id,
   name: widget.name,
   publish_token: widget.publish_token,
@@ -49,8 +51,12 @@ const toPublic = (widget: WidgetRow, publicOrigin: string): WidgetPublic => ({
   agent_config: widget.agent_config,
   created_at: widget.created_at,
   theme: widget.theme,
-  embed_snippet: '',
-  app_url: `${publicOrigin}/app/${widget.publish_token}`,
+  embed_snippet: buildEmbedSnippet({
+    token: widget.publish_token,
+    cdnOrigin: config.cdnOrigin,
+    publicOrigin: config.publicOrigin,
+  }),
+  app_url: `${config.publicOrigin}/app/${widget.publish_token}`,
 });
 
 /**
@@ -73,7 +79,7 @@ export const widgetRoutes: FastifyPluginAsync = async (app) => {
 
   app.get('/widgets', async (req, reply) => {
     const widgets = await listWidgetsByAccount(app.deps.pool, req.account!.id);
-    return reply.send({ widgets: widgets.map((w) => toPublic(w, app.deps.config.publicOrigin)) });
+    return reply.send({ widgets: widgets.map((w) => toPublic(w, app.deps.config)) });
   });
 
   app.post<{ Body: { name?: unknown; agent_config?: unknown; allowed_origins?: unknown } }>(
@@ -109,13 +115,13 @@ export const widgetRoutes: FastifyPluginAsync = async (app) => {
           if ((err as { code?: unknown }).code !== '23505' || attempt === 1) throw err;
         }
       }
-      return reply.code(201).send({ widget: toPublic(widget!, app.deps.config.publicOrigin) });
+      return reply.code(201).send({ widget: toPublic(widget!, app.deps.config) });
     },
   );
 
   app.get<{ Params: { id: string } }>('/widgets/:id', async (req, reply) => {
     const widget = await load(req.params.id, req.account!.id);
-    return reply.send({ widget: toPublic(widget, app.deps.config.publicOrigin) });
+    return reply.send({ widget: toPublic(widget, app.deps.config) });
   });
 
   app.patch<{
@@ -145,7 +151,7 @@ export const widgetRoutes: FastifyPluginAsync = async (app) => {
 
     const updated = await updateWidget(app.deps.pool, req.params.id, accountId, patch);
     if (!updated) throw notFound();
-    return reply.send({ widget: toPublic(updated, app.deps.config.publicOrigin) });
+    return reply.send({ widget: toPublic(updated, app.deps.config) });
   });
 
   /**
@@ -178,7 +184,7 @@ export const widgetRoutes: FastifyPluginAsync = async (app) => {
         }
       }
       if (!widget) throw notFound();
-      return reply.send({ widget: toPublic(widget, app.deps.config.publicOrigin) });
+      return reply.send({ widget: toPublic(widget, app.deps.config) });
     },
   );
 

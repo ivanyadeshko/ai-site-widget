@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue';
-import { useRoute, useRouter } from 'vue-router';
+import { RouterLink, useRoute, useRouter } from 'vue-router';
 import {
   NAlert, NButton, NCard, NColorPicker, NDivider, NForm, NFormItem, NInput, NPopconfirm, NRadio,
   NRadioGroup, NSpace, NSpin, NSwitch, NText,
@@ -261,6 +261,9 @@ async function destroy(): Promise<void> {
       <n-card v-if="widget" title="Публичный токен">
         <n-space vertical size="small">
           <n-text code>{{ widget.publish_token }}</n-text>
+          <router-link data-test="install-link" :to="`/widgets/${widget.id}/install`">
+            Как установить виджет на сайт
+          </router-link>
           <!-- Токен НЕ секрет: он лежит в HTML сайта открытым текстом. Владелец
                обязан это знать, иначе перевыпуск будет восприниматься как
                «смена пароля» и делаться зря. -->

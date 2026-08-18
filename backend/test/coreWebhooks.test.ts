@@ -35,6 +35,7 @@ beforeAll(async () => {
       maxDialogsPerIpPerDay: 30, maxDurationS: 600, trustProxy: false, logLevel: 'silent',
       maxSessionsPerAccountPerDay: 300,
       sessionTtlDays: 30, panelOrigin: 'http://localhost:8200', cookieSecure: false,
+      cdnOrigin: 'http://localhost:8200',
       loginMaxFailures: 10, loginLockMinutes: 15,
     },
     pool,
