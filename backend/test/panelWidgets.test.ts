@@ -111,6 +111,27 @@ describe('панельный CRUD виджетов', () => {
     expect(mine.json().widget.name).toBe('Виджет магазина');
   });
 
+  it('изоляция держится и на ТЕМЕ: PATCH {theme} чужого виджета — 404, оформление соседа цело', async () => {
+    // Довесок выборочной проверки потока V. Тема пишется ОТДЕЛЬНОЙ веткой
+    // PATCH (parseTheme), и тело только с `theme` не проходит ни одной из
+    // проверок имени/оригинов. Порядок в ручке обязан оставаться «сначала
+    // владение, потом разбор тела»: иначе чужой виджет отвечал бы 422 на
+    // кривую тему, то есть подтверждал бы своё существование.
+    const alice = await owner('theme-iso-alice@example.com');
+    const bob = await owner('theme-iso-bob@example.com');
+    const widgetId = (await createWidget(alice)).json().widget.id;
+
+    const hijack = await app.inject({
+      method: 'PATCH', url: `/api/v1/widgets/${widgetId}`,
+      headers: { origin: ORIGIN, cookie: bob }, payload: { theme: { color: '#ff0000' } },
+    });
+    expect(hijack.statusCode).toBe(404);
+    expect(hijack.json().error.code).toBe('widget_not_found');
+
+    const mine = await app.inject({ method: 'GET', url: `/api/v1/widgets/${widgetId}`, headers: { cookie: alice } });
+    expect(mine.json().widget.theme).toEqual({});
+  });
+
   it('без cookie сессии CRUD закрыт целиком', async () => {
     const cookie = await owner('anon-owner@example.com');
     const id = (await createWidget(cookie)).json().widget.id;

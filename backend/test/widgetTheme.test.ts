@@ -2,7 +2,10 @@ import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildTestApp } from './helpers/app.ts';
 import { seedWidget, testPool, truncateAll } from './helpers/db.ts';
-import { DEFAULT_THEME, LAUNCHER_TITLE_PREFIX, TITLE_FALLBACK } from '../src/widgets/theme.ts';
+import {
+  DEFAULT_THEME, LAUNCHER_TITLE_MAX, LAUNCHER_TITLE_PREFIX, TITLE_FALLBACK, TITLE_MAX,
+} from '../src/widgets/theme.ts';
+import { NAME_MAX } from '../src/widgets/validation.ts';
 
 const pool = testPool();
 let app: FastifyInstance;
@@ -113,6 +116,42 @@ describe('тема виджета', () => {
       method: 'PATCH', url: `/api/v1/widgets/${widget.id}`,
       headers: { origin: ORIGIN, cookie },
       payload: { theme: { title: theme.title, launcher_title: theme.launcher_title } },
+    });
+    expect(echoed.statusCode).toBe(200);
+  });
+
+  it('имя РОВНО в 100 символов (потолок parseWidgetName) не ломает round-trip темы', async () => {
+    // Довесок выборочной проверки потока V: граница NAME_MAX проверялась только
+    // на ОТКАЗ (101 символ — 422), а на ПРОХОД — нет. Ровно на потолке сходятся
+    // два разных лимита: имя меряется в UTF-16 (parseWidgetName), а выведенный
+    // из него title — в code point'ах и режется по 40 (derived). Ошибка в любом
+    // из них ломает инвариант D-9 на самом длинном ЛЕГАЛЬНОМ имени, то есть у
+    // реального владельца, а не в синтетике.
+    const cookie = await owner('max-length-name@example.com');
+    const name = 'Консультант интернет-магазина оптовых поставок стройматериалов по всей стране круглосуточно ежедневн';
+    expect(name).toHaveLength(NAME_MAX);
+
+    const created = await app.inject({
+      method: 'POST', url: '/api/v1/widgets', headers: { origin: ORIGIN, cookie },
+      payload: {
+        name, agent_config: { instructions: 'Ты консультант магазина.' },
+        allowed_origins: ['https://shop.example'],
+      },
+    });
+    expect(created.statusCode).toBe(201);
+    const widget = created.json().widget;
+    expect(widget.name).toBe(name);
+
+    const theme = (await app.inject({ method: 'GET', url: `/w/v1/${widget.publish_token}/config` })).json().theme;
+    expect(Array.from(theme.title as string).length).toBe(TITLE_MAX);
+    expect(Array.from(theme.launcher_title as string).length).toBeLessThanOrEqual(LAUNCHER_TITLE_MAX);
+    // Обрезка не должна оставлять висящий пробел на срезе.
+    expect(theme.title).toBe((theme.title as string).trimEnd());
+
+    // Тот же инвариант, что и у «грязного» имени: отданное /config обязано
+    // приниматься обратно правилами темы.
+    const echoed = await patchTheme(cookie, widget.id, {
+      title: theme.title, launcher_title: theme.launcher_title,
     });
     expect(echoed.statusCode).toBe(200);
   });
