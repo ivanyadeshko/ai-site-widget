@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildTestApp } from './helpers/app.ts';
 import { seedWidget, testPool, truncateAll } from './helpers/db.ts';
-import { DEFAULT_THEME } from '../src/widgets/theme.ts';
+import { DEFAULT_THEME, LAUNCHER_TITLE_PREFIX, TITLE_FALLBACK } from '../src/widgets/theme.ts';
 
 const pool = testPool();
 let app: FastifyInstance;
@@ -71,12 +71,70 @@ describe('тема виджета', () => {
     }
   });
 
-  it('дефолты темы совпадают с фолбэками лоадера — константа продублирована в двух сборках', () => {
+  it('дефолты темы совпадают с фолбэками лоадера — константы продублированы в двух сборках', () => {
     // `embed/loader/src/loader.ts` держит ТЕ ЖЕ значения на случай отката
     // образа бэкенда (тогда /config приходит без theme). Общего файла у бандла
     // для чужого сайта и у бэкенда нет и быть не может, поэтому расхождение
     // ловится ровно здесь: меняя брендовый цвет, обязаны поменять оба места.
     expect(DEFAULT_THEME).toEqual({ color: '#2563eb', position: 'right', button_label: '💬' });
+    // Четвёртая копия — префикс подписи кнопки (loader.ts, фолбэк aria-label).
+    expect(LAUNCHER_TITLE_PREFIX).toBe('Открыть чат: ');
+  });
+
+  it('дефолтные title/launcher_title подчиняются ТЕМ ЖЕ правилам, что и заданные владельцем', async () => {
+    // Дефолт этих полей строится из ИМЕНИ виджета, а `parseWidgetName`
+    // разрешает и «<», и «>», и сотню символов. Без чистки /config отдавал бы
+    // наружу тему, которую сам же отверг бы на записи, — а инвариант D-9
+    // («лоадер не валидирует, потому что валидирует бэкенд») держится ровно на
+    // том, что из /config НЕ МОЖЕТ приехать не прошедшее правила значение.
+    const cookie = await owner('dirty-name@example.com');
+    const created = await app.inject({
+      method: 'POST', url: '/api/v1/widgets', headers: { origin: ORIGIN, cookie },
+      payload: {
+        name: `<img src=x onerror=alert(1)> ${'Э'.repeat(60)}`,
+        agent_config: { instructions: 'Ты консультант магазина.' },
+        allowed_origins: ['https://shop.example'],
+      },
+    });
+    expect(created.statusCode).toBe(201);
+    const widget = created.json().widget;
+
+    const theme = (await app.inject({ method: 'GET', url: `/w/v1/${widget.publish_token}/config` })).json().theme;
+    for (const field of ['title', 'launcher_title'] as const) {
+      expect(theme[field], `${field} протащил разметку`).not.toMatch(/[<>]/);
+    }
+    expect(Array.from(theme.title as string).length).toBeLessThanOrEqual(40);
+    expect(Array.from(theme.launcher_title as string).length).toBeLessThanOrEqual(60);
+
+    // Самая строгая формулировка инварианта: то, что отдал /config, обязано
+    // приниматься обратно валидацией темы. Не принимается — значит наружу
+    // уехало невалидное значение.
+    const echoed = await app.inject({
+      method: 'PATCH', url: `/api/v1/widgets/${widget.id}`,
+      headers: { origin: ORIGIN, cookie },
+      payload: { theme: { title: theme.title, launcher_title: theme.launcher_title } },
+    });
+    expect(echoed.statusCode).toBe(200);
+  });
+
+  it('имя из одних запрещённых символов не даёт пустого заголовка в /config', async () => {
+    // После чистки от «<» и «>» не остаётся ничего, а лоадер подставляет поля
+    // темы без проверок: пустой title стал бы пустой шапкой панели, а пустой
+    // launcher_title — кнопкой без имени для скринридера.
+    const cookie = await owner('junk-name@example.com');
+    const created = await app.inject({
+      method: 'POST', url: '/api/v1/widgets', headers: { origin: ORIGIN, cookie },
+      payload: {
+        name: '<<>>',
+        agent_config: { instructions: 'Ты консультант магазина.' },
+        allowed_origins: ['https://shop.example'],
+      },
+    });
+    const theme = (await app.inject({
+      method: 'GET', url: `/w/v1/${created.json().widget.publish_token}/config`,
+    })).json().theme;
+    expect(theme.title).toBe(TITLE_FALLBACK);
+    expect(theme.launcher_title).toBe(`${LAUNCHER_TITLE_PREFIX}${TITLE_FALLBACK}`);
   });
 
   it('POST принимает тему при создании и отвергает мусорную, а не глотает молча', async () => {
@@ -146,6 +204,19 @@ describe('тема виджета', () => {
     expect(config.json().theme.position).toBe('left');
     expect(config.json().theme.color).toBe(DEFAULT_THEME.color);
     expect(config.json().theme.button_label).toBe(DEFAULT_THEME.button_label);
+  });
+
+  it('theme:{} в теле СБРАСЫВАЕТ оформление к дефолтам', async () => {
+    // Пара к тесту ниже: отсутствие ключа тему не трогает, а пустой объект —
+    // именно сбрасывает. Без этой проверки «сброс» держался бы на комментарии.
+    const cookie = await owner('reset-theme@example.com');
+    const widget = (await createWidget(cookie)).json().widget;
+    await patchTheme(cookie, widget.id, { color: '#ff0000', title: 'Своё название' });
+    expect((await patchTheme(cookie, widget.id, {})).json().widget.theme).toEqual({});
+
+    const config = await app.inject({ method: 'GET', url: `/w/v1/${widget.publish_token}/config` });
+    expect(config.json().theme.color).toBe(DEFAULT_THEME.color);
+    expect(config.json().theme.title).toBe('Виджет магазина');
   });
 
   it('PATCH без поля theme её НЕ обнуляет (частичность патча)', async () => {

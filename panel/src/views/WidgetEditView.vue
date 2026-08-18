@@ -18,6 +18,21 @@ const LAUNCHER_TITLE_MAX = 60;
 const BUTTON_LABEL_MAX = 2;
 const DEFAULT_POSITION = 'right';
 
+/**
+ * Счётчик длины полей ТЕМЫ — обязан совпадать с бэкендом code-point в
+ * code-point (`parseText` в backend/src/widgets/theme.ts считает
+ * `Array.from(value).length`).
+ *
+ * Без этого пропа `n-input` вешает НАТИВНЫЙ атрибут `maxlength`, а тот считает
+ * UTF-16 code units: почти любое эмодзи — суррогатная пара, то есть одно «🤖»
+ * съедает сразу 2 из 2 разрешённых, и второй символ ввести уже нельзя, хотя
+ * бэкенд его принял бы. Передача `count-graphemes` заставляет naive-ui снять
+ * нативный атрибут и считать самому (naive-ui/lib/input/src/Input.js:395-407,
+ * 817). Поля агента (инструкции, приветствие) сюда НЕ входят: их бэкенд
+ * меряет обычной `.length`, и там нативный счёт как раз совпадает.
+ */
+const countCodePoints = (value: string): number => Array.from(value).length;
+
 const store = useWidgetsStore();
 const route = useRoute();
 const router = useRouter();
@@ -228,7 +243,12 @@ async function destroy(): Promise<void> {
 
           <n-form-item label="Значок на кнопке">
             <div data-test="theme-button-label">
-              <n-input v-model:value="form.themeButtonLabel" :maxlength="BUTTON_LABEL_MAX" placeholder="💬" />
+              <n-input
+                v-model:value="form.themeButtonLabel"
+                :maxlength="BUTTON_LABEL_MAX"
+                :count-graphemes="countCodePoints"
+                placeholder="💬"
+              />
             </div>
           </n-form-item>
 
@@ -237,6 +257,7 @@ async function destroy(): Promise<void> {
               <n-input
                 v-model:value="form.themeTitle"
                 :maxlength="TITLE_MAX"
+                :count-graphemes="countCodePoints"
                 placeholder="по умолчанию — название виджета"
               />
             </div>
@@ -247,6 +268,7 @@ async function destroy(): Promise<void> {
               <n-input
                 v-model:value="form.themeLauncherTitle"
                 :maxlength="LAUNCHER_TITLE_MAX"
+                :count-graphemes="countCodePoints"
                 placeholder="по умолчанию — «Открыть чат: заголовок»"
               />
             </div>

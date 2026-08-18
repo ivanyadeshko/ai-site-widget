@@ -38,7 +38,12 @@ export type Widget = {
   agent_config: AgentConfig;
   created_at: string;
   theme: WidgetTheme;
-  /** Наполняется в Task 13; сейчас бэкенд отдаёт пустую строку. */
+  /**
+   * Готовый `<script>` для вставки на сайт. Собран БЭКЕНДОМ
+   * (`backend/src/widgets/snippet.ts`) и показывается как есть: панель его не
+   * досочиняет — на мультидоменной раскладке в нём есть `data-host`, знать про
+   * который фронту незачем.
+   */
   embed_snippet: string;
   app_url: string;
 };

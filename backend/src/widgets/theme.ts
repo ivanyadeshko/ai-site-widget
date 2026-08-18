@@ -38,6 +38,23 @@ export const TITLE_MAX = 40;
 export const LAUNCHER_TITLE_MAX = 60;
 export const BUTTON_LABEL_MAX = 2;
 
+/**
+ * Префикс дефолтной подписи кнопки. Продублирован в `embed/loader/src/loader.ts`
+ * как фолбэк `aria-label` на случай отката образа бэкенда: общего файла у
+ * бандла для чужого сайта и у бэкенда нет и быть не может, поэтому расхождение
+ * ловит только тест-пин (`backend/test/widgetTheme.test.ts`).
+ */
+export const LAUNCHER_TITLE_PREFIX = 'Открыть чат: ';
+
+/**
+ * Последний рубеж для заголовка: имя виджета вида `<<>>` после чистки
+ * (`derived`) не оставляет НИ ОДНОГО символа, а `/config` обязан отдавать все
+ * поля темы непустыми — лоадер подставляет их без проверок. Именно поэтому
+ * константа-заглушка допустима здесь и недопустима как общий дефолт: она
+ * срабатывает только там, где показать нечего в принципе.
+ */
+export const TITLE_FALLBACK = 'Чат';
+
 const COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 const POSITIONS = new Set(['right', 'left']);
 /**
@@ -50,6 +67,8 @@ const POSITIONS = new Set(['right', 'left']);
  * единственная линия защиты.
  */
 const FORBIDDEN_RE = /[<>\u0000-\u001f\u007f]/;
+/** Тот же класс символов для ЗАМЕНЫ (а не проверки) — см. `derived`. */
+const FORBIDDEN_RE_GLOBAL = /[<>\u0000-\u001f\u007f]/g;
 
 const KNOWN_FIELDS = new Set<keyof WidgetTheme>([
   'color', 'position', 'button_label', 'title', 'launcher_title',
@@ -116,6 +135,25 @@ export function parseTheme(raw: unknown): WidgetTheme {
 }
 
 /**
+ * Значение, ВЫВЕДЕННОЕ не из темы (сегодня — из имени виджета), приведённое к
+ * правилам темы.
+ *
+ * Зачем: `parseWidgetName` (widgets/validation.ts) проверяет только длину
+ * 1..100 и разрешает и «<», и «>», и переводы строк. Без этой чистки `/config`
+ * отдавал бы наружу `title`, который сам же бэкенд отверг бы на записи, — а
+ * весь инвариант D-9 («в `w.js` нет валидации, потому что валидирует бэкенд»)
+ * держится ровно на обратном: из `/config` не может приехать значение, не
+ * прошедшее правила темы. Здесь именно ЧИСТКА, а не отказ: имя виджета
+ * владелец задал легально, и ронять из-за него публичную ручку нельзя.
+ */
+const derived = (value: string, max: number): string => {
+  const clean = Array.from(value.replace(FORBIDDEN_RE_GLOBAL, ' ').trim().replace(/\s+/g, ' '));
+  // Обрезаем по code point'ам, а не по `.slice`: разрез посреди суррогатной
+  // пары дал бы «половину эмодзи» — невалидный UTF-16 в JSON.
+  return clean.length > max ? clean.slice(0, max).join('').trimEnd() : clean.join('');
+};
+
+/**
  * Тема для публичного `/config` — ПОЛНАЯ, без единого пропуска.
  *
  * ⚠️ Отклонение от буквы плана: в интерфейсе задачи сигнатура была
@@ -126,12 +164,13 @@ export function parseTheme(raw: unknown): WidgetTheme {
  * доступность у всех существующих виджетов.
  */
 export function themeForConfig(stored: WidgetTheme, widgetName: string): Required<WidgetTheme> {
-  const title = stored.title ?? widgetName;
+  const title = stored.title ?? (derived(widgetName, TITLE_MAX) || TITLE_FALLBACK);
   return {
     color: stored.color ?? DEFAULT_THEME.color,
     position: stored.position ?? DEFAULT_THEME.position,
     button_label: stored.button_label ?? DEFAULT_THEME.button_label,
     title,
-    launcher_title: stored.launcher_title ?? `Открыть чат: ${title}`,
+    launcher_title: stored.launcher_title
+      ?? derived(`${LAUNCHER_TITLE_PREFIX}${title}`, LAUNCHER_TITLE_MAX),
   };
 }
