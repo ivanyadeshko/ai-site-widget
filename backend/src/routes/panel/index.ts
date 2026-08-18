@@ -4,6 +4,7 @@ import { ApiError, sendApiError } from '../../http/errors.ts';
 import { authRoutes } from './auth.ts';
 import { dialogRoutes } from './dialogs.ts';
 import { leadRoutes } from './leads.ts';
+import { usageRoutes } from './usage.ts';
 import { widgetRoutes } from './widgets.ts';
 
 /**
@@ -42,4 +43,5 @@ export const panelRoutes: FastifyPluginAsync = async (app) => {
   await app.register(widgetRoutes);
   await app.register(leadRoutes);
   await app.register(dialogRoutes);
+  await app.register(usageRoutes);
 };

@@ -25,6 +25,33 @@ export function parseDateParam(raw: unknown, field: string): Date | null {
   return value;
 }
 
+/** Окно отчёта: больше года — уже не «посмотреть расход», а выгрузка всей истории. */
+export const MAX_PERIOD_DAYS = 366;
+/** Что показываем, когда владелец не выбрал период сам. */
+export const DEFAULT_PERIOD_DAYS = 30;
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Период отчёта: обе границы обязательны, поэтому пустые заполняются дефолтом.
+ *
+ * Потолок в 366 дней — не вкусовщина: без него любой запрос «за всё время»
+ * разворачивает `jsonb_each_text` по ВСЕЙ таблице диалогов, и один любопытный
+ * владелец кладёт отчёты всем. Дефолтное окно — последние 30 дней.
+ *
+ * `from` включительно, `to` исключительно: соседние периоды стыкуются без
+ * нахлёста, и один диалог не попадает в два отчёта.
+ */
+export function parseReportPeriod(rawFrom: unknown, rawTo: unknown): { from: Date; to: Date } {
+  const to = parseDateParam(rawTo, 'to') ?? new Date();
+  const from = parseDateParam(rawFrom, 'from') ?? new Date(to.getTime() - DEFAULT_PERIOD_DAYS * DAY_MS);
+  if (from.getTime() > to.getTime()) throw invalidPeriod('Начало периода позже его конца.');
+  if (to.getTime() - from.getTime() > MAX_PERIOD_DAYS * DAY_MS) {
+    throw invalidPeriod(`Период не может быть длиннее ${MAX_PERIOD_DAYS} дней — выберите отрезок покороче.`);
+  }
+  return { from, to };
+}
+
 /** Границы периода в правильном порядке; пустые — «без ограничения». */
 export function parseOptionalPeriod(rawFrom: unknown, rawTo: unknown): { from: Date | null; to: Date | null } {
   const from = parseDateParam(rawFrom, 'from');
