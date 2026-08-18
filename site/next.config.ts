@@ -8,6 +8,9 @@ const nextConfig: NextConfig = {
   // Картинки отдаются как есть из public/ и /media/ — без resize и
   // перекодирования: лендинг статичен, оптимизатор Next тут только жёг бы CPU.
   images: { unoptimized: true },
+  // `X-Powered-By: Next.js` бесплатно сообщает сканеру стек и мажорную ветку
+  // фреймворка. Пользы ноль, поэтому выключаем.
+  poweredByHeader: false,
   async headers() {
     // Базовая гигиена. Отличие от apps/cms: X-Frame-Options DENY, а не
     // SAMEORIGIN — лендинг vell.pro не встраивается ни во что и не встраивает

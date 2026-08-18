@@ -23,7 +23,22 @@ export const Users: CollectionConfig = {
     // Кука сессии Payload — host-only и SameSite=Lax: `domain` НЕ задаём,
     // иначе кука апекса уехала бы на app.vell.pro и смешалась бы с сессией
     // панели (см. README «Два админа»).
-    cookies: { sameSite: 'Lax' },
+    //
+    // `secure` ОБЯЗАН быть задан явно: Payload не выводит его из NODE_ENV —
+    // в generateCookie (payload/dist/auth/cookies.js) флаг считается как
+    // `secureArg || sameSite === 'None'`, то есть при SameSite=Lax без этой
+    // строки токен редактора уезжал бы по открытому http и на проде.
+    // Привязка к NODE_ENV, а не `true` навсегда: `npm run dev` работает по
+    // http://localhost, и браузер Secure-куку там просто не вернёт.
+    //
+    // ⚠️ В ОБРАЗЕ это условие вычислено на этапе `next build` (Next инлайнит
+    // process.env.NODE_ENV в бандл), то есть там всегда Secure. Запуск образа
+    // с `-e NODE_ENV=development` флаг НЕ снимает — проверено контейнером.
+    // Практическое следствие: стенд из образа, открытый по http на IP,
+    // логин в /admin не примет (браузер не вернёт Secure-куку). Нужен TLS,
+    // либо доступ через http://localhost / ssh-туннель — localhost браузеры
+    // считают доверенным origin'ом и Secure-куку там отдают.
+    cookies: { sameSite: 'Lax', secure: process.env.NODE_ENV === 'production' },
   },
   fields: [{ name: 'name', type: 'text' }],
 }

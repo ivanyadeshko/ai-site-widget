@@ -13,7 +13,15 @@ export const Posts: CollectionConfig = {
     defaultColumns: ['title', 'slug', 'publishedAt'],
     group: 'Контент',
   },
-  access: { read: () => true },
+  access: {
+    // Аноним видит только опубликованное. `read: () => true` отдавал бы
+    // черновики любому желающему через /admin/api/posts — неготовый текст
+    // утекал бы до вычитки, а поле `publishedAt` из «сайт его не показывает»
+    // превращалось бы в чистую декорацию.
+    // Залогиненный редактор видит всё: иначе черновик исчез бы и из админки.
+    read: ({ req }) =>
+      req.user ? true : { publishedAt: { less_than_equal: new Date().toISOString() } },
+  },
   fields: [
     { name: 'title', type: 'text', required: true },
     { name: 'slug', type: 'text', required: true, unique: true, index: true },

@@ -33,7 +33,12 @@
 #     preflight проверяет сеть до того, как тронуть стенд.
 #   • Миграции — node-pg-migrate через exec в backend, после `up`.
 #
-# Env: REPO_DIR (авто), IMAGE_TAG, WIDGET_HEALTH_URL, BACKUP_RETAIN, IMAGE_OWNER.
+#   • Лендинг (профиль `site`, образ vell-site) — второй сервис того же
+#     релиза: preflight сверяет и его тег в реестре, health опрашивает и его.
+#     Включённость профиля берётся из COMPOSE_PROFILES в .env.
+#
+# Env: REPO_DIR (авто), IMAGE_TAG, WIDGET_HEALTH_URL, SITE_HEALTH_URL,
+#      BACKUP_RETAIN, IMAGE_OWNER.
 # ──────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
@@ -214,6 +219,25 @@ acquire_lock() {
 
 health_url() { printf '%s' "${WIDGET_HEALTH_URL:-http://localhost:8200/healthz}"; }
 
+# Лендинг на этом стенде включён? Правда одна — COMPOSE_PROFILES в .env
+# (по нему compose и решает, существуют ли сервисы site*). Разбираем как
+# список через запятую, а не `grep site`: подстрока совпала бы и с чужим
+# профилем вроде `site-preview`, и стенд без лендинга получил бы лишние
+# проверки и лишние die.
+site_profile_enabled() {
+    local profiles item
+    profiles="$(env_get COMPOSE_PROFILES)"
+    [ -n "$profiles" ] || return 1
+    local IFS=','
+    for item in $profiles; do
+        item="$(printf '%s' "$item" | tr -d '[:space:]')"
+        [ "$item" = "site" ] && return 0
+    done
+    return 1
+}
+
+site_health_url() { printf '%s' "${SITE_HEALTH_URL:-http://127.0.0.1:3000/api/health}"; }
+
 # ── preflight ─────────────────────────────────────────────────────────
 
 cmd_preflight() {
@@ -248,6 +272,18 @@ cmd_preflight() {
         docker manifest inspect "ghcr.io/${owner}/site-widget-backend:${IMAGE_TAG}" >/dev/null 2>&1 \
             || die "образ site-widget-backend:${IMAGE_TAG} недоступен в ghcr (нет тега или docker login протух)"
         info "образ ${IMAGE_TAG} найден в реестре"
+
+        # Лендинг едет ОТДЕЛЬНЫМ образом (vell-site), публикуемым той же
+        # джобой релиза. На стенде с профилем `site` его отсутствие всплыло бы
+        # только на `pull` внутри apply — то есть уже ПОСЛЕ подмены тега в
+        # .env, в состоянии «наполовину задеплоено», ровно от которого этот
+        # preflight и защищает backend. Стенд без профиля проверку не делает:
+        # образ ему не нужен, и требовать его там — ложный отказ деплоя.
+        if site_profile_enabled; then
+            docker manifest inspect "ghcr.io/${owner}/vell-site:${IMAGE_TAG}" >/dev/null 2>&1 \
+                || die "образ vell-site:${IMAGE_TAG} недоступен в ghcr, а профиль site включён (нет тега или docker login протух)"
+            info "образ лендинга vell-site:${IMAGE_TAG} найден в реестре"
+        fi
     fi
 
     echo "✅ preflight пройден"
@@ -416,16 +452,35 @@ cmd_apply() {
 cmd_health() {
     local url; url="$(health_url)"
     echo "═══ health $url ═══"
-    local code i
+    local code i healthy=0
     for i in $(seq 1 30); do
         code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$url" 2>/dev/null || echo 000)
         if [ "$code" = "200" ]; then
             echo "✅ healthy (попытка $i)"
+            healthy=1
+            break
+        fi
+        sleep 5
+    done
+    [ "$healthy" = "1" ] || die "$url не отдал 200 за 150с (последний код: $code)"
+
+    # Лендинг — второй сервис того же релиза, и без этой проверки деплой
+    # считался бы успешным при мёртвом апексе: BFF отвечает, а vell.pro
+    # отдаёт 502, и узнаёт об этом первый посетитель. Порог короче, чем у
+    # BFF: `site` стартует после one-shot `site-migrate`, то есть к моменту
+    # этой проверки миграции уже отработали.
+    site_profile_enabled || return 0
+    local site_url; site_url="$(site_health_url)"
+    echo "═══ health лендинга $site_url ═══"
+    for i in $(seq 1 24); do
+        code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$site_url" 2>/dev/null || echo 000)
+        if [ "$code" = "200" ]; then
+            echo "✅ лендинг healthy (попытка $i)"
             return 0
         fi
         sleep 5
     done
-    die "$url не отдал 200 за 150с (последний код: $code)"
+    die "$site_url не отдал 200 за 120с (последний код: $code)"
 }
 
 # ── rollback ──────────────────────────────────────────────────────────
