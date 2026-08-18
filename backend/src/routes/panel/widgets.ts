@@ -1,0 +1,178 @@
+import type { FastifyPluginAsync } from 'fastify';
+import { requireAccount } from '../../auth/guards.ts';
+import {
+  countWidgetsByAccount, deleteWidget, findWidgetByIdForAccount, insertWidget,
+  listWidgetsByAccount, rotatePublishToken, updateWidget,
+  type WidgetPatch, type WidgetRow,
+} from '../../db/repositories/widgets.ts';
+import { ApiError } from '../../http/errors.ts';
+import { generatePublishToken } from '../../widgets/tokens.ts';
+import {
+  WIDGETS_PER_ACCOUNT_MAX, parseAgentConfig, parseAllowedOrigins, parseWidgetName,
+} from '../../widgets/validation.ts';
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/**
+ * Наружу уезжает РОВНО это.
+ *
+ * `publish_token` отдаётся владельцу намеренно: он не секрет, он лежит в HTML
+ * его собственного сайта. `theme` здесь НЕТ — колонка `widgets.theme`
+ * появляется только в Task 11, и объявить поле заранее значило бы отдавать
+ * `undefined` из несуществующей колонки.
+ */
+export type WidgetPublic = {
+  id: string;
+  name: string;
+  publish_token: string;
+  enabled: boolean;
+  allowed_origins: string[];
+  agent_config: WidgetRow['agent_config'];
+  created_at: Date;
+  /** Готовый <script> для вставки на сайт. Наполняется в Task 13. */
+  embed_snippet: string;
+  app_url: string;
+};
+
+const toPublic = (widget: WidgetRow, publicOrigin: string): WidgetPublic => ({
+  id: widget.id,
+  name: widget.name,
+  publish_token: widget.publish_token,
+  enabled: widget.enabled,
+  allowed_origins: widget.allowed_origins,
+  agent_config: widget.agent_config,
+  created_at: widget.created_at,
+  embed_snippet: '',
+  app_url: `${publicOrigin}/app/${widget.publish_token}`,
+});
+
+/**
+ * Кривой UUID в пути — это НЕ 500: `WHERE id = 'не-uuid'` роняет Postgres
+ * ошибкой 22P02, и без этой проверки любая опечатка в адресной строке панели
+ * превращалась бы во внутреннюю ошибку сервера.
+ */
+const notFound = (): ApiError => new ApiError(404, 'widget_not_found', 'Виджет не найден.');
+
+export const widgetRoutes: FastifyPluginAsync = async (app) => {
+  // Гард на весь скоуп плагина: новая ручка виджетов не может «забыть» вход.
+  app.addHook('preHandler', requireAccount);
+
+  const load = async (id: string, accountId: string): Promise<WidgetRow> => {
+    if (!UUID_RE.test(id)) throw notFound();
+    const widget = await findWidgetByIdForAccount(app.deps.pool, id, accountId);
+    if (!widget) throw notFound();
+    return widget;
+  };
+
+  app.get('/widgets', async (req, reply) => {
+    const widgets = await listWidgetsByAccount(app.deps.pool, req.account!.id);
+    return reply.send({ widgets: widgets.map((w) => toPublic(w, app.deps.config.publicOrigin)) });
+  });
+
+  app.post<{ Body: { name?: unknown; agent_config?: unknown; allowed_origins?: unknown } }>(
+    '/widgets',
+    { config: { rateLimit: { max: 60, timeWindow: '1 minute' } } },
+    async (req, reply) => {
+      const accountId = req.account!.id;
+      const name = parseWidgetName(req.body?.name);
+      const agentConfig = parseAgentConfig(req.body?.agent_config);
+      const allowedOrigins = parseAllowedOrigins(req.body?.allowed_origins ?? []);
+
+      // Кап читается ПОСЛЕ валидации: мусорное тело не должно даже считаться.
+      // Гонка двух параллельных созданий на границе капа теоретически даёт
+      // 11-й виджет — цена вопроса нулевая, а на транзакцию с блокировкой
+      // счётчика она не тянет.
+      if (await countWidgetsByAccount(app.deps.pool, accountId) >= WIDGETS_PER_ACCOUNT_MAX) {
+        throw new ApiError(
+          422, 'widget_limit_reached',
+          `Достигнут предел в ${WIDGETS_PER_ACCOUNT_MAX} виджетов на аккаунт. Удалите ненужный или напишите в поддержку.`,
+        );
+      }
+
+      // Одна повторная попытка на случай коллизии UNIQUE(publish_token):
+      // вероятность её — 2^-128, но 500 из-за неё выглядел бы как «панель
+      // сломалась», а не как чудо.
+      let widget: WidgetRow | null = null;
+      for (let attempt = 0; attempt < 2 && widget === null; attempt += 1) {
+        try {
+          widget = await insertWidget(app.deps.pool, {
+            accountId, name, publishToken: generatePublishToken(), agentConfig, allowedOrigins,
+          });
+        } catch (err) {
+          if ((err as { code?: unknown }).code !== '23505' || attempt === 1) throw err;
+        }
+      }
+      return reply.code(201).send({ widget: toPublic(widget!, app.deps.config.publicOrigin) });
+    },
+  );
+
+  app.get<{ Params: { id: string } }>('/widgets/:id', async (req, reply) => {
+    const widget = await load(req.params.id, req.account!.id);
+    return reply.send({ widget: toPublic(widget, app.deps.config.publicOrigin) });
+  });
+
+  app.patch<{
+    Params: { id: string };
+    Body: { name?: unknown; agent_config?: unknown; allowed_origins?: unknown; enabled?: unknown };
+  }>('/widgets/:id', async (req, reply) => {
+    const accountId = req.account!.id;
+    await load(req.params.id, accountId);
+
+    const body = req.body ?? {};
+    const patch: WidgetPatch = {};
+    if (body.name !== undefined) patch.name = parseWidgetName(body.name);
+    if (body.agent_config !== undefined) patch.agentConfig = parseAgentConfig(body.agent_config);
+    if (body.allowed_origins !== undefined) patch.allowedOrigins = parseAllowedOrigins(body.allowed_origins);
+    if (body.enabled !== undefined) {
+      if (typeof body.enabled !== 'boolean') {
+        throw new ApiError(422, 'invalid_enabled', 'Поле enabled должно быть true или false.');
+      }
+      patch.enabled = body.enabled;
+    }
+
+    const updated = await updateWidget(app.deps.pool, req.params.id, accountId, patch);
+    if (!updated) throw notFound();
+    return reply.send({ widget: toPublic(updated, app.deps.config.publicOrigin) });
+  });
+
+  /**
+   * Перевыпуск публичного токена — кнопка «после ухода подрядчика».
+   *
+   * Токен не секрет (он в HTML чужого сайта), но владелец обязан иметь способ
+   * оборвать все уже раздатые копии сниппета. Цена операции — СТАРЫЙ сниппет
+   * на сайте немедленно перестаёт работать (404 на /w/v1/:token/config),
+   * поэтому панель обязана предупреждать об этом до нажатия.
+   *
+   * История НЕ теряется: диалоги и лиды привязаны к widget_id, а не к токену.
+   *
+   * Лимит — 5/час на IP (штатный keyGenerator из app.ts): гард requireAccount
+   * работает на preHandler, то есть ПОЗЖЕ onRequest-хука лимитера, и ключом
+   * по аккаунту здесь воспользоваться нельзя. Для легитимного владельца пять
+   * ротаций в час — заведомо больше, чем нужно.
+   */
+  app.post<{ Params: { id: string } }>(
+    '/widgets/:id/rotate-token',
+    { config: { rateLimit: { max: 5, timeWindow: '1 hour' } } },
+    async (req, reply) => {
+      const accountId = req.account!.id;
+      await load(req.params.id, accountId);
+      let widget: WidgetRow | null = null;
+      for (let attempt = 0; attempt < 2 && widget === null; attempt += 1) {
+        try {
+          widget = await rotatePublishToken(app.deps.pool, req.params.id, accountId, generatePublishToken());
+        } catch (err) {
+          if ((err as { code?: unknown }).code !== '23505' || attempt === 1) throw err;
+        }
+      }
+      if (!widget) throw notFound();
+      return reply.send({ widget: toPublic(widget, app.deps.config.publicOrigin) });
+    },
+  );
+
+  app.delete<{ Params: { id: string } }>('/widgets/:id', async (req, reply) => {
+    if (!UUID_RE.test(req.params.id)) throw notFound();
+    const removed = await deleteWidget(app.deps.pool, req.params.id, req.account!.id);
+    if (!removed) throw notFound();
+    return reply.code(204).send();
+  });
+};

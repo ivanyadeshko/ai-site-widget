@@ -10,6 +10,7 @@ import { appPageRoutes } from './routes/appPage.ts';
 import { coreWebhookRoutes } from './routes/coreWebhooks.ts';
 import { healthRoutes } from './routes/health.ts';
 import { panelRoutes } from './routes/panel/index.ts';
+import { panelAppRoutes } from './routes/panelApp.ts';
 import { publicApiRoutes } from './routes/publicApi.ts';
 
 export type AppDeps = {
@@ -65,6 +66,11 @@ export async function buildApp(input: AppDepsInput): Promise<FastifyInstance> {
   // путь раньше роутов).
   await app.register(cookie);
   await app.register(panelRoutes, { prefix: '/api/v1' });
+
+  // SPA кабинета — ДО корневой статики: та смотрит на embed/loader/dist и
+  // embed/public с prefix '/', и зарегистрированная раньше перехватила бы
+  // /panel/* своим 404 вместо history-фолбэка панели.
+  await app.register(panelAppRoutes, { prefix: '/panel' });
 
   await app.register(fastifyStatic, {
     // Порядок важен: первый корень, где нашёлся файл, побеждает.

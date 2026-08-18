@@ -1,6 +1,6 @@
 name: ci
 
-# Один npm-workspace монорепо (backend + embed/loader + embed/app) — один
+# Один npm-workspace монорепо (backend + embed/loader + embed/app + panel) — один
 # гейт: typecheck + тесты + сборка. Сборка = ЗАОДНО бюджет-гейт w.js:
 # `embed/loader` package.json wire'ит `vite build && make-shim && size-check`
 # в свой `build`-скрипт (потолок 8КБ gzip, embed/loader/scripts/size-check.mjs),
@@ -43,7 +43,7 @@ jobs:
           node-version-file: .nvmrc
           cache: npm
 
-      # Ставит все 3 воркспейса разом (root package-lock.json общий).
+      # Ставит все 4 воркспейса разом (root package-lock.json общий).
       - name: npm ci
         run: npm ci
 
@@ -88,7 +88,7 @@ jobs:
       - name: Start test postgres
         run: docker compose -f infra/compose.test.yaml up -d --wait
 
-      # tsc (backend), vue-tsc (embed/app), tsc (embed/loader) — по каждому
+      # tsc (backend), vue-tsc (embed/app и panel), tsc (embed/loader) — по каждому
       # воркспейсу свой typecheck-скрипт.
       - name: Typecheck
         run: npm run typecheck --workspaces --if-present
@@ -98,7 +98,7 @@ jobs:
       - name: Test
         run: npm run test --workspaces --if-present
 
-      # tsc → dist (backend) + vite build → dist (embed/loader, embed/app).
+      # tsc → dist (backend) + vite build → dist (embed/loader, embed/app, panel).
       # embed/loader заодно прогоняет size-check.mjs (бюджет 8КБ gzip) —
       # это и есть бюджет-гейт w.js, встроенный в билд, а не отдельный шаг.
       - name: Build (incl. w.js budget gate)

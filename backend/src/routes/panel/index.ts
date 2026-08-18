@@ -2,6 +2,7 @@ import type { FastifyPluginAsync } from 'fastify';
 import { requireSameOrigin } from '../../auth/guards.ts';
 import { ApiError, sendApiError } from '../../http/errors.ts';
 import { authRoutes } from './auth.ts';
+import { widgetRoutes } from './widgets.ts';
 
 /**
  * Плагин панельного API. Регистрируется с `{ prefix: '/api/v1' }`.
@@ -33,5 +34,8 @@ export const panelRoutes: FastifyPluginAsync = async (app) => {
   // отдельности легко забыть в новой ручке, а цена забывчивости — дыра.
   app.addHook('preHandler', requireSameOrigin);
 
+  // Каждая панельная ручка регистрируется ДОЧЕРНИМ плагином ИМЕННО ЗДЕСЬ —
+  // только внутри этого скоупа она наследует CSRF-хук и формат ошибок выше.
   await app.register(authRoutes);
+  await app.register(widgetRoutes);
 };

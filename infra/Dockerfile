@@ -4,6 +4,7 @@ COPY package.json package-lock.json ./
 COPY backend/package.json backend/
 COPY embed/loader/package.json embed/loader/
 COPY embed/app/package.json embed/app/
+COPY panel/package.json panel/
 RUN npm ci
 COPY . .
 RUN npm run build --workspaces --if-present
@@ -18,6 +19,9 @@ COPY --from=build /app/backend/dist backend/dist
 COPY --from=build /app/backend/migrations backend/migrations
 COPY --from=build /app/embed/loader/dist embed/loader/dist
 COPY --from=build /app/embed/app/dist embed/app/dist
+# SPA кабинета: @fastify/static в panelApp.ts падает ПРИ РЕГИСТРАЦИИ, если
+# каталога нет, — без этой строки образ не поднимется вовсе.
+COPY --from=build /app/panel/dist panel/dist
 COPY embed/public embed/public
 COPY contracts/core-api.d.ts contracts/
 # curl нужен для healthcheck: в node:alpine его НЕТ (урок инцидента с Alloy).
