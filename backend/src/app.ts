@@ -27,7 +27,18 @@ export async function buildApp(input: AppDepsInput): Promise<FastifyInstance> {
     logger: {
       level: input.config.logLevel,
       // Структурный JSON: стенд собирает логи grep'ом по полям, не по тексту.
-      redact: { paths: ['req.headers.authorization', 'req.headers["x-core-signature"]'], remove: true },
+      // Кука сессии панели — долгоживущий секрет: даже если будущая
+      // кастомизация сериализатора начнёт логировать заголовки, токен не
+      // должен утечь в логи (находка кросс-ревью потока I).
+      redact: {
+        paths: [
+          'req.headers.authorization',
+          'req.headers["x-core-signature"]',
+          'req.headers.cookie',
+          'res.headers["set-cookie"]',
+        ],
+        remove: true,
+      },
     },
     // trustProxy НЕ включаем на дев-раскладке: сервис слушает :8200 напрямую,
     // и доверие к X-Forwarded-For позволило бы обойти IP-кап одним заголовком.
