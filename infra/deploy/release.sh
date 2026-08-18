@@ -286,8 +286,43 @@ cmd_backup() {
     info "бэкап готов: $(basename "$file") ($size), проверен pg_restore"
     state_set BACKUP_FILE "backups/$(basename "$file")"
 
-    ls -1t "$BACKUP_DIR"/*.dump 2>/dev/null | tail -n "+$((BACKUP_RETAIN + 1))" | xargs -r rm -f
-    info "в каталоге $(ls -1 "$BACKUP_DIR"/*.dump 2>/dev/null | wc -l) дампов (лимит $BACKUP_RETAIN)"
+    ls -1t "$BACKUP_DIR"/pre-*.dump 2>/dev/null | tail -n "+$((BACKUP_RETAIN + 1))" | xargs -r rm -f
+    info "в каталоге $(ls -1 "$BACKUP_DIR"/pre-*.dump 2>/dev/null | wc -l) дампов (лимит $BACKUP_RETAIN)"
+
+    # ── БД лендинга (compose-профиль `site`) ──────────────────────────
+    # Контент CMS — тоже данные, и терять их деплоем нельзя. Условно: на
+    # стенде без профиля `site` сервиса site-db просто нет, и это не ошибка.
+    # `ps --services --all` перечисляет сервисы всех профилей, поэтому
+    # проверяем не «объявлен ли сервис», а «есть ли у него контейнер».
+    if ! docker compose ps --services --all 2>/dev/null | grep -qx 'site-db'; then
+        info "site-db не поднят (профиль site выключен) — бэкап лендинга пропущен"
+        return 0
+    fi
+
+    local site_file site_tmp site_size
+    site_file="$BACKUP_DIR/site-pre-${IMAGE_TAG:-manual}-$(date -u +%Y%m%dT%H%M%SZ).dump"
+    site_tmp="/tmp/release-backup-site-$$.dump"
+
+    # Пользователь и БД зашиты в compose (site/vell_site) — та же логика
+    # единственной точки правды, что и у widget-db выше.
+    docker compose exec -T site-db sh -c \
+        "pg_dump -U site -d vell_site -Fc -f '$site_tmp'" \
+        || die "pg_dump site-db не отработал"
+
+    docker compose exec -T site-db pg_restore --list "$site_tmp" >/dev/null \
+        || { docker compose exec -T site-db rm -f "$site_tmp" || true; die "дамп site-db не читается pg_restore"; }
+
+    docker compose cp "site-db:$site_tmp" "$site_file" || die "не смог забрать дамп site-db из контейнера"
+    docker compose exec -T site-db rm -f "$site_tmp" || true
+    [ -s "$site_file" ] || die "дамп site-db пустой: $site_file"
+    chmod 600 "$site_file"
+
+    site_size=$(du -h "$site_file" | cut -f1)
+    info "бэкап лендинга готов: $(basename "$site_file") ($site_size), проверен pg_restore"
+
+    # Ретенция считается ОТДЕЛЬНО по маске: общий счётчик вымывал бы дампы
+    # виджета вдвое быстрее, стоило появиться второй базе.
+    ls -1t "$BACKUP_DIR"/site-pre-*.dump 2>/dev/null | tail -n "+$((BACKUP_RETAIN + 1))" | xargs -r rm -f
 }
 
 # ── apply ─────────────────────────────────────────────────────────────

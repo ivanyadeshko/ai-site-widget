@@ -1,0 +1,12 @@
+node_modules
+.next
+npm-debug.log
+.env
+.env.local
+.env.development
+.env.production
+.DS_Store
+*.log
+.git
+public/media
+payload.config.mjs

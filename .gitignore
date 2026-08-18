@@ -3,3 +3,10 @@ dist/
 .env
 *.log
 backend/coverage/
+# site/ — отдельный npm-проект (Payload 3 + Next), не воркспейс (D-10).
+# Артефакты сборки и СОБРАННЫЙ конфиг Payload в репозиторий не едут:
+# payload.config.mjs генерируется на билде (`npm run build:payload-config`).
+site/.next/
+site/payload.config.mjs
+site/tsconfig.tsbuildinfo
+site/public/media/
