@@ -79,21 +79,25 @@ type AccountBucket = {
 };
 
 describe('админ-поверхность: виджеты витрины', () => {
-  it('показывает виджеты ВСЕХ аккаунтов с владельцем — включая бесхозные (наследие релиза 1)', async () => {
+  it('показывает виджеты ВСЕХ аккаунтов витрины', async () => {
+    // Релиз 2 (Task 27): widgets.account_id — NOT NULL, бесхозных строк
+    // (owner_email = null) больше не существует — прежний пункт «включая
+    // бесхозные» проверял состояние, которого схема теперь не допускает.
+    // Оператор по-прежнему видит виджеты ВСЕХ владельцев (изоляции у админ-
+    // поверхности нет — она на то и админская).
     const admin = await signIn('root@example.com', true);
     const alice = await seedAccount(pool, { email: 'alice@example.com' });
     const bob = await seedAccount(pool, { email: 'bob@example.com' });
     await seedWidget(pool, { accountId: alice.id });
     await seedWidget(pool, { accountId: bob.id });
-    await seedWidget(pool, {}); // account_id IS NULL
 
     const res = await app.inject({ method: 'GET', url: '/api/v1/admin/widgets', headers: { cookie: admin.cookie } });
     expect(res.statusCode).toBe(200);
     const widgets = res.json().widgets as AdminWidget[];
-    expect(widgets).toHaveLength(3);
+    expect(widgets).toHaveLength(2);
     // Порядок — по created_at DESC, поэтому сравниваем составом, а не списком.
     expect(new Set(widgets.map((w) => w.owner_email)))
-      .toEqual(new Set([null, 'alice@example.com', 'bob@example.com']));
+      .toEqual(new Set(['alice@example.com', 'bob@example.com']));
   });
 
   it('фильтр account_id сужает список до одного владельца', async () => {
@@ -159,24 +163,30 @@ describe('админ-поверхность: расход в разрезе ак
     expect(buckets.some((b) => b.account_email === 'root@example.com' && b.dialogs === 0)).toBe(true);
   });
 
-  it('итог периода — по ВСЕМ диалогам витрины, включая бесхозные виджеты', async () => {
+  it('итог периода — по ВСЕМ диалогам витрины', async () => {
+    // Релиз 2 (Task 27): бесхозных виджетов больше нет (account_id NOT NULL),
+    // каждый диалог принадлежит аккаунту. Прежний пункт проверял, что итог
+    // включает бесхозные диалоги, которых в разрезе аккаунтов нет; теперь такого
+    // расхождения быть не может — инвариант ужесточился до «итог == сумма по
+    // аккаунтам», и это ровно то, что должен видеть оператор.
     const admin = await signIn('root@example.com', true);
     const alice = await seedAccount(pool, { email: 'alice@example.com' });
+    const bob = await seedAccount(pool, { email: 'bob@example.com' });
     const aliceWidget = await seedWidget(pool, { accountId: alice.id });
-    const orphan = await seedWidget(pool, {}); // account_id IS NULL
+    const bobWidget = await seedWidget(pool, { accountId: bob.id });
 
     await seedDialogAt(aliceWidget.id, '2026-08-10T12:00:00Z', { usage: { llm_input_tokens: 10 }, credits: 5 });
-    await seedDialogAt(orphan.id, '2026-08-10T13:00:00Z', { usage: { llm_input_tokens: 1 }, credits: 2 });
+    await seedDialogAt(bobWidget.id, '2026-08-10T13:00:00Z', { usage: { llm_input_tokens: 1 }, credits: 2 });
 
     const res = await app.inject({
       method: 'GET', url: `/api/v1/admin/usage?${PERIOD}`, headers: { cookie: admin.cookie },
     });
     const body = res.json() as { buckets: AccountBucket[]; totals: { dialogs: number; credits_total: number } };
-    // В разрезе аккаунтов бесхозного диалога нет — владельца у него не существует.
-    expect(body.buckets.reduce((sum, b) => sum + b.credits_total, 0)).toBe(5);
-    // А в итоге он есть: деньги ядра списаны, и оператор обязан их видеть.
+    // Итог по витрине — по всем диалогам обоих владельцев.
     expect(body.totals.dialogs).toBe(2);
     expect(body.totals.credits_total).toBe(7);
+    // И он в точности совпадает с суммой по аккаунтам: бесхозных денег нет.
+    expect(body.buckets.reduce((sum, b) => sum + b.credits_total, 0)).toBe(7);
   });
 
   it('период разбирается ТЕМИ ЖЕ правилами, что и в кабинете: задом наперёд и длиннее года — 422', async () => {

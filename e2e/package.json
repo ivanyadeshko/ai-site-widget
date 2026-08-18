@@ -1,0 +1,21 @@
+{
+  "name": "@aski/site-widget-e2e",
+  "private": true,
+  "type": "module",
+  "description": "Playwright e2e витрины vell.pro. ОТДЕЛЬНЫЙ npm-проект, НЕ воркспейс (D-11): @playwright/test тянет браузеры postinstall'ом, в корневом npm ci это било бы по каждому backend/embed/panel.",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "playwright test",
+    "test:panel": "playwright test --project=panel",
+    "test:acceptance": "playwright test --project=acceptance",
+    "test:voice": "playwright test --project=voice",
+    "stack:up": "docker compose -f compose.e2e.yaml up -d --build --wait",
+    "stack:down": "docker compose -f compose.e2e.yaml down -v",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.50.0",
+    "@types/node": "^22.10.0",
+    "typescript": "~5.7.2"
+  }
+}

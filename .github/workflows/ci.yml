@@ -182,3 +182,56 @@ jobs:
             -v "$PWD/infra/nginx/vell.pro.conf:/etc/nginx/conf.d/vell.pro.conf:ro" \
             -v "$PWD/certs:/etc/letsencrypt/live/vell.pro:ro" \
             nginx:1.24-alpine nginx -t
+
+  e2e-panel:
+    name: e2e Playwright (герметичный проект panel)
+    runs-on: ubuntu-latest
+    # ПОСЛЕ основного гейта: если typecheck/тесты/сборка красные — гонять
+    # браузерный e2e поверх заведомо сломанного дерева смысла нет.
+    needs: test
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          # Кэш по локу ОТДЕЛЬНОГО e2e-проекта: он не воркспейс (D-11), у него
+          # свой package-lock.json.
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+
+      # Секретов НЕ требует: проект panel герметичен (fake-core вместо ядра),
+      # поэтому джоба обязательна и на форк-PR (Constraint 3в, D-14). acceptance
+      # и voice в CI НЕ входят — они ходят в живое ядро.
+      - name: npm ci (e2e)
+        working-directory: e2e
+        run: npm ci
+
+      - name: Playwright install chromium
+        working-directory: e2e
+        run: npx playwright install --with-deps chromium
+
+      # `--build` собирает образ BFF из infra/Dockerfile (=заодно панель/embed),
+      # `--wait` держит шаг, пока backend не станет healthy (миграции накатывает
+      # one-shot migrate до старта backend).
+      - name: Поднять герметичный стек (widget-db + backend + fake-core)
+        run: docker compose -f e2e/compose.e2e.yaml up -d --build --wait
+
+      - name: Playwright --project=panel
+        working-directory: e2e
+        run: npx playwright test --project=panel
+
+      - name: Отчёт Playwright при провале
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: e2e/playwright-report/
+          retention-days: 7
+
+      - name: Снести стек
+        if: always()
+        run: docker compose -f e2e/compose.e2e.yaml down -v

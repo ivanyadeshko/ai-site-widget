@@ -24,6 +24,10 @@ export async function seedWidget(
   }> = {},
 ): Promise<{ id: string; token: string }> {
   const token = overrides.token ?? `wgt_${randomUUID().replaceAll('-', '')}`;
+  // Релиз 2 (Task 27): widgets.account_id — NOT NULL. Виджет без владельца
+  // больше не создать, поэтому заводим свежий аккаунт-владелец, если тест не
+  // передал свой. Тесты, которым важен конкретный владелец, передают accountId.
+  const accountId = overrides.accountId ?? (await seedAccount(pool)).id;
   const { rows } = await pool.query<{ id: string }>(
     `INSERT INTO widgets (publish_token, name, agent_config, kb_ids, allowed_origins, enabled, account_id)
      VALUES ($1, 'Тестовый виджет', $2::jsonb, '[]'::jsonb, $3::jsonb, $4, $5) RETURNING id`,
@@ -32,7 +36,7 @@ export async function seedWidget(
       JSON.stringify({ instructions: overrides.instructions ?? 'Ты консультант сайта.' }),
       JSON.stringify(overrides.allowedOrigins ?? ['https://shop.example']),
       overrides.enabled ?? true,
-      overrides.accountId ?? null,
+      accountId,
     ],
   );
   return { id: rows[0]!.id, token };
