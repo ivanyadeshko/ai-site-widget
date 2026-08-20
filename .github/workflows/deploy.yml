@@ -158,8 +158,13 @@ jobs:
           # блокировал сам себя: «есть незавершённые прогоны — дождитесь их».
           # Поймано первым же живым прогоном 2026-08-17 (кросс-ревью, наоборот,
           # утверждало, что `.name` — имя workflow; это оказалось неверно).
+          # Исключаем и сам deploy.yml (см. ниже), и uptime.yml — это
+          # ПЛАНОВЫЙ МОНИТОР (cron), а не сборка/тест: его транзиентный красный
+          # прогон на том же head_sha не значит, что образ негоден, но блокировал
+          # деплой наглухо (поймано первым живым дев-выкатом виджета 2026-08-20).
           runs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${full}&per_page=100" \
-                  --jq '[.workflow_runs[] | select(.path != ".github/workflows/deploy.yml")
+                  --jq '[.workflow_runs[] | select(.path != ".github/workflows/deploy.yml"
+                         and .path != ".github/workflows/uptime.yml")
                          | "\(.path)=\(.status):\(.conclusion // "running")"] | join(" ")')" \
             || { echo "::error::не смог получить прогоны коммита (нужен scope actions: read)"; exit 1; }
           echo "прогоны коммита ${sha}: ${runs:-<нет>}"
