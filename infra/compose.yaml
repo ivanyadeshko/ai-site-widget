@@ -117,7 +117,7 @@ services:
       NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL}
       # Сид-роут деструктивен, по умолчанию выключен (404). См. site/README.
       ENABLE_SEED_ROUTES: ${ENABLE_SEED_ROUTES:-}
-    ports: ["3000:3000"]
+    ports: ["127.0.0.1:${SITE_PORT:-3000}:3000"]
     # Загруженные в CMS картинки лежат в томе, а не в образе: пересборка
     # образа не должна стирать медиатеку.
     volumes: ["site-media:/app/public/media"]
